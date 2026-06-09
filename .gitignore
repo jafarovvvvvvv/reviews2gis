@@ -1,0 +1,32 @@
+# --- Секреты и конфиг окружения ---
+.env
+.env.local
+
+# --- Персональные данные лидов (телефоны и т.п.) — НИКОГДА в Git ---
+output/
+*.csv
+
+# --- Разведочные дампы 2GIS (реальные отзывы, имена, телефоны) ---
+explore_dump/
+*.html
+*.json
+*.png
+*.jpg
+*.jpeg
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+*.egg-info/
+
+# --- ОС/редакторы ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
