@@ -86,6 +86,11 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         row = db.get_company(conn, company_id)
         if row is None:
             return {"new": [], "errors": ["компания удалена"]}
+        # Не было ни одной успешной проверки -> это baseline, даже если проверку
+        # запустили вручную: первичная загрузка могла упасть (нет браузера и т.п.),
+        # и первый успешный прогон не должен счесть все старые отзывы «новыми»
+        # и захлестнуть Telegram уведомлениями.
+        baseline = baseline or row["last_checked"] is None
         db.set_company_status(conn, company_id,
                               db.ST_ADDING if baseline else db.ST_CHECKING)
         try:
@@ -95,8 +100,14 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
                     c = await s.parse_firm(row["firm_id"])
                     data = s.last_reviews_data
         except Exception as e:
-            db.set_company_status(conn, company_id, db.ST_ERROR, str(e)[:300])
-            result["errors"].append(str(e))
+            err = str(e)
+            if "Executable doesn't exist" in err:
+                # типовая беда Playwright: пакет есть, браузер не докачан
+                err = ("Браузер Playwright не найден. Выполните в терминале "
+                       "«python -m playwright install chromium» и перезапустите "
+                       "панель (python app.py).")
+            db.set_company_status(conn, company_id, db.ST_ERROR, err[:300])
+            result["errors"].append(err)
             return result
 
         if c.name == NA and data is None:
