@@ -48,6 +48,8 @@ class Config:
     city_slug: str
     headless: bool
     output_dir: str
+    sender_name: str = ""     # имя в сообщении-открывашке (SENDER_NAME)
+    sender_contact: str = ""  # телефон/Instagram для подписи аудита (SENDER_CONTACT)
 
     @property
     def domain(self) -> str:
@@ -66,6 +68,10 @@ def load_config() -> Config:
     p.add_argument("--no-headless", action="store_true",
                    help="Показать окно браузера (по умолчанию headless)")
     p.add_argument("--output-dir", default=os.getenv("OUTPUT_DIR") or "output")
+    p.add_argument("--sender-name", default=os.getenv("SENDER_NAME") or "",
+                   help="Ваше имя — подставляется в сообщение-открывашку")
+    p.add_argument("--sender-contact", default=os.getenv("SENDER_CONTACT") or "",
+                   help="Ваш контакт (телефон/Instagram) — подпись в аудите")
     p.add_argument("--firm", default=None,
                    help="Режим одной карточки: ID филиала 2GIS (для отладки)")
     args = p.parse_args()
@@ -80,6 +86,8 @@ def load_config() -> Config:
         city_slug=city_to_slug(args.city),
         headless=headless,
         output_dir=args.output_dir,
+        sender_name=args.sender_name.strip(),
+        sender_contact=args.sender_contact.strip(),
     )
     # пробросим firm отдельно (не часть основного конфига)
     cfg.firm = args.firm  # type: ignore[attr-defined]

@@ -23,6 +23,7 @@ _PRIORITY_RANK = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
 
 @dataclass
 class Company:
+    firm_id: str = NA
     name: str = NA
     category: str = NA
     rating: Optional[float] = None          # None -> н/д
@@ -33,6 +34,14 @@ class Company:
     phone: str = NA
     website: str = NA          # сайт / соцсети
     url: str = NA              # ссылка на карточку 2GIS
+
+    # --- детали для аудита и сообщений (по загруженным отзывам, до 50 новейших) ---
+    loaded_reviews: Optional[int] = None        # сколько отзывов реально загружено
+    unanswered_count: Optional[int] = None      # из них без официального ответа
+    negative_unanswered: Optional[int] = None   # негатив (<=3) без ответа
+    fresh_count: Optional[int] = None           # отзывов за последние 30 дней
+    last_review_date: Optional[str] = None      # ISO-дата новейшего отзыва
+    worst_reviews: list = field(default_factory=list)  # [{rating, date, text, answered}]
 
     priority: str = field(default=PRIORITY_LOW)
 
@@ -81,6 +90,8 @@ class Company:
             "Свежие отзывы (мес)": self._fmt_bool(self.has_fresh_reviews),
             "Владелец отвечает": self._fmt_bool(self.owner_responds),
             "Негатив без ответа (топ-5)": self._fmt_bool(self.negative_without_response),
+            "Отзывов без ответа": self._fmt_num(self.unanswered_count),
+            "Дата последнего отзыва": self.last_review_date or NA,
             "Телефон": self.phone or NA,
             "Сайт/соцсети": self.website or NA,
             "Ссылка 2GIS": self.url or NA,
@@ -90,6 +101,7 @@ class Company:
 CSV_HEADERS = [
     "Приоритет", "Название", "Категория", "Рейтинг", "Кол-во отзывов",
     "Свежие отзывы (мес)", "Владелец отвечает", "Негатив без ответа (топ-5)",
+    "Отзывов без ответа", "Дата последнего отзыва",
     "Телефон", "Сайт/соцсети", "Ссылка 2GIS",
 ]
 
@@ -100,6 +112,13 @@ def sort_key(c: Company):
 
 
 if __name__ == "__main__":
+    # консоль Windows -> UTF-8 (иначе вывод эмодзи приоритетов падает на cp1251)
+    import sys
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
     # быстрые проверки логики приоритета
     cases = [
         # (rc, fresh, rating, neg_no_reply, owner_responds, expect)

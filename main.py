@@ -25,6 +25,7 @@ for _s in (sys.stdout, sys.stderr):
 from config import load_config
 from lead_scoring import (Company, CSV_HEADERS, sort_key,
                           PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW)
+from outreach import build_message, write_outreach_pack
 from scraper import Scraper, BlockedError
 
 
@@ -71,6 +72,8 @@ async def run_single(cfg):
     async with Scraper(cfg) as s:
         c = await s.parse_firm(cfg.firm)
     print_company(c)
+    log("\n--- сообщение-открывашка ---")
+    log(build_message(c, None, cfg))
 
 
 async def run_full(cfg):
@@ -117,10 +120,13 @@ async def run_full(cfg):
     # 2. сортировка по приоритету
     companies.sort(key=sort_key)
 
-    # 3. CSV
+    # 3. CSV + пакет для рассылки
     out = write_csv(companies, cfg)
+    pack = write_outreach_pack(companies, cfg)
     print_summary(companies)
     log(f"\nCSV сохранён: {out}")
+    log(f"Пакет для рассылки: {pack / 'index.html'}")
+    log("  (откройте в браузере: готовые сообщения, ссылки WhatsApp, аудиты)")
     if blocked:
         log("(данные неполные — был обнаружен блок)")
 

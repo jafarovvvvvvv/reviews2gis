@@ -182,6 +182,7 @@ class Scraper:
     # ---------- парсинг одной карточки ----------
     async def parse_firm(self, firm_id: str) -> Company:
         c = Company()
+        c.firm_id = firm_id
         c.category = self.cfg.category
         c.url = f"{self.cfg.domain}/{self.cfg.city_slug}/firm/{firm_id}"
 
@@ -337,6 +338,10 @@ class Scraper:
             c.has_fresh_reviews = False
             c.owner_responds = None
             c.negative_without_response = None
+            c.loaded_reviews = 0
+            c.unanswered_count = 0
+            c.negative_unanswered = 0
+            c.fresh_count = 0
             return
 
         # сортируем по дате создания (новейшие первыми) — не зависим от серверной сортировки
@@ -362,6 +367,33 @@ class Scraper:
             (r.get("rating") or 5) <= NEGATIVE_RATING_MAX and not r.get("official_answer")
             for r in top
         )
+
+        # --- детали для аудита/сообщений (по загруженным отзывам, до 50) ---
+        c.loaded_reviews = len(reviews)
+        c.unanswered_count = sum(1 for r in reviews if not r.get("official_answer"))
+        c.negative_unanswered = sum(
+            1 for r in reviews
+            if (r.get("rating") or 5) <= NEGATIVE_RATING_MAX and not r.get("official_answer"))
+        c.fresh_count = sum(1 for r in reviews
+                            if (now - created(r)) <= timedelta(days=FRESH_DAYS))
+        c.last_review_date = created(reviews[0]).date().isoformat()
+
+        # худшие отзывы (цитаты для аудита): самые низкие оценки, при равенстве — новее
+        worst = sorted(reviews,
+                       key=lambda r: ((r.get("rating") or 5), -created(r).timestamp()))
+        c.worst_reviews = []
+        for r in worst:
+            if (r.get("rating") or 5) > NEGATIVE_RATING_MAX:
+                break  # негатив кончился
+            text = re.sub(r"\s+", " ", (r.get("text") or "")).strip()
+            c.worst_reviews.append({
+                "rating": r.get("rating"),
+                "date": created(r).date().isoformat(),
+                "text": (text[:220] + "…") if len(text) > 220 else text,
+                "answered": bool(r.get("official_answer")),
+            })
+            if len(c.worst_reviews) >= 3:
+                break
 
     async def _fetch_reviews(self, firm_id: str, _retry=True):
         params = {
