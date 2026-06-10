@@ -10,6 +10,7 @@
 """
 import asyncio
 import re
+import sys
 from dataclasses import dataclass
 
 import db
@@ -23,6 +24,10 @@ URL_DOMAIN_RE = re.compile(
 URL_FIRM_RE = re.compile(r"/firm/(\d{6,})")
 
 SCRAPE_LOCK = asyncio.Lock()  # один Playwright одновременно (add/check/scheduler)
+
+# автоустановка браузера: не больше одной попытки на запуск приложения
+_REPAIR_LOCK = asyncio.Lock()
+_repair_attempted = False
 
 
 @dataclass
@@ -56,6 +61,41 @@ def extract_review(raw: dict) -> dict:
         "text": text,
         "answered": bool(raw.get("official_answer")),
     }
+
+
+async def _scrape(row):
+    """Открыть карточку и забрать сырые отзывы (один Playwright за раз)."""
+    async with SCRAPE_LOCK:
+        cfg = MonitorCfg(city_slug=row["city_slug"], domain=row["domain"])
+        async with Scraper(cfg) as s:
+            c = await s.parse_firm(row["firm_id"])
+            return c, s.last_reviews_data
+
+
+async def _install_browsers() -> str:
+    """Автопочинка «Executable doesn't exist»: ставим Chromium тем же
+    интерпретатором и в том же окружении, где упал запуск. Возвращает ''
+    при успехе, иначе текст причины."""
+    global _repair_attempted
+    async with _REPAIR_LOCK:
+        if _repair_attempted:
+            return "автоустановка уже выполнялась в этом запуске"
+        _repair_attempted = True
+        print(f"[monitor] браузер не найден — запускаю: "
+              f"{sys.executable} -m playwright install chromium", flush=True)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "playwright", "install", "chromium",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+            if proc.returncode == 0:
+                print("[monitor] установка браузера завершена", flush=True)
+                return ""
+            lines = (out or b"").decode(errors="replace").strip().splitlines()
+            return "установка не удалась: " + (lines[-1][:150] if lines
+                                               else f"код {proc.returncode}")
+        except Exception as e:
+            return f"установка не удалась: {e}"
 
 
 async def notify_chats(conn, text: str, company_id=None) -> list:
@@ -97,19 +137,28 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         baseline = baseline or row["last_checked"] is None
         db.set_company_status(conn, company_id,
                               db.ST_ADDING if baseline else db.ST_CHECKING)
+        c = data = None
+        err = ""
         try:
-            async with SCRAPE_LOCK:
-                cfg = MonitorCfg(city_slug=row["city_slug"], domain=row["domain"])
-                async with Scraper(cfg) as s:
-                    c = await s.parse_firm(row["firm_id"])
-                    data = s.last_reviews_data
+            c, data = await _scrape(row)
         except Exception as e:
             err = str(e)
-            if "Executable doesn't exist" in err:
-                # типовая беда Playwright: пакет есть, браузер не докачан
-                err = ("Браузер Playwright не найден. Выполните в терминале "
-                       "«python -m playwright install chromium» и перезапустите "
-                       "панель (python app.py).")
+        if err and "Executable doesn't exist" in err:
+            # самовосстановление: ставим браузер и пробуем ещё раз
+            print(f"[monitor] {err}", flush=True)  # полный текст с путём — в консоль
+            fail = await _install_browsers()
+            if not fail:
+                try:
+                    c, data = await _scrape(row)
+                    err = ""
+                except Exception as e2:
+                    err = str(e2)
+                    fail = "браузер не виден даже после установки"
+            if err:
+                err = (f"Браузер Playwright недоступен ({fail}). "
+                       f"{err.splitlines()[0][:160]} — запустите панель из обычного "
+                       f"PowerShell: python app.py")
+        if err:
             db.set_company_status(conn, company_id, db.ST_ERROR, err[:300])
             result["errors"].append(err)
             return result

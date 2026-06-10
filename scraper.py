@@ -81,23 +81,35 @@ class Scraper:
     # ---------- жизненный цикл ----------
     async def __aenter__(self):
         self._pw = await async_playwright().start()
-        self.browser = await self._pw.chromium.launch(
-            headless=self.cfg.headless,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
-        ua = random.choice(USER_AGENTS)
-        self.ctx = await self.browser.new_context(
-            user_agent=ua,
-            locale="ru-RU",
-            viewport={"width": random.randint(1320, 1460), "height": random.randint(840, 960)},
-            extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
-        )
-        await self.ctx.add_init_script(STEALTH_JS)
-        # ловим актуальный ключ reviews-API из живого трафика
-        self.ctx.on("request", self._sniff_key)
-        self.page = await self.ctx.new_page()  # одна вкладка на всю сессию
-        _log(f"  [browser] UA: {ua.split(') ')[-1]}")
-        return self
+        try:
+            launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+            try:
+                self.browser = await self._pw.chromium.launch(
+                    headless=self.cfg.headless, args=launch_args)
+            except Exception as e:
+                # headless shell может быть не виден процессу (наблюдалось на
+                # Windows) — полный Chromium ставится рядом, пробуем его
+                if "Executable doesn't exist" not in str(e):
+                    raise
+                _log("  [browser] headless shell недоступен — пробую полный Chromium")
+                self.browser = await self._pw.chromium.launch(
+                    headless=self.cfg.headless, channel="chromium", args=launch_args)
+            ua = random.choice(USER_AGENTS)
+            self.ctx = await self.browser.new_context(
+                user_agent=ua,
+                locale="ru-RU",
+                viewport={"width": random.randint(1320, 1460), "height": random.randint(840, 960)},
+                extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"},
+            )
+            await self.ctx.add_init_script(STEALTH_JS)
+            # ловим актуальный ключ reviews-API из живого трафика
+            self.ctx.on("request", self._sniff_key)
+            self.page = await self.ctx.new_page()  # одна вкладка на всю сессию
+            _log(f"  [browser] UA: {ua.split(') ')[-1]}")
+            return self
+        except Exception:
+            await self.__aexit__()  # не оставляем подвисший драйвер Playwright
+            raise
 
     async def __aexit__(self, *exc):
         try:
