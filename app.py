@@ -17,6 +17,7 @@ SQLite (db.py), проверки — monitor.py, Telegram — tg.py.
 import asyncio
 import html
 import os
+import socket
 import sys
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -537,12 +538,22 @@ async def _serve():
     await server.serve()
 
 
+def _port_busy() -> bool:
+    with socket.socket() as s:
+        return s.connect_ex((HOST, PORT)) == 0
+
+
 if __name__ == "__main__":
     for _s in (sys.stdout, sys.stderr):
         try:
             _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
         except Exception:
             pass
+    if _port_busy():
+        print(f"Похоже, панель уже запущена: http://{HOST}:{PORT} — просто "
+              f"откройте эту ссылку.\nЕсли нужен перезапуск, закройте старый "
+              f"процесс (Ctrl+C в его окне) и запустите снова.", flush=True)
+        sys.exit(0)
     # Proactor-loop обязателен: Playwright запускает браузер субпроцессом.
     # Поэтому uvicorn запускаем внутри своего цикла (server.serve), а не
     # uvicorn.run(), который мог бы переключить event loop policy.
