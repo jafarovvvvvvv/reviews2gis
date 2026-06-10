@@ -58,8 +58,24 @@ CREATE TABLE IF NOT EXISTS reviews(
 CREATE TABLE IF NOT EXISTS chats(
   chat_id  TEXT PRIMARY KEY,
   title    TEXT NOT NULL DEFAULT '',
-  added_at TEXT NOT NULL);
+  added_at TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0);
+
+CREATE TABLE IF NOT EXISTS subscriptions(
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  chat_id    TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+  PRIMARY KEY(company_id, chat_id));
 """
+
+
+def _migrate(conn):
+    """Старые БД: chats без is_admin -> добавить; прежние чаты получали всё,
+    значит они админы."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)")}
+    if "is_admin" not in cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE chats SET is_admin=1")
+        conn.commit()
 
 
 def now_iso() -> str:
@@ -71,6 +87,7 @@ def connect(path=DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -175,20 +192,71 @@ def new_reviews_count(conn, company_id: int, days: int = 7) -> int:
 
 # ---------- telegram chats ----------
 
-def add_chat(conn, chat_id: str, title: str):
-    conn.execute("INSERT INTO chats(chat_id,title,added_at) VALUES(?,?,?) "
-                 "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
-                 (str(chat_id), title, now_iso()))
+def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
+    """Зарегистрировать чат. Возвращает True, если чат новый.
+
+    is_admin=None: самый первый чат становится админом (это владелец),
+    остальные — обычные получатели (их подвязывают к компаниям).
+    """
+    chat_id = str(chat_id)
+    if conn.execute("SELECT 1 FROM chats WHERE chat_id=?", (chat_id,)).fetchone():
+        conn.execute("UPDATE chats SET title=? WHERE chat_id=?", (title, chat_id))
+        conn.commit()
+        return False
+    if is_admin is None:
+        is_admin = conn.execute("SELECT 1 FROM chats LIMIT 1").fetchone() is None
+    conn.execute("INSERT INTO chats(chat_id,title,added_at,is_admin) VALUES(?,?,?,?)",
+                 (chat_id, title, now_iso(), int(is_admin)))
     conn.commit()
+    return True
 
 
 def list_chats(conn):
     return conn.execute("SELECT * FROM chats ORDER BY added_at").fetchall()
 
 
+def get_chat(conn, chat_id: str):
+    return conn.execute("SELECT * FROM chats WHERE chat_id=?",
+                        (str(chat_id),)).fetchone()
+
+
+def set_chat_admin(conn, chat_id: str, is_admin: bool):
+    conn.execute("UPDATE chats SET is_admin=? WHERE chat_id=?",
+                 (int(is_admin), str(chat_id)))
+    conn.commit()
+
+
 def delete_chat(conn, chat_id: str):
     conn.execute("DELETE FROM chats WHERE chat_id=?", (str(chat_id),))
     conn.commit()
+
+
+# ---------- подписки «компания -> чат» ----------
+
+def set_subscriptions(conn, company_id: int, chat_ids: list):
+    conn.execute("DELETE FROM subscriptions WHERE company_id=?", (company_id,))
+    for cid in chat_ids:
+        conn.execute("INSERT OR IGNORE INTO subscriptions(company_id,chat_id) "
+                     "VALUES(?,?)", (company_id, str(cid)))
+    conn.commit()
+
+
+def subscribed_chat_ids(conn, company_id: int) -> set:
+    rows = conn.execute("SELECT chat_id FROM subscriptions WHERE company_id=?",
+                        (company_id,)).fetchall()
+    return {r["chat_id"] for r in rows}
+
+
+def notify_targets(conn, company_id=None):
+    """Чаты-получатели уведомления: админы (получают всё) + подписанные на
+    компанию. company_id=None — только админы (служебные сообщения)."""
+    targets = {c["chat_id"]: c for c in list_chats(conn) if c["is_admin"]}
+    if company_id is not None:
+        subs = subscribed_chat_ids(conn, company_id)
+        for c in list_chats(conn):
+            if c["chat_id"] in subs:
+                targets[c["chat_id"]] = c
+    return list(targets.values())
 
 
 if __name__ == "__main__":
@@ -231,14 +299,45 @@ if __name__ == "__main__":
         checks.append(("update info", row["name"] == "Тест" and row["rating"] == 4.5
                        and row["last_checked"] is not None))
 
-        add_chat(conn, 42, "Эмиль")
-        add_chat(conn, 42, "Эмиль (личный)")
-        checks.append(("chat upsert", [c["title"] for c in list_chats(conn)] == ["Эмиль (личный)"]))
+        checks.append(("первый чат — админ", add_chat(conn, 42, "Эмиль") is True
+                       and get_chat(conn, 42)["is_admin"] == 1))
+        checks.append(("второй чат — не админ", add_chat(conn, 77, "Клиент") is True
+                       and get_chat(conn, 77)["is_admin"] == 0))
+        checks.append(("повторный /start — не новый", add_chat(conn, 42, "Эмиль 2") is False
+                       and get_chat(conn, 42)["title"] == "Эмиль 2"
+                       and get_chat(conn, 42)["is_admin"] == 1))
+
+        # маршрутизация: админ получает всё, подписанный — свою компанию
+        checks.append(("targets: только админ",
+                       [t["chat_id"] for t in notify_targets(conn, cid)] == ["42"]))
+        set_subscriptions(conn, cid, ["77"])
+        checks.append(("targets: админ + подписка",
+                       sorted(t["chat_id"] for t in notify_targets(conn, cid)) == ["42", "77"]))
+        checks.append(("targets: служебное — только админ",
+                       [t["chat_id"] for t in notify_targets(conn)] == ["42"]))
+        set_chat_admin(conn, 42, False)
+        checks.append(("снятие админа", notify_targets(conn) == []))
+        set_chat_admin(conn, 42, True)
+
+        delete_chat(conn, 77)
+        checks.append(("cascade подписок при удалении чата",
+                       subscribed_chat_ids(conn, cid) == set()))
         delete_chat(conn, 42)
-        checks.append(("chat delete", list_chats(conn) == []))
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))
+        conn.close()
+
+        # миграция старой схемы chats (без is_admin)
+        old = sqlite3.connect(Path(td) / "old.db")
+        old.execute("CREATE TABLE chats(chat_id TEXT PRIMARY KEY, "
+                    "title TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL)")
+        old.execute("INSERT INTO chats VALUES('1','старый','2026-01-01')")
+        old.commit()
+        old.close()
+        conn = connect(Path(td) / "old.db")
+        checks.append(("миграция: старый чат стал админом",
+                       get_chat(conn, "1")["is_admin"] == 1))
         conn.close()  # иначе Windows не даст удалить временную папку
 
         ok = 0

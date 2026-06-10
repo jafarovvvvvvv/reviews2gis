@@ -1,9 +1,9 @@
 """
 Telegram-уведомления через Bot API (голый HTTPS, без сторонних SDK).
 
-Привязка чата: пользователь пишет своему боту /start (или любое сообщение),
-приложение по кнопке в настройках вызывает getUpdates и сохраняет найденные
-чаты. Long-polling не используется — конфликтов с getUpdates нет.
+Поллинг getUpdates и команды живут в bot.py (он — единственный потребитель
+getUpdates). Здесь — транспорт (call/send_message/get_me) и чистое
+форматирование уведомлений.
 
 Форматирование сообщений — чистые функции, самотесты: python tg.py
 """
@@ -27,10 +27,11 @@ class TgError(Exception):
     """Ошибка Telegram API (текст — description из ответа)."""
 
 
-async def call(token: str, method: str, **params):
+async def call(token: str, method: str, http_timeout: float = 20, **params):
+    """http_timeout должен превышать timeout long-polling'а getUpdates."""
     url = API.format(token=token.strip(), method=method)
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
             resp = await client.post(url, json=params)
             data = resp.json()
     except Exception as e:
@@ -48,23 +49,6 @@ async def send_message(token: str, chat_id: str, text: str):
 async def get_me(token: str) -> dict:
     """Проверка токена; возвращает {username, ...}."""
     return await call(token, "getMe")
-
-
-async def get_new_chats(token: str, offset: int = 0):
-    """Собрать чаты, написавшие боту. Возвращает ({chat_id: title}, новый offset)."""
-    updates = await call(token, "getUpdates", offset=offset, timeout=0)
-    chats = {}
-    for u in updates:
-        offset = max(offset, u.get("update_id", 0) + 1)
-        msg = u.get("message") or u.get("edited_message") or {}
-        chat = msg.get("chat") or {}
-        if not chat.get("id"):
-            continue
-        title = chat.get("title") or " ".join(
-            x for x in (chat.get("first_name"), chat.get("last_name")) if x) \
-            or chat.get("username") or str(chat["id"])
-        chats[str(chat["id"])] = title
-    return chats, offset
 
 
 # ---------- форматирование уведомлений (чистые функции) ----------

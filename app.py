@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+import bot
 import db
 import monitor
 import tg
@@ -52,9 +53,11 @@ async def lifespan(app):
     if not db.get_setting(conn, "bot_token") and os.getenv("TELEGRAM_BOT_TOKEN"):
         db.set_setting(conn, "bot_token", os.getenv("TELEGRAM_BOT_TOKEN"))
     conn.close()
-    task = asyncio.create_task(monitor.scheduler_loop())
+    tasks = [asyncio.create_task(monitor.scheduler_loop()),
+             asyncio.create_task(bot.bot_loop())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -152,9 +155,13 @@ def fmt_dt(iso: str) -> str:
 def tg_status_line(conn) -> str:
     token = db.get_setting(conn, "bot_token")
     chats = db.list_chats(conn)
+    admins = sum(1 for c in chats if c["is_admin"])
+    if token and admins:
+        return (f'<span class="badge b-ok">Telegram подключён · чатов: {len(chats)}, '
+                f'админских: {admins}</span>')
     if token and chats:
-        return (f'<span class="badge b-ok">Telegram подключён · '
-                f'чатов: {len(chats)}</span>')
+        return ('<span class="badge b-err">нет админ-чата</span> '
+                '<a href="/settings">назначить →</a> (админ получает все уведомления)')
     return ('<span class="badge b-err">Telegram не настроен</span> '
             '<a href="/settings">настроить →</a> (без этого уведомления не уходят)')
 
@@ -281,7 +288,8 @@ async def companies_test(cid: int):
         if rv is None:
             return redirect(f"/company/{cid}", err="В базе ещё нет отзывов этой компании")
         errors = await monitor.notify_chats(
-            conn, tg.fmt_review_alert(c["name"], c["url"], dict(rv), test=True))
+            conn, tg.fmt_review_alert(c["name"], c["url"], dict(rv), test=True),
+            company_id=cid)
     finally:
         conn.close()
     if errors:
@@ -298,6 +306,8 @@ async def company_page(cid: int, request: Request):
         if c is None:
             return redirect("/", err="Компания не найдена")
         reviews = db.recent_reviews(conn, cid, limit=50)
+        all_chats = db.list_chats(conn)
+        subs = db.subscribed_chat_ids(conn, cid)
     finally:
         conn.close()
 
@@ -320,6 +330,24 @@ async def company_page(cid: int, request: Request):
  {e(rv['author'] or 'аноним')}{badges}</div></blockquote>""")
     reviews_html = "".join(quotes) or '<p class="muted">Отзывы ещё не загружены.</p>'
 
+    # маршрутизация: админы получают всё, остальных подписывают галочками
+    admins = [ch for ch in all_chats if ch["is_admin"]]
+    guests = [ch for ch in all_chats if not ch["is_admin"]]
+    admin_line = (", ".join(e(ch["title"]) for ch in admins)
+                  if admins else "нет — назначьте в «Настройках»")
+    if guests:
+        boxes = "".join(
+            f'<label style="display:block;margin:4px 0">'
+            f'<input type="checkbox" name="chat" value="{e(ch["chat_id"])}" '
+            f'{"checked" if ch["chat_id"] in subs else ""}> {e(ch["title"])} '
+            f'<span class="muted">({e(ch["chat_id"])})</span></label>'
+            for ch in guests)
+        routing = f"""<form method="post" action="/companies/{cid}/chats">{boxes}
+ <button class="primary">Сохранить получателей</button></form>"""
+    else:
+        routing = ('<p class="muted">Клиентских чатов пока нет: добавьте бота в чат '
+                   'клиента и отправьте там /start — чат появится здесь.</p>')
+
     busy = c["status"] in (db.ST_ADDING, db.ST_CHECKING)
     body = f"""
 <div class="card">
@@ -338,9 +366,31 @@ async def company_page(cid: int, request: Request):
        onsubmit="return confirm('Удалить компанию и все её отзывы?')">
    <button class="danger">Удалить</button></form>
 </div>
+<div class="card"><h2>Кому слать уведомления</h2>
+ <p class="muted">Админ-чаты получают все компании всегда: <b>{admin_line}</b>.
+ Ниже — дополнительные получатели именно этой компании (например, чат клиента).</p>
+ {routing}
+</div>
 <div class="card"><h2>Отзывы (последние {len(reviews)})</h2>{reviews_html}</div>
 <p><a href="/">← ко всем компаниям</a></p>"""
     return page(c["name"], body, request, refresh=busy)
+
+
+@app.post("/companies/{cid}/chats")
+async def companies_chats(cid: int, request: Request):
+    form = await request.form()
+    chat_ids = form.getlist("chat")
+    conn = db.connect()
+    try:
+        if db.get_company(conn, cid) is None:
+            return redirect("/", err="Компания не найдена")
+        # сохраняем только реально существующие неадминские чаты
+        valid = {c["chat_id"] for c in db.list_chats(conn) if not c["is_admin"]}
+        db.set_subscriptions(conn, cid, [c for c in chat_ids if c in valid])
+        n = len([c for c in chat_ids if c in valid])
+    finally:
+        conn.close()
+    return redirect(f"/company/{cid}", msg=f"Получатели сохранены ({n} доп. чатов)")
 
 
 # ---------- настройки ----------
@@ -359,13 +409,22 @@ async def settings_page(request: Request):
         conn.close()
 
     chat_rows = "".join(f"""<tr><td>{e(ch['title'])}</td><td>{e(ch['chat_id'])}</td>
- <td><form class="inline" method="post" action="/settings/chats/delete">
- <input type="hidden" name="chat_id" value="{e(ch['chat_id'])}">
- <button class="danger">Отвязать</button></form></td></tr>""" for ch in chats)
-    chats_html = (f"<table><tr><th>Чат</th><th>ID</th><th></th></tr>{chat_rows}</table>"
+ <td>{'<span class="badge b-new">админ — получает всё</span>' if ch['is_admin']
+      else '<span class="muted">по подпискам</span>'}</td>
+ <td><form class="inline" method="post" action="/settings/chats/admin">
+   <input type="hidden" name="chat_id" value="{e(ch['chat_id'])}">
+   <input type="hidden" name="value" value="{0 if ch['is_admin'] else 1}">
+   <button>{'Убрать админа' if ch['is_admin'] else 'Сделать админом'}</button></form>
+  <form class="inline" method="post" action="/settings/chats/delete"
+        onsubmit="return confirm('Отвязать чат {e(ch['title'])}?')">
+   <input type="hidden" name="chat_id" value="{e(ch['chat_id'])}">
+   <button class="danger">Отвязать</button></form></td></tr>""" for ch in chats)
+    chats_html = (f"<table><tr><th>Чат</th><th>ID</th><th>Роль</th><th></th></tr>"
+                  f"{chat_rows}</table>"
                   if chats else '<p class="muted">Чаты пока не привязаны.</p>')
-    bot_line = (f'Бот: <b>@{e(bot_username)}</b> — напишите ему /start и нажмите '
-                f'«Найти чаты».' if bot_username else
+    bot_line = (f'Бот: <b>@{e(bot_username)}</b> — напишите ему /start, чат '
+                f'привяжется сам (первый чат становится админом).'
+                if bot_username else
                 'Токен не проверен — сохраните его, и я проверю подключение.')
 
     body = f"""
@@ -384,18 +443,32 @@ async def settings_page(request: Request):
  </form>
 </div>
 <div class="card">
- <h2>Привязка чатов</h2>
+ <h2>Чаты и роли</h2>
  <p>{bot_line}</p>
  <ol class="help muted">
-  <li>Напишите боту в Telegram любое сообщение (например /start) — лично или добавьте его в группу.</li>
-  <li>Нажмите «Найти чаты» — все, кто написал боту, появятся в списке.</li>
+  <li><b>Свой (админский) чат:</b> напишите боту /start в личку — придут все
+      уведомления и команды управления (/help — список).</li>
+  <li><b>Чат клиента:</b> добавьте бота в группу клиента, отправьте там /start,
+      затем на странице компании отметьте этот чат галочкой — туда пойдут
+      только отзывы этой компании.</li>
  </ol>
- <form class="inline" method="post" action="/settings/scan-chats"><button class="primary">Найти чаты</button></form>
- <form class="inline" method="post" action="/settings/test"><button>Отправить тестовое сообщение</button></form>
+ <form class="inline" method="post" action="/settings/test"><button>Отправить тестовое сообщение (в админ-чаты)</button></form>
  <div style="margin-top:12px">{chats_html}</div>
 </div>
 <p><a href="/">← к компаниям</a></p>"""
     return page("Настройки", body, request)
+
+
+@app.post("/settings/chats/admin")
+async def settings_chat_admin(request: Request):
+    form = await request.form()
+    conn = db.connect()
+    try:
+        db.set_chat_admin(conn, str(form.get("chat_id", "")),
+                          form.get("value") == "1")
+    finally:
+        conn.close()
+    return redirect("/settings", msg="Роль чата обновлена")
 
 
 @app.post("/settings/save")
@@ -422,41 +495,12 @@ async def settings_save(request: Request):
             db.set_setting(conn, "bot_username", me.get("username", ""))
             return redirect("/settings",
                             msg=f"Сохранено. Бот @{me.get('username')} на связи — "
-                                f"напишите ему /start и нажмите «Найти чаты»")
+                                f"напишите ему /start, чат привяжется сам")
         except tg.TgError as ex:
             db.set_setting(conn, "bot_username", "")
             return redirect("/settings", err=f"Токен сохранён, но Telegram ответил: {ex}")
     finally:
         conn.close()
-
-
-@app.post("/settings/scan-chats")
-async def settings_scan_chats():
-    conn = db.connect()
-    try:
-        token = db.get_setting(conn, "bot_token")
-        if not token:
-            return redirect("/settings", err="Сначала сохраните токен бота")
-        offset = int(db.get_setting(conn, "tg_offset", "0"))
-        try:
-            chats, offset = await tg.get_new_chats(token, offset)
-        except tg.TgError as ex:
-            return redirect("/settings", err=f"Telegram: {ex}")
-        db.set_setting(conn, "tg_offset", str(offset))
-        for chat_id, title in chats.items():
-            db.add_chat(conn, chat_id, title)
-            try:
-                await tg.send_message(token, chat_id,
-                                      "✅ Этот чат привязан к уведомлениям об отзывах 2ГИС.")
-            except tg.TgError:
-                pass
-        n = len(chats)
-    finally:
-        conn.close()
-    if n:
-        return redirect("/settings", msg=f"Привязано чатов: {n}")
-    return redirect("/settings", err="Новых чатов не нашёл. Напишите боту /start и "
-                                     "нажмите «Найти чаты» ещё раз.")
 
 
 @app.post("/settings/chats/delete")

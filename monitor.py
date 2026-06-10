@@ -58,13 +58,17 @@ def extract_review(raw: dict) -> dict:
     }
 
 
-async def notify_chats(conn, text: str) -> list:
-    """Разослать text во все привязанные чаты. Возвращает список ошибок."""
+async def notify_chats(conn, text: str, company_id=None) -> list:
+    """Разослать text получателям: админ-чаты (получают всё) + чаты,
+    подписанные на company_id. Возвращает список ошибок."""
     token = db.get_setting(conn, "bot_token")
-    chats = db.list_chats(conn)
+    chats = db.notify_targets(conn, company_id)
     errors = []
-    if not token or not chats:
-        return ["Telegram не настроен (токен/чаты) — уведомление не отправлено"]
+    if not token:
+        return ["Telegram не настроен (нет токена) — уведомление не отправлено"]
+    if not chats:
+        return ["нет получателей: напишите боту /start (админ) или подпишите "
+                "чат на компанию на её странице"]
     for chat in chats:
         try:
             await tg.send_message(token, chat["chat_id"], text)
@@ -132,7 +136,8 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         for rv in new:
             if notify_all or tg.is_negative(rv.get("rating")):
                 result["errors"] += await notify_chats(
-                    conn, tg.fmt_review_alert(c.name, row["url"], rv))
+                    conn, tg.fmt_review_alert(c.name, row["url"], rv),
+                    company_id=company_id)
         result["new"] = new
         return result
     finally:
