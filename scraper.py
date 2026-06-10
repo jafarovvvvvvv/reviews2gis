@@ -70,6 +70,9 @@ class Scraper:
         self.review_key = DEFAULT_REVIEW_KEY
         self.review_api_base = "https://public-api.reviews.2gis.com/3.0/"
         self._key_from_page = False  # был ли ключ хоть раз получен со страницы
+        # сырой ответ reviews-API последней разобранной фирмы (нужен monitor.py
+        # для дифа отзывов; сбрасывается в начале parse_firm)
+        self.last_reviews_data = None
         self._pw = None
         self.browser = None
         self.ctx = None
@@ -181,6 +184,7 @@ class Scraper:
 
     # ---------- парсинг одной карточки ----------
     async def parse_firm(self, firm_id: str) -> Company:
+        self.last_reviews_data = None  # не отдать данные предыдущей фирмы
         c = Company()
         c.firm_id = firm_id
         c.category = self.cfg.category
@@ -323,6 +327,7 @@ class Scraper:
     # ---------- отзывы через API ----------
     async def _extract_reviews(self, c: Company, firm_id: str):
         data = await self._fetch_reviews(firm_id)
+        self.last_reviews_data = data
         if data is None:
             return  # оставляем рейтинг/кол-во из og:*, а review-флаги — None (н/д)
 

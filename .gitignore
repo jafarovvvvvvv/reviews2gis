@@ -14,6 +14,10 @@ explore_dump/
 *.jpg
 *.jpeg
 
+# --- БД мониторинга (реальные отзывы, чаты Telegram) ---
+monitor.db
+*.db
+
 # --- Python ---
 __pycache__/
 *.pyc
