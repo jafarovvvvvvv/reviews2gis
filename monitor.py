@@ -13,6 +13,7 @@ import re
 import sys
 from dataclasses import dataclass
 
+import ai_reply
 import db
 import tg
 from lead_scoring import NA
@@ -182,10 +183,19 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         # уведомления: старые первыми, чтобы лента в Telegram шла хронологично
         new.sort(key=lambda r: r.get("date_created") or "")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
+        fresh_row = db.get_company(conn, company_id)  # с обновлённым именем/тоном
         for rv in new:
             if notify_all or tg.is_negative(rv.get("rating")):
+                # AI-варианты ответа; любая ошибка генерации не должна
+                # останавливать доставку алерта
+                ai = []
+                try:
+                    ai = await ai_reply.generate_for_company(conn, fresh_row, rv)
+                except ai_reply.AiReplyError as e:
+                    print(f"[ai] {e}", flush=True)
+                    result["errors"].append(str(e))
                 result["errors"] += await notify_chats(
-                    conn, tg.fmt_review_alert(c.name, row["url"], rv),
+                    conn, tg.fmt_review_alert(c.name, row["url"], rv, ai_replies=ai),
                     company_id=company_id)
         result["new"] = new
         return result

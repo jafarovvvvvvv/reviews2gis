@@ -1,0 +1,203 @@
+"""
+AI-черновики ответов на отзывы (этап 1 ROADMAP).
+
+Генерация через OpenAI API голым HTTPS (без SDK — в духе tg.py). Ключ и модель:
+настройки openai_api_key/openai_model в БД (панель) либо .env OPENAI_API_KEY /
+OPENAI_MODEL (по умолчанию gpt-5.4-mini).
+
+Правила ответов 2ГИС зашиты в системный промпт (по официальной инструкции
+help.2gis: вежливо, без рекламы/конкурентов/споров, персонализация, контакт,
+публичное решение проблемы). Язык ответа = язык отзыва (ru/kk — детект по
+казахским буквам). Автопубликации нет — владелец копирует ответ в кабинет сам.
+
+Деградация: нет ключа -> generate_replies возвращает [] и алерт остаётся со
+статичным шаблоном; ошибка API -> AiReplyError (вызывающий решает, глушить ли).
+Чистые функции — без сети, самотесты: python ai_reply.py
+"""
+import json
+import os
+import re
+
+import httpx
+from dotenv import load_dotenv
+
+import db
+
+load_dotenv()  # OPENAI_API_KEY/OPENAI_MODEL доступны и вне app.py (бот, скрипты)
+
+API_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = "gpt-5.4-mini"
+MAX_VARIANTS = 2
+
+# буквы, встречающиеся в казахском и отсутствующие в русском
+_KK_LETTERS = set("әғқңөұүһі")
+
+SYSTEM_PROMPT = """Ты — специалист по работе с отзывами локального бизнеса в Казахстане.
+Готовишь черновики ПУБЛИЧНЫХ ответов официального представителя компании на отзыв в 2ГИС.
+
+Строго соблюдай правила площадки 2ГИС:
+- вежливо и спокойно; никаких оскорблений, сарказма, споров с автором и оправдательной перепалки;
+- никакой рекламы, акций, промокодов и упоминаний конкурентов;
+- персонализируй ответ по содержанию отзыва — шаблонная отписка недопустима;
+- негативный отзыв: признай проблему, коротко извинись, предложи связаться для решения
+  и скажи, что будет сделано; не обещай компенсаций, которых компания не давала;
+- позитивный отзыв: поблагодари за конкретику из отзыва, пригласи снова;
+- не выдумывай факты и имена; пиши 2–4 предложения, без капса, максимум один уместный эмодзи.
+
+Ответ пиши на языке: {lang_name}.
+Верни строго JSON без пояснений: {{"replies": ["вариант 1", "вариант 2"]}} —
+два разных по формулировке и структуре варианта."""
+
+
+class AiReplyError(Exception):
+    """Ошибка генерации (текст — для показа админу)."""
+
+
+def detect_lang(text: str) -> str:
+    """'kk' если в тексте есть казахские буквы (≥2), иначе 'ru'."""
+    hits = sum(1 for ch in (text or "").lower() if ch in _KK_LETTERS)
+    return "kk" if hits >= 2 else "ru"
+
+
+def get_ai_settings(conn) -> tuple:
+    """(api_key, model) из настроек БД с фолбэком на переменные окружения."""
+    key = db.get_setting(conn, "openai_api_key") or os.getenv("OPENAI_API_KEY", "")
+    model = (db.get_setting(conn, "openai_model") or os.getenv("OPENAI_MODEL", "")
+             or DEFAULT_MODEL)
+    return key.strip(), model.strip()
+
+
+def build_messages(company_name: str, review: dict, tone: str = "",
+                   signature: str = "", category: str = "") -> list:
+    """Сообщения для chat-completions. Чистая функция."""
+    text = (review.get("text") or "").strip() or "(отзыв без текста, только оценка)"
+    lang = detect_lang(text)
+    lang_name = "казахский" if lang == "kk" else "русский"
+    rating = review.get("rating")
+    rating_s = f"{rating}/5" if rating is not None else "без оценки"
+    author = review.get("author") or "клиент"
+
+    user = (f"Компания: «{company_name}»"
+            + (f", сфера: {category}" if category else "") + ".\n"
+            f"Тон бренда: {tone or 'нейтрально-доброжелательный'}.\n"
+            + (f"Подпись/контакт для связи: {signature} — аккуратно используй в конце ответа.\n"
+               if signature else "")
+            + f"Отзыв (оценка {rating_s}, автор: {author}):\n«{text}»")
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT.format(lang_name=lang_name)},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_replies(content: str) -> list:
+    """Достать варианты из ответа модели. Терпит код-фенсы и мусор вокруг JSON."""
+    content = (content or "").strip()
+    if not content:
+        return []
+    m = re.search(r"\{.*\}", content, re.S)  # JSON может быть обёрнут в ```…```
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            replies = [str(r).strip() for r in data.get("replies", []) if str(r).strip()]
+            if replies:
+                return replies[:MAX_VARIANTS]
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    # модель ответила просто текстом — используем как единственный вариант
+    return [content[:900]]
+
+
+async def generate_replies(company_name: str, review: dict, tone: str = "",
+                           signature: str = "", category: str = "",
+                           api_key: str = "", model: str = "") -> list:
+    """0–2 варианта ответа. Пустой список — ключ не задан (тихая деградация)."""
+    if not api_key:
+        return []
+    messages = build_messages(company_name, review, tone, signature, category)
+    payload = {
+        "model": model or DEFAULT_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        # лимит с запасом: у reasoning-моделей сюда входят и токены размышлений
+        "max_completion_tokens": 2000,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            resp = await client.post(API_URL, json=payload,
+                                     headers={"Authorization": f"Bearer {api_key}"})
+            data = resp.json()
+    except Exception as e:
+        raise AiReplyError(f"OpenAI недоступен: {e}") from e
+    if resp.status_code != 200:
+        err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+        raise AiReplyError(f"OpenAI: {err[:200]}")
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise AiReplyError(f"OpenAI: неожиданный формат ответа ({e})") from e
+    return parse_replies(content)
+
+
+async def generate_for_company(conn, company_row, review: dict) -> list:
+    """Удобная обёртка: настройки из БД + поля тона из карточки компании."""
+    api_key, model = get_ai_settings(conn)
+    keys = company_row.keys() if hasattr(company_row, "keys") else []
+    return await generate_replies(
+        company_name=company_row["name"],
+        review=review,
+        tone=company_row["tone"] if "tone" in keys else "",
+        signature=company_row["reply_signature"] if "reply_signature" in keys else "",
+        category=company_row["category"] if "category" in keys else "",
+        api_key=api_key, model=model)
+
+
+if __name__ == "__main__":
+    import sys
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    checks = []
+
+    checks.append(("lang: русский", detect_lang("Очень плохо, не рекомендую") == "ru"))
+    checks.append(("lang: казахский", detect_lang("Өте жақсы дәрігер, рахмет!") == "kk"))
+    checks.append(("lang: пусто -> ru", detect_lang("") == "ru"))
+    checks.append(("lang: одна буква -> ru", detect_lang("сәлем по-русски") == "ru"))
+
+    msgs = build_messages("Клиника Аруна", {"rating": 1, "author": "Айка",
+                                            "text": "Хамят на ресепшн"},
+                          tone="тёплый", signature="WhatsApp +7 700 000 00 00",
+                          category="стоматология")
+    sys_c, user_c = msgs[0]["content"], msgs[1]["content"]
+    checks.append(("промпт: правила 2ГИС", "2ГИС" in sys_c and "конкурент" in sys_c))
+    checks.append(("промпт: язык русский", "русский" in sys_c))
+    checks.append(("промпт: JSON-формат", '"replies"' in sys_c))
+    checks.append(("промпт: компания/тон/подпись",
+                   "Аруна" in user_c and "тёплый" in user_c and "WhatsApp" in user_c))
+    checks.append(("промпт: текст отзыва", "Хамят" in user_c))
+
+    kk = build_messages("X", {"text": "Дәрігер өте жақсы, рахмет үлкен!"})
+    checks.append(("промпт: казахский детект", "казахский" in kk[0]["content"]))
+    no_text = build_messages("X", {"rating": 2, "text": ""})
+    checks.append(("промпт: отзыв без текста", "без текста" in no_text[1]["content"]))
+
+    checks.append(("parse: чистый JSON",
+                   parse_replies('{"replies": ["Ответ один", "Ответ два"]}')
+                   == ["Ответ один", "Ответ два"]))
+    checks.append(("parse: код-фенс",
+                   parse_replies('```json\n{"replies": ["A", "B"]}\n```') == ["A", "B"]))
+    checks.append(("parse: обрезка до 2",
+                   len(parse_replies('{"replies": ["1", "2", "3"]}')) == 2))
+    checks.append(("parse: голый текст -> 1 вариант",
+                   parse_replies("Просто текст ответа") == ["Просто текст ответа"]))
+    checks.append(("parse: пусто", parse_replies("") == []))
+    checks.append(("parse: битый JSON -> текст",
+                   parse_replies('{"replies": [не json') == ['{"replies": [не json']))
+
+    ok = 0
+    for label, passed in checks:
+        print(f"  [{'OK ' if passed else 'FAIL'}] {label}")
+        ok += passed
+    print(f"{ok}/{len(checks)} passed")

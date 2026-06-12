@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS companies(
   status        TEXT NOT NULL DEFAULT 'adding',
   error         TEXT NOT NULL DEFAULT '',
   added_at      TEXT NOT NULL,
-  last_checked  TEXT);
+  last_checked  TEXT,
+  tone            TEXT NOT NULL DEFAULT '',   -- тон бренда для AI-ответов
+  reply_signature TEXT NOT NULL DEFAULT '');  -- подпись/контакт в конце ответа
 
 CREATE TABLE IF NOT EXISTS reviews(
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,11 +72,16 @@ CREATE TABLE IF NOT EXISTS subscriptions(
 
 def _migrate(conn):
     """Старые БД: chats без is_admin -> добавить; прежние чаты получали всё,
-    значит они админы."""
+    значит они админы. companies: поля тона/подписи для AI-ответов."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)")}
     if "is_admin" not in cols:
         conn.execute("ALTER TABLE chats ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE chats SET is_admin=1")
+        conn.commit()
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(companies)")}
+    if "tone" not in cols:
+        conn.execute("ALTER TABLE companies ADD COLUMN tone TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE companies ADD COLUMN reply_signature TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -178,6 +185,11 @@ def recent_reviews(conn, company_id: int, limit: int = 30):
 def latest_review(conn, company_id: int):
     rows = recent_reviews(conn, company_id, limit=1)
     return rows[0] if rows else None
+
+
+def get_review(conn, review_row_id: int):
+    return conn.execute("SELECT * FROM reviews WHERE id=?",
+                        (review_row_id,)).fetchone()
 
 
 def new_reviews_count(conn, company_id: int, days: int = 7) -> int:
@@ -333,11 +345,17 @@ if __name__ == "__main__":
         old.execute("CREATE TABLE chats(chat_id TEXT PRIMARY KEY, "
                     "title TEXT NOT NULL DEFAULT '', added_at TEXT NOT NULL)")
         old.execute("INSERT INTO chats VALUES('1','старый','2026-01-01')")
+        old.execute("CREATE TABLE companies(id INTEGER PRIMARY KEY, "
+                    "firm_id TEXT, city_slug TEXT, added_at TEXT)")
+        old.execute("INSERT INTO companies VALUES(1,'9','almaty','2026-01-01')")
         old.commit()
         old.close()
         conn = connect(Path(td) / "old.db")
         checks.append(("миграция: старый чат стал админом",
                        get_chat(conn, "1")["is_admin"] == 1))
+        row = get_company(conn, 1)
+        checks.append(("миграция: тон/подпись добавлены",
+                       row["tone"] == "" and row["reply_signature"] == ""))
         conn.close()  # иначе Windows не даст удалить временную папку
 
         ok = 0

@@ -24,6 +24,7 @@ parse_command, самотесты: python bot.py
 import asyncio
 import html
 
+import ai_reply
 import db
 import monitor
 import tg
@@ -34,6 +35,7 @@ HELP_ADMIN = (
     "/add <ссылка 2ГИС> — добавить компанию\n"
     "/del <N> — удалить компанию №N\n"
     "/check [N] — проверить все (или №N)\n"
+    "/reply <N> — AI-ответ на последний отзыв компании №N\n"
     "/status — настройки и состояние\n"
     "/interval <мин> — интервал автопроверки\n"
     "/mode all|neg — все отзывы / только негатив\n"
@@ -228,6 +230,36 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
                 await _reply(token, chat_id, "Режим: только негатив (оценка ≤3).")
             else:
                 await _reply(token, chat_id, "Так: /mode all — все, /mode neg — только негатив")
+
+        elif cmd == "reply":
+            c = _company_by_num(companies, args)
+            if c is None:
+                await _reply(token, chat_id, "Укажите номер из /list: /reply 2")
+                return
+            rv = db.latest_review(conn, c["id"])
+            if rv is None:
+                await _reply(token, chat_id, "У этой компании ещё нет отзывов в базе.")
+                return
+            api_key, _ = ai_reply.get_ai_settings(conn)
+            if not api_key:
+                await _reply(token, chat_id, "AI не настроен: добавьте ключ OpenAI "
+                                             "в «Настройках» панели.")
+                return
+            await _reply(token, chat_id, "Генерирую варианты…")
+            try:
+                variants = await ai_reply.generate_for_company(conn, c, dict(rv))
+            except ai_reply.AiReplyError as ex:
+                await _reply(token, chat_id, f"⚠ {e(str(ex))}")
+                return
+            if not variants:
+                await _reply(token, chat_id, "Модель не вернула вариантов — "
+                                             "повторите /reply.")
+                return
+            text = (rv["text"] or "(без текста)")[:200]
+            parts = [f"Отзыв ({tg.stars(rv['rating'])}): «{e(text)}»"]
+            for i, v in enumerate(variants, 1):
+                parts.append(f"Вариант {i} (тап — скопируется):\n<pre>{e(v)}</pre>")
+            await _reply(token, chat_id, "\n".join(parts))
 
         elif cmd == "test":
             await _reply(token, chat_id, "🔔 Тест: уведомления работают.")

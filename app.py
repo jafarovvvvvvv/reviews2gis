@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+import ai_reply
 import bot
 import db
 import monitor
@@ -53,6 +54,11 @@ async def lifespan(app):
     conn = db.connect()
     if not db.get_setting(conn, "bot_token") and os.getenv("TELEGRAM_BOT_TOKEN"):
         db.set_setting(conn, "bot_token", os.getenv("TELEGRAM_BOT_TOKEN"))
+    if not db.get_setting(conn, "openai_api_key") and os.getenv("OPENAI_API_KEY"):
+        db.set_setting(conn, "openai_api_key", os.getenv("OPENAI_API_KEY"))
+    if not db.get_setting(conn, "openai_model"):
+        db.set_setting(conn, "openai_model",
+                       os.getenv("OPENAI_MODEL") or ai_reply.DEFAULT_MODEL)
     conn.close()
     tasks = [asyncio.create_task(monitor.scheduler_loop()),
              asyncio.create_task(bot.bot_loop())]
@@ -288,8 +294,14 @@ async def companies_test(cid: int):
         rv = db.latest_review(conn, cid)
         if rv is None:
             return redirect(f"/company/{cid}", err="В базе ещё нет отзывов этой компании")
+        ai = []
+        try:
+            ai = await ai_reply.generate_for_company(conn, c, dict(rv))
+        except ai_reply.AiReplyError as ex:
+            print(f"[ai] тест: {ex}", flush=True)
         errors = await monitor.notify_chats(
-            conn, tg.fmt_review_alert(c["name"], c["url"], dict(rv), test=True),
+            conn, tg.fmt_review_alert(c["name"], c["url"], dict(rv), test=True,
+                                      ai_replies=ai),
             company_id=cid)
     finally:
         conn.close()
@@ -328,7 +340,8 @@ async def company_page(cid: int, request: Request):
         text = e(rv["text"] or "(без текста)")
         quotes.append(f"""<blockquote class="{'neg' if neg else ''}">{text}
  <div class="meta">{tg.stars(rv['rating'])} · {e((rv['date_created'] or '')[:10])} ·
- {e(rv['author'] or 'аноним')}{badges}</div></blockquote>""")
+ {e(rv['author'] or 'аноним')}{badges} ·
+ <a href="/company/{cid}/reply/{rv['id']}">AI-ответ →</a></div></blockquote>""")
     reviews_html = "".join(quotes) or '<p class="muted">Отзывы ещё не загружены.</p>'
 
     # маршрутизация: админы получают всё, остальных подписывают галочками
@@ -372,9 +385,88 @@ async def company_page(cid: int, request: Request):
  Ниже — дополнительные получатели именно этой компании (например, чат клиента).</p>
  {routing}
 </div>
+<div class="card"><h2>Тон AI-ответов</h2>
+ <p class="muted">Стиль, в котором AI готовит ответы на отзывы этой компании,
+ и подпись/контакт в конце ответа (например, WhatsApp администратора).</p>
+ <form method="post" action="/companies/{cid}/reply-settings">
+  <p><input type="text" name="tone" value="{e(c['tone'] or '')}"
+        placeholder="Тон: тёплый и заботливый / деловой и краткий / молодёжный…"></p>
+  <p><input type="text" name="signature" value="{e(c['reply_signature'] or '')}"
+        placeholder="Подпись/контакт: С уважением, клиника N · WhatsApp +7 …"></p>
+  <button class="primary">Сохранить тон</button>
+ </form>
+</div>
 <div class="card"><h2>Отзывы (последние {len(reviews)})</h2>{reviews_html}</div>
 <p><a href="/">← ко всем компаниям</a></p>"""
     return page(c["name"], body, request, refresh=busy)
+
+
+@app.post("/companies/{cid}/reply-settings")
+async def companies_reply_settings(cid: int, request: Request):
+    form = await request.form()
+    conn = db.connect()
+    try:
+        if db.get_company(conn, cid) is None:
+            return redirect("/", err="Компания не найдена")
+        conn.execute("UPDATE companies SET tone=?, reply_signature=? WHERE id=?",
+                     (str(form.get("tone", "")).strip(),
+                      str(form.get("signature", "")).strip(), cid))
+        conn.commit()
+    finally:
+        conn.close()
+    return redirect(f"/company/{cid}", msg="Тон AI-ответов сохранён")
+
+
+@app.get("/company/{cid}/reply/{review_id}", response_class=HTMLResponse)
+async def company_reply_page(cid: int, review_id: int, request: Request):
+    """Генерация AI-ответов на конкретный отзыв (синхронно, ~5–10 сек)."""
+    e = html.escape
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, cid)
+        rv = db.get_review(conn, review_id)
+        if c is None or rv is None or rv["company_id"] != cid:
+            return redirect("/", err="Отзыв не найден")
+        api_key, _ = ai_reply.get_ai_settings(conn)
+        if not api_key:
+            return redirect(f"/company/{cid}",
+                            err="AI не настроен: добавьте ключ OpenAI в «Настройках»")
+        try:
+            replies = await ai_reply.generate_for_company(conn, c, dict(rv))
+        except ai_reply.AiReplyError as ex:
+            return redirect(f"/company/{cid}", err=str(ex))
+    finally:
+        conn.close()
+
+    variants = "".join(f"""<div class="card"><b>Вариант {i}</b>
+ <button style="float:right" onclick="copyMsg('v{i}',this)">Копировать</button>
+ <pre id="v{i}">{e(r)}</pre></div>""" for i, r in enumerate(replies, 1)) \
+        or '<p class="muted">Модель не вернула вариантов — попробуйте ещё раз.</p>'
+    body = f"""
+<div class="card">
+ <h1>AI-ответ на отзыв — {e(c['name'])}</h1>
+ <blockquote class="{'neg' if tg.is_negative(rv['rating']) else ''}">{e(rv['text'] or '(без текста)')}
+  <div class="meta">{tg.stars(rv['rating'])} · {e((rv['date_created'] or '')[:10])} ·
+  {e(rv['author'] or 'аноним')}</div></blockquote>
+ <p class="muted">Скопируйте вариант и опубликуйте в кабинете 2ГИС от имени компании.
+ Тон настраивается на странице компании.</p>
+</div>
+{variants}
+<p><a href="/company/{cid}/reply/{review_id}">↻ Сгенерировать ещё</a> ·
+ <a href="/company/{cid}">← к компании</a></p>
+<script>
+function copyMsg(id, btn){{
+  const t = document.getElementById(id).innerText;
+  const done = () => {{ btn.textContent = 'Скопировано ✓';
+                        setTimeout(() => btn.textContent = 'Копировать', 1500); }};
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(t).then(done);
+  else {{ const ta = document.createElement('textarea'); ta.value = t;
+         document.body.appendChild(ta); ta.select();
+         document.execCommand('copy'); ta.remove(); done(); }}
+}}
+</script>"""
+    return page(f"AI-ответ — {c['name']}", body, request)
 
 
 @app.post("/companies/{cid}/chats")
@@ -406,8 +498,14 @@ async def settings_page(request: Request):
         interval = db.get_setting(conn, "check_interval_min", "360")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
         chats = db.list_chats(conn)
+        ai_key, ai_model = ai_reply.get_ai_settings(conn)
     finally:
         conn.close()
+    ai_status = (f'<span class="badge b-ok">подключены · {e(ai_model)}</span>'
+                 if ai_key else
+                 '<span class="badge b-err">нет ключа — в алертах статичный шаблон</span>')
+    ai_key_hint = f"сохранён: …{e(ai_key[-6:])} — введите новый, чтобы заменить" \
+        if ai_key else "sk-…"
 
     chat_rows = "".join(f"""<tr><td>{e(ch['title'])}</td><td>{e(ch['chat_id'])}</td>
  <td>{'<span class="badge b-new">админ — получает всё</span>' if ch['is_admin']
@@ -440,6 +538,11 @@ async def settings_page(request: Request):
    <span class="muted">не ставьте меньше 30 — частые проверки повышают риск блокировки 2ГИС</span></p>
   <p><label><input type="checkbox" name="notify_all" {'checked' if notify_all else ''}>
    уведомлять обо <b>всех</b> новых отзывах (иначе — только о негативе, оценка ≤3)</label></p>
+  <p><b>AI-ответы на отзывы</b> {ai_status}<br>
+   <span class="muted">Ключ OpenAI API; модель менять только осознанно.</span><br>
+   <input type="text" name="openai_key" value="" placeholder="{ai_key_hint}"
+          autocomplete="off" style="margin-bottom:6px">
+   <input type="text" name="openai_model" value="{e(ai_model)}" style="width:240px"></p>
   <button class="primary">Сохранить</button>
  </form>
 </div>
@@ -483,11 +586,17 @@ async def settings_save(request: Request):
     except ValueError:
         interval = "360"
 
+    openai_key = str(form.get("openai_key", "")).strip()
+    openai_model = str(form.get("openai_model", "")).strip() or ai_reply.DEFAULT_MODEL
+
     conn = db.connect()
     try:
         db.set_setting(conn, "bot_token", token)
         db.set_setting(conn, "check_interval_min", interval)
         db.set_setting(conn, "notify_all", notify_all)
+        if openai_key:  # пустое поле = оставить прежний ключ
+            db.set_setting(conn, "openai_api_key", openai_key)
+        db.set_setting(conn, "openai_model", openai_model)
         if not token:
             db.set_setting(conn, "bot_username", "")
             return redirect("/settings", msg="Сохранено (токен пуст — уведомления выключены)")

@@ -63,8 +63,12 @@ def is_negative(rating: Optional[int]) -> bool:
 
 
 def fmt_review_alert(company_name: str, company_url: str, rv: dict,
-                     test: bool = False) -> str:
-    """Уведомление о новом отзыве. rv: rating/date_created/author/text/answered."""
+                     test: bool = False, ai_replies: list = None) -> str:
+    """Уведомление о новом отзыве. rv: rating/date_created/author/text/answered.
+
+    ai_replies — готовые варианты ответа (ai_reply.py); в Telegram <pre>-блок
+    копируется одним тапом. Без них на негатив идёт статичный шаблон.
+    """
     e = html.escape
     rating = rv.get("rating")
     neg = is_negative(rating)
@@ -82,7 +86,11 @@ def fmt_review_alert(company_name: str, company_url: str, rv: dict,
         f"«{e(text)}»",
         f'<a href="{e(company_url)}">Карточка в 2ГИС</a> — ответить можно в кабинете.',
     ]
-    if neg:
+    if ai_replies:
+        lines.append("\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
+        for i, reply in enumerate(ai_replies, 1):
+            lines.append(f"Вариант {i}:\n<pre>{e(reply)}</pre>")
+    elif neg:
         lines.append(f"\n✍ Черновик ответа:\n<i>{e(NEGATIVE_DRAFT)}</i>")
     return "\n".join(lines)
 
@@ -120,6 +128,15 @@ if __name__ == "__main__":
 
     long = fmt_review_alert("Y", "u", {"rating": 1, "text": "ы" * 600})
     checks.append(("обрезка длинного текста", "ы" * 501 not in long and "…" in long))
+
+    ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"},
+                          ai_replies=["Ответ <раз>", "Ответ два"])
+    checks.append(("ai: оба варианта в pre",
+                   ai.count("<pre>") == 2 and "Вариант 2" in ai))
+    checks.append(("ai: экранирование", "&lt;раз&gt;" in ai))
+    checks.append(("ai: статичный шаблон не дублируется", "Черновик ответа" not in ai))
+    no_ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"}, ai_replies=[])
+    checks.append(("ai: пустой список -> старый шаблон", "Черновик ответа" in no_ai))
 
     ok = 0
     for label, passed in checks:
