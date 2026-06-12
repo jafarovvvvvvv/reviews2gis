@@ -25,7 +25,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 
 import ai_reply
 import bot
@@ -69,56 +69,148 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 
+# Рабочее имя продукта для витрины (поменять — одна строка)
+BRAND = "Пульс Карты"
+
+
+@app.middleware("http")
+async def local_guard(request: Request, call_next):
+    """Защита локальной панели: DNS rebinding (чужой Host) и CSRF
+    (form-POST с чужого сайта на 127.0.0.1). Браузер при кросс-сайтовом
+    POST всегда шлёт Origin — чужой Origin отклоняем; отсутствие Origin
+    означает same-origin или не-браузерный клиент (curl) — пропускаем."""
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host not in ("127.0.0.1", "localhost"):
+        return PlainTextResponse("Forbidden: unknown host", status_code=403)
+    if request.method == "POST":
+        source = request.headers.get("origin") or request.headers.get("referer") or ""
+        if source:
+            src_host = (urllib.parse.urlparse(source).hostname or "").lower()
+            if src_host not in ("127.0.0.1", "localhost"):
+                return PlainTextResponse("Forbidden: cross-site POST", status_code=403)
+    return await call_next(request)
+
+
 # ---------- HTML-каркас ----------
 
 CSS = """
-body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#f4f6fa;color:#1a1a2e}
-header{background:#1a1a2e;color:#fff;padding:12px 24px;display:flex;gap:24px;align-items:center}
-header a{color:#cdd3ff;text-decoration:none;font-weight:600}
-header a:hover{color:#fff}
-header .brand{color:#fff;font-size:1.1em}
-main{max-width:980px;margin:20px auto;padding:0 16px}
-.card{background:#fff;border-radius:12px;padding:18px 20px;margin-bottom:16px;
-      box-shadow:0 1px 3px rgba(20,20,60,.08)}
-h1{font-size:1.3em;margin:4px 0 12px}
-h2{font-size:1.05em}
+:root{
+  --paper:#F1F4F0; --card:#FFFFFF; --ink:#122620; --muted:#5C7064;
+  --line:#DFE7DF; --green:#1E7A46; --green-deep:#155C34; --green-soft:#E2F0E6;
+  --red:#D8472B; --red-soft:#FBE9E4; --amber:#B97E14; --amber-soft:#F7EED7;
+  --blue:#2B5FD9; --blue-soft:#E8EEFB;
+}
+*{box-sizing:border-box}
+body{font-family:Manrope,'Segoe UI',Arial,sans-serif;margin:0;background:var(--paper);
+     color:var(--ink);line-height:1.55;font-size:15.5px}
+.mono{font-family:'JetBrains Mono',Consolas,monospace}
+header{background:var(--ink);padding:13px 26px;display:flex;gap:24px;align-items:center;flex-wrap:wrap}
+.brand{font-family:Unbounded,Manrope,sans-serif;font-weight:700;font-size:.98em;
+       letter-spacing:.1em;color:#fff;text-transform:uppercase;text-decoration:none}
+.brand b{color:#7BD389}
+header nav{display:flex;gap:18px;margin-left:auto}
+header nav a{color:#B9CCBE;text-decoration:none;font-weight:600;padding:4px 2px}
+header nav a:hover{color:#fff}
+main{max-width:1080px;margin:24px auto 60px;padding:0 18px}
+h1{font-size:1.45em;font-weight:700;letter-spacing:-.01em;margin:6px 0 14px}
+h2{font-family:'JetBrains Mono',Consolas,monospace;font-size:.76em;font-weight:600;
+   letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:2px 0 12px}
+a{color:var(--green-deep)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+      padding:18px 20px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:14px}
+.company{display:flex;gap:14px;align-items:flex-start;background:var(--card);
+         border:1px solid var(--line);border-radius:14px;padding:16px;
+         transition:border-color .15s,transform .15s}
+.company:hover{border-color:var(--green);transform:translateY(-1px)}
+.pin{flex:0 0 56px;height:56px;display:flex;align-items:center;justify-content:center;
+     border-radius:16px 16px 16px 4px;color:#fff;font-family:Unbounded,Manrope,sans-serif;
+     font-size:1.08em;font-weight:700;letter-spacing:-.02em}
+.pin.g{background:var(--green)} .pin.a{background:var(--amber)}
+.pin.r{background:var(--red)} .pin.n{background:#8A9A8E}
+.pin.big{flex-basis:72px;height:72px;font-size:1.5em}
+.company .body{min-width:0;flex:1}
+.company .name{font-weight:700;text-decoration:none;color:var(--ink);font-size:1.05em}
+.company .name:hover{color:var(--green-deep)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 9px}
+.badge,.chip{display:inline-flex;align-items:center;gap:6px;border-radius:99px;
+      padding:2px 11px;font-size:.8em;font-weight:700}
+.badge::before,.chip::before{content:'';width:6px;height:6px;border-radius:50%;
+      background:currentColor;flex:0 0 6px}
+.chip.ok,.badge.b-ok{background:var(--green-soft);color:var(--green-deep)}
+.chip.err,.badge.b-err{background:var(--red-soft);color:var(--red)}
+.chip.busy,.badge.b-busy{background:var(--amber-soft);color:var(--amber)}
+.chip.new,.badge.b-new{background:var(--blue-soft);color:var(--blue)}
+.meta,.muted{color:var(--muted);font-size:.88em}
+button,.btn{cursor:pointer;border:1.5px solid var(--line);border-radius:99px;
+      background:var(--card);padding:7px 16px;font-size:.92em;font-weight:600;
+      color:var(--ink);font-family:inherit;text-decoration:none;display:inline-block;
+      transition:border-color .15s,background .15s}
+button:hover,.btn:hover{border-color:var(--ink)}
+button.primary{background:var(--green);border-color:var(--green);color:#fff}
+button.primary:hover{background:var(--green-deep);border-color:var(--green-deep)}
+button.danger{color:var(--red);border-color:#EBC4B9}
+button.danger:hover{border-color:var(--red);background:var(--card)}
+button.small{padding:4px 13px;font-size:.84em}
+:focus-visible{outline:2.5px solid var(--blue);outline-offset:2px;border-radius:8px}
+input[type=text],input[type=number]{padding:9px 12px;border:1.5px solid var(--line);
+      border-radius:10px;font-size:1em;width:100%;font-family:inherit;background:#fff;
+      color:var(--ink)}
+input[type=text]:focus,input[type=number]:focus{border-color:var(--green);outline:none}
 table{border-collapse:collapse;width:100%}
-th,td{border-bottom:1px solid #eceef5;padding:8px 10px;text-align:left;vertical-align:top}
-th{color:#666;font-weight:600;font-size:.9em}
-tr:hover td{background:#fafbff}
-input[type=text],input[type=number]{padding:8px 10px;border:1px solid #ccd;border-radius:8px;
-      font-size:1em;width:100%;box-sizing:border-box}
-button,.btn{cursor:pointer;border:1px solid #ccd;border-radius:8px;background:#fff;
-      padding:7px 14px;font-size:.95em;text-decoration:none;color:#1a1a2e;display:inline-block}
-button:hover,.btn:hover{background:#eef}
-button.primary{background:#3b5bdb;border-color:#3b5bdb;color:#fff}
-button.primary:hover{background:#2f4ec0}
-button.danger{color:#c0392b;border-color:#e3b4ac}
-.badge{display:inline-block;border-radius:20px;padding:2px 10px;font-size:.82em;font-weight:600}
-.b-ok{background:#e6f7ed;color:#1d7a40}.b-err{background:#fdeaea;color:#c0392b}
-.b-busy{background:#fff4d6;color:#9a6b00}.b-new{background:#e8edff;color:#3b5bdb}
-.muted{color:#888;font-size:.9em}
-.flash{border-radius:10px;padding:10px 14px;margin-bottom:14px}
-.flash.ok{background:#e6f7ed;color:#1d7a40}.flash.err{background:#fdeaea;color:#c0392b}
+th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}
+th{font-family:'JetBrains Mono',Consolas,monospace;font-size:.7em;letter-spacing:.12em;
+   text-transform:uppercase;color:var(--muted);font-weight:600}
+.flash{border-radius:12px;padding:11px 16px;margin-bottom:14px;font-weight:600}
+.flash.ok{background:var(--green-soft);color:var(--green-deep)}
+.flash.err{background:var(--red-soft);color:var(--red)}
 .addform{display:flex;gap:10px}
 .addform input{flex:1}
-blockquote{background:#f8f9fd;border-left:4px solid #ccd;margin:8px 0;padding:8px 12px;
-      border-radius:0 8px 8px 0}
-blockquote.neg{background:#fff6f6;border-color:#c0392b}
-blockquote .meta{color:#888;font-size:.85em;margin-top:4px}
+blockquote{background:#F7FAF7;border-left:3px solid var(--line);margin:10px 0;
+      padding:10px 14px;border-radius:0 10px 10px 0}
+blockquote.neg{background:var(--red-soft);border-color:var(--red)}
+blockquote .meta{margin-top:5px}
+pre{white-space:pre-wrap;background:#F4F7F4;border-radius:10px;padding:12px;
+    font-family:inherit;font-size:.95em}
+.kv{display:flex;gap:30px;flex-wrap:wrap;margin:10px 0 14px}
+.kv b{font-size:1.5em;font-family:'JetBrains Mono',Consolas,monospace;font-weight:600}
+.kv span{display:block;color:var(--muted);font-size:.82em}
 form.inline{display:inline}
-.kv{display:flex;gap:28px;flex-wrap:wrap;margin:8px 0}
-.kv div b{font-size:1.25em}
-.kv div span{display:block;color:#888;font-size:.85em}
+.sysbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
 ol.help li{margin:6px 0}
+.links a{margin-right:10px;white-space:nowrap}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (max-width:640px){header{padding:12px 16px}header nav{margin-left:0}
+  main{margin-top:14px}.addform{flex-direction:column}}
 """
 
+FAVICON = ("data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 "
+           "viewBox=%220 0 100 100%22><path d=%22M50 6C29 6 13 22 13 43c0 27 37 51 "
+           "37 51s37-24 37-51C87 22 71 6 50 6z%22 fill=%22%231E7A46%22/>"
+           "<circle cx=%2250%22 cy=%2242%22 r=%2215%22 fill=%22white%22/></svg>")
+
+FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+         '<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700'
+         '&family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;600'
+         '&display=swap" rel="stylesheet">')
+
 ST_BADGE = {
-    db.ST_OK: '<span class="badge b-ok">ок</span>',
-    db.ST_ERROR: '<span class="badge b-err">ошибка</span>',
-    db.ST_ADDING: '<span class="badge b-busy">загружается…</span>',
-    db.ST_CHECKING: '<span class="badge b-busy">проверяется…</span>',
+    db.ST_OK: '<span class="chip ok">ок</span>',
+    db.ST_ERROR: '<span class="chip err">ошибка</span>',
+    db.ST_ADDING: '<span class="chip busy">загружается…</span>',
+    db.ST_CHECKING: '<span class="chip busy">проверяется…</span>',
 }
+
+
+def health_pin(rating, status: str, extra_cls: str = "") -> str:
+    """Рейтинг в пине-маркере, цвет = здоровье карточки (подпись дизайна)."""
+    if status == db.ST_ERROR:
+        return f'<div class="pin n {extra_cls}">⚠</div>'
+    if rating is None:
+        return f'<div class="pin n {extra_cls}">—</div>'
+    cls = "g" if rating >= 4.5 else ("a" if rating >= 4.0 else "r")
+    return (f'<div class="pin {cls} {extra_cls}">'
+            f'{f"{rating:.1f}".replace(".", ",")}</div>')
 
 
 def page(title: str, body: str, request: Request, refresh: bool = False) -> HTMLResponse:
@@ -131,11 +223,14 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
     if err:
         flash += f'<div class="flash err">{e(err)}</div>'
     meta = '<meta http-equiv="refresh" content="7">' if refresh else ""
+    brand = e(BRAND).upper().replace(" ", "<b>·</b>", 1)
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">{meta}
-<title>{e(title)}</title><style>{CSS}</style></head><body>
-<header><span class="brand">📍 Отзывы 2ГИС → Telegram</span>
-<a href="/">Компании</a><a href="/settings">Настройки</a></header>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href='{FAVICON}'>{FONTS}
+<title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
+<header><a class="brand" href="/">{brand}</a>
+<nav><a href="/">Карточки</a><a href="/settings">Настройки</a></nav></header>
 <main>{flash}{body}</main></body></html>""")
 
 
@@ -183,51 +278,57 @@ async def dashboard(request: Request):
         companies = db.list_companies(conn)
         interval = db.get_setting(conn, "check_interval_min", "360")
         tg_line = tg_status_line(conn)
-        rows = []
+        ai_key, ai_model = ai_reply.get_ai_settings(conn)
+        cards = []
         busy = False
         for c in companies:
             busy = busy or c["status"] in (db.ST_ADDING, db.ST_CHECKING)
             new7 = db.new_reviews_count(conn, c["id"])
-            new_badge = (f' <span class="badge b-new">+{new7} за 7 дн</span>'
-                         if new7 else "")
-            rating = "—" if c["rating"] is None else f"{c['rating']:.1f}".replace(".", ",")
+            new_chip = (f'<span class="chip new">+{new7} за 7 дн</span>' if new7 else "")
             count = "—" if c["reviews_count"] is None else c["reviews_count"]
-            err_note = (f'<div class="muted">⚠ {e(c["error"])}</div>'
+            err_note = (f'<div class="meta" style="color:var(--red)">⚠ {e(c["error"][:120])}</div>'
                         if c["status"] == db.ST_ERROR and c["error"] else "")
-            rows.append(f"""<tr>
- <td><a href="/company/{c['id']}"><b>{e(c['name'])}</b></a>{new_badge}
-     <div class="muted">{e(c['city_slug'])} · {e(c['category'] or '')}</div>{err_note}</td>
- <td>{rating} / {count} отз.</td>
- <td>{ST_BADGE.get(c['status'], e(c['status']))}<div class="muted">{fmt_dt(c['last_checked'])}</div></td>
- <td>
-   <form class="inline" method="post" action="/companies/{c['id']}/check"><button>Проверить</button></form>
+            cards.append(f"""<div class="company">
+ {health_pin(c['rating'], c['status'])}
+ <div class="body">
+  <a class="name" href="/company/{c['id']}">{e(c['name'])}</a>
+  <div class="meta">{e(c['city_slug'])} · {e(c['category'] or '2ГИС')} ·
+    <span class="mono">{count} отз.</span></div>
+  <div class="chips">{ST_BADGE.get(c['status'], e(c['status']))}{new_chip}</div>
+  <div class="meta">проверено: <span class="mono">{fmt_dt(c['last_checked'])}</span></div>
+  {err_note}
+  <div style="margin-top:10px">
+   <form class="inline" method="post" action="/companies/{c['id']}/check">
+     <button class="small">Проверить</button></form>
    <form class="inline" method="post" action="/companies/{c['id']}/delete"
          onsubmit="return confirm('Удалить «{e(c['name'])}» и все её отзывы?')">
-     <button class="danger">Удалить</button></form>
- </td></tr>""")
+     <button class="small danger">Удалить</button></form>
+  </div>
+ </div></div>""")
     finally:
         conn.close()
 
-    table = (f"<table><tr><th>Компания</th><th>Рейтинг</th><th>Статус</th><th></th></tr>"
-             f"{''.join(rows)}</table>" if rows else
-             '<p class="muted">Пока нет компаний — вставьте ссылку на карточку 2ГИС выше.</p>')
+    ai_chip = ('<span class="chip ok">AI-ответы включены</span>' if ai_key
+               else '<span class="chip err">AI-ответы: нет ключа</span>')
+    grid = (f'<div class="grid">{"".join(cards)}</div>' if cards else
+            '<div class="card"><p class="muted">Пока нет ни одной карточки. Вставьте '
+            'выше ссылку на компанию в 2ГИС — и её отзывы будут под присмотром.</p></div>')
+    check_all = (f"""<div style="margin-top:14px">
+  <form class="inline" method="post" action="/check-all">
+    <button>Проверить все сейчас</button></form></div>""" if cards else "")
     body = f"""
+<h1>Карточки под наблюдением</h1>
+<div class="sysbar">{tg_line} {ai_chip}
+ <span class="muted">автопроверка каждые <span class="mono">{e(interval)}</span> мин</span></div>
 <div class="card">
- <h1>Мониторинг отзывов</h1>
- <div style="margin-bottom:10px">{tg_line}
-   <span class="muted"> · автопроверка каждые {e(interval)} мин</span></div>
  <form class="addform" method="post" action="/companies/add">
-  <input type="text" name="url" required
-         placeholder="Ссылка на карточку 2ГИС, например https://2gis.kz/almaty/firm/70000001062690247">
-  <button class="primary">Добавить</button>
+  <input type="text" name="url" required aria-label="Ссылка на карточку 2ГИС"
+         placeholder="Вставьте ссылку на карточку 2ГИС — https://2gis.kz/almaty/firm/…">
+  <button class="primary">Добавить карточку</button>
  </form>
 </div>
-<div class="card">{table}
- <div style="margin-top:10px">
-  <form class="inline" method="post" action="/check-all"><button>Проверить все сейчас</button></form>
- </div>
-</div>"""
-    return page("Компании — мониторинг 2ГИС", body, request, refresh=busy)
+{grid}{check_all}"""
+    return page("Карточки", body, request, refresh=busy)
 
 
 @app.post("/companies/add")
@@ -365,9 +466,15 @@ async def company_page(cid: int, request: Request):
     busy = c["status"] in (db.ST_ADDING, db.ST_CHECKING)
     body = f"""
 <div class="card">
- <h1>{e(c['name'])} {ST_BADGE.get(c['status'], '')}</h1>
- <div class="muted">{e(c['category'] or '')} · {e(c['city_slug'])} ·
-   <a href="{e(c['url'])}">карточка в 2ГИС</a></div>
+ <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
+  {health_pin(c['rating'], c['status'], 'big')}
+  <div style="flex:1;min-width:240px">
+   <h1 style="margin:0 0 4px">{e(c['name'])}</h1>
+   <div class="meta">{e(c['category'] or '')} · {e(c['city_slug'])} ·
+     <a href="{e(c['url'])}">карточка в 2ГИС</a></div>
+   <div class="chips" style="margin-top:8px">{ST_BADGE.get(c['status'], '')}</div>
+  </div>
+ </div>
  {err_note}
  <div class="kv">
   <div><b>{rating}</b><span>рейтинг</span></div>
@@ -506,6 +613,8 @@ async def settings_page(request: Request):
                  '<span class="badge b-err">нет ключа — в алертах статичный шаблон</span>')
     ai_key_hint = f"сохранён: …{e(ai_key[-6:])} — введите новый, чтобы заменить" \
         if ai_key else "sk-…"
+    token_hint = (f"сохранён: …{e(token[-6:])} — введите новый, чтобы заменить"
+                  if token else "1234567890:AA…")
 
     chat_rows = "".join(f"""<tr><td>{e(ch['title'])}</td><td>{e(ch['chat_id'])}</td>
  <td>{'<span class="badge b-new">админ — получает всё</span>' if ch['is_admin']
@@ -531,8 +640,10 @@ async def settings_page(request: Request):
  <h1>Настройки</h1>
  <form method="post" action="/settings/save">
   <p><b>Токен Telegram-бота</b><br>
-   <span class="muted">Создайте бота у @BotFather командой /newbot и вставьте токен.</span><br>
-   <input type="text" name="bot_token" value="{e(token)}" placeholder="1234567890:AA…"></p>
+   <span class="muted">Создайте бота у @BotFather командой /newbot и вставьте токен.
+   Пустое поле — текущий токен сохранится.</span><br>
+   <input type="text" name="bot_token" value="" placeholder="{token_hint}"
+          autocomplete="off"></p>
   <p><b>Интервал автопроверки, минут</b><br>
    <input type="number" name="interval" value="{e(interval)}" min="30" style="width:120px">
    <span class="muted">не ставьте меньше 30 — частые проверки повышают риск блокировки 2ГИС</span></p>
@@ -578,7 +689,7 @@ async def settings_chat_admin(request: Request):
 @app.post("/settings/save")
 async def settings_save(request: Request):
     form = await request.form()
-    token = str(form.get("bot_token", "")).strip()
+    new_token = str(form.get("bot_token", "")).strip()
     interval = str(form.get("interval", "360")).strip()
     notify_all = "1" if form.get("notify_all") else "0"
     try:
@@ -591,7 +702,9 @@ async def settings_save(request: Request):
 
     conn = db.connect()
     try:
-        db.set_setting(conn, "bot_token", token)
+        if new_token:  # пустое поле = оставить прежний токен (он не светится в HTML)
+            db.set_setting(conn, "bot_token", new_token)
+        token = db.get_setting(conn, "bot_token")
         db.set_setting(conn, "check_interval_min", interval)
         db.set_setting(conn, "notify_all", notify_all)
         if openai_key:  # пустое поле = оставить прежний ключ
@@ -599,7 +712,7 @@ async def settings_save(request: Request):
         db.set_setting(conn, "openai_model", openai_model)
         if not token:
             db.set_setting(conn, "bot_username", "")
-            return redirect("/settings", msg="Сохранено (токен пуст — уведомления выключены)")
+            return redirect("/settings", msg="Сохранено (токена нет — уведомления выключены)")
         try:
             me = await tg.get_me(token)
             db.set_setting(conn, "bot_username", me.get("username", ""))
