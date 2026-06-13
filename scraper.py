@@ -412,9 +412,30 @@ class Scraper:
             if len(c.worst_reviews) >= 3:
                 break
 
-    async def _fetch_reviews(self, firm_id: str, _retry=True):
+    async def fetch_reviews_deep(self, firm_id: str, limit_total: int = 300) -> list:
+        """Постранично собрать до limit_total отзывов (аналитика/аудит).
+
+        Вызывать после parse_firm той же фирмы — ключ reviews-API уже получен.
+        Пагинация той же сессией, с паузами; обрыв страницы = отдаём что есть.
+        """
+        out: list = []
+        offset = 0
+        while len(out) < limit_total:
+            data = await self._fetch_reviews(firm_id, offset=offset)
+            reviews = (data or {}).get("reviews") or []
+            if not reviews:
+                break
+            out.extend(reviews)
+            _log(f"    [deep] собрано отзывов: {len(out)}")
+            if len(reviews) < 50:
+                break  # последняя страница
+            offset += 50
+            await self._human_pause(1.0, 2.2)
+        return out[:limit_total]
+
+    async def _fetch_reviews(self, firm_id: str, _retry=True, offset: int = 0):
         params = {
-            "limit": 50, "offset": 0, "is_advertiser": "false",
+            "limit": 50, "offset": offset, "is_advertiser": "false",
             "fields": "meta.branch_rating,meta.branch_reviews_count",
             "rated": "true", "sort_by": "date_edited",
             "key": self.review_key, "locale": "ru_KZ",
@@ -440,7 +461,7 @@ class Scraper:
         # reviews-API (ключ ловит _sniff_key), и содержит свежий конфиг.
         if _retry:
             if await self._refresh_review_key(firm_id):
-                return await self._fetch_reviews(firm_id, _retry=False)
+                return await self._fetch_reviews(firm_id, _retry=False, offset=offset)
         return None
 
     async def _refresh_review_key(self, firm_id: str) -> bool:

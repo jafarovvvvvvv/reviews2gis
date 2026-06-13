@@ -26,6 +26,7 @@ import html
 
 import ai_reply
 import db
+import insights
 import monitor
 import tg
 
@@ -36,6 +37,7 @@ HELP_ADMIN = (
     "/del <N> — удалить компанию №N\n"
     "/check [N] — проверить все (или №N)\n"
     "/reply <N> — AI-ответ на последний отзыв компании №N\n"
+    "/report <N> — аналитический отчёт болей по компании №N\n"
     "/status — настройки и состояние\n"
     "/interval <мин> — интервал автопроверки\n"
     "/mode all|neg — все отзывы / только негатив\n"
@@ -104,6 +106,29 @@ async def _add_and_report(company_id: int, token: str, chat_id: str):
         await _reply(token, chat_id,
                      f"⚠ Компанию добавил, но загрузка не удалась: "
                      f"{html.escape(c['error'] or 'неизвестная ошибка')}")
+
+
+async def _build_and_send_report(company_id: int, token: str, chat_id: str):
+    """Фон: отчёт болей + отправка файлом в чат, откуда попросили."""
+    try:
+        rid = await insights.build_report(company_id)
+    except Exception as ex:
+        await _reply(token, chat_id, f"⚠ Отчёт не построился: {html.escape(str(ex)[:300])}")
+        return
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+        comp = db.get_company(conn, company_id)
+    finally:
+        conn.close()
+    try:
+        await tg.send_document(
+            token, chat_id, f"otchet_{company_id}_{rep['created_at'][:10]}.html",
+            rep["html"].encode("utf-8"),
+            f"📊 Аналитика отзывов — {comp['name']} · {rep['period']} · "
+            f"в анализе {rep['reviews_used']} отзывов")
+    except tg.TgError as e:
+        await _reply(token, chat_id, f"⚠ Файл не отправился: {html.escape(str(e))}")
 
 
 async def _check_and_report(ids: list, token: str, chat_id: str):
@@ -260,6 +285,21 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
             for i, v in enumerate(variants, 1):
                 parts.append(f"Вариант {i} (тап — скопируется):\n<pre>{e(v)}</pre>")
             await _reply(token, chat_id, "\n".join(parts))
+
+        elif cmd == "report":
+            c = _company_by_num(companies, args)
+            if c is None:
+                await _reply(token, chat_id, "Укажите номер из /list: /report 2")
+                return
+            api_key, _ = ai_reply.get_ai_settings(conn)
+            if not api_key:
+                await _reply(token, chat_id, "AI не настроен: добавьте ключ OpenAI "
+                                             "в «Настройках» панели.")
+                return
+            await _reply(token, chat_id,
+                         f"Готовлю отчёт по «{e(c['name'])}»: сбор до 300 отзывов "
+                         f"и анализ, ~2–4 минуты…")
+            _spawn(_build_and_send_report(c["id"], token, chat_id))
 
         elif cmd == "test":
             await _reply(token, chat_id, "🔔 Тест: уведомления работают.")

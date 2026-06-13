@@ -22,6 +22,7 @@ import sys
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -30,6 +31,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 import ai_reply
 import bot
 import db
+import insights
 import monitor
 import tg
 
@@ -326,6 +328,11 @@ async def dashboard(request: Request):
          placeholder="Вставьте ссылку на карточку 2ГИС — https://2gis.kz/almaty/firm/…">
   <button class="primary">Добавить карточку</button>
  </form>
+ <form class="addform" method="post" action="/audit" style="margin-top:10px">
+  <input type="text" name="url" required aria-label="Ссылка для аудита"
+         placeholder="Аудит по ссылке без мониторинга — отчёт болей придёт в Telegram (~3 мин)">
+  <button>Сделать аудит</button>
+ </form>
 </div>
 {grid}{check_all}"""
     return page("Карточки", body, request, refresh=busy)
@@ -422,6 +429,7 @@ async def company_page(cid: int, request: Request):
         reviews = db.recent_reviews(conn, cid, limit=50)
         all_chats = db.list_chats(conn)
         subs = db.subscribed_chat_ids(conn, cid)
+        reports = db.list_reports(conn, cid)
     finally:
         conn.close()
 
@@ -492,6 +500,21 @@ async def company_page(cid: int, request: Request):
  Ниже — дополнительные получатели именно этой компании (например, чат клиента).</p>
  {routing}
 </div>
+<div class="card"><h2>Аналитический отчёт болей</h2>
+ <p class="muted">Глубокий сбор до 300 отзывов, карта болей с цитатами-уликами и
+ конкретные рекомендации. Готовый отчёт уходит в Telegram файлом (печать в PDF —
+ Ctrl+P). Со второго отчёта появляется динамика «было → стало».</p>
+ <form class="inline" method="post" action="/companies/{cid}/report">
+   <button class="primary">Сгенерировать отчёт</button></form>
+ {('<table><tr><th>Когда</th><th>Период данных</th><th>Объём</th><th></th></tr>'
+   + ''.join(f'<tr><td class="mono">{fmt_dt(r["created_at"])}</td>'
+             f'<td>{e(r["period"])}</td><td>{r["reviews_used"]} отз.</td>'
+             f'<td class="links"><a href="/report/{r["id"]}" target="_blank" rel="noopener">открыть</a> '
+             f'<form class="inline" method="post" action="/report/{r["id"]}/send">'
+             f'<button class="small">в Telegram</button></form></td></tr>'
+             for r in reports) + '</table>') if reports else
+  '<p class="muted" style="margin-top:10px">Отчётов ещё нет.</p>'}
+</div>
 <div class="card"><h2>Тон AI-ответов</h2>
  <p class="muted">Стиль, в котором AI готовит ответы на отзывы этой компании,
  и подпись/контакт в конце ответа (например, WhatsApp администратора).</p>
@@ -506,6 +529,127 @@ async def company_page(cid: int, request: Request):
 <div class="card"><h2>Отзывы (последние {len(reviews)})</h2>{reviews_html}</div>
 <p><a href="/">← ко всем компаниям</a></p>"""
     return page(c["name"], body, request, refresh=busy)
+
+
+async def _send_report(report_id: int) -> list:
+    """Отправить сохранённый отчёт получателям компании. Список ошибок."""
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, report_id)
+        if rep is None:
+            return ["отчёт не найден"]
+        comp = db.get_company(conn, rep["company_id"])
+        name = comp["name"] if comp else "компания"
+        fname = f"otchet_{rep['company_id']}_{rep['created_at'][:10]}.html"
+        caption = (f"📊 Аналитика отзывов — {name} · {rep['period']} · "
+                   f"в анализе {rep['reviews_used']} отзывов")
+        return await monitor.notify_document(conn, fname,
+                                             rep["html"].encode("utf-8"),
+                                             caption, company_id=rep["company_id"])
+    finally:
+        conn.close()
+
+
+async def _report_task(cid: int):
+    """Фон: построить отчёт и разослать; об ошибке сказать админам в TG."""
+    try:
+        rid = await insights.build_report(cid, brand=BRAND)
+    except Exception as ex:
+        conn = db.connect()
+        try:
+            await monitor.notify_chats(
+                conn, f"⚠ Отчёт не построился: {html.escape(str(ex)[:300])}")
+        finally:
+            conn.close()
+        return
+    for err in await _send_report(rid):
+        print(f"[report] {err}", flush=True)
+
+
+async def _audit_task(domain: str, slug: str, firm_id: str):
+    """Фон: аудит по ссылке (без мониторинга) -> файл в output/ + админам в TG."""
+    conn = db.connect()
+    try:
+        try:
+            name, html_out = await insights.build_adhoc_report(
+                domain, slug, firm_id, brand=BRAND)
+        except Exception as ex:
+            await monitor.notify_chats(
+                conn, f"⚠ Аудит по ссылке не построился: {html.escape(str(ex)[:300])}")
+            return
+        fname = f"audit_insights_{firm_id}.html"
+        out = Path("output")
+        out.mkdir(exist_ok=True)
+        (out / fname).write_text(html_out, encoding="utf-8")
+        for err in await monitor.notify_document(
+                conn, fname, html_out.encode("utf-8"),
+                f"📊 Аудит по ссылке — {name} (копия: output/{fname})"):
+            print(f"[audit] {err}", flush=True)
+    finally:
+        conn.close()
+
+
+@app.post("/companies/{cid}/report")
+async def companies_report(cid: int):
+    conn = db.connect()
+    try:
+        if db.get_company(conn, cid) is None:
+            return redirect("/", err="Компания не найдена")
+        api_key, _ = ai_reply.get_ai_settings(conn)
+    finally:
+        conn.close()
+    if not api_key:
+        return redirect(f"/company/{cid}",
+                        err="AI не настроен: добавьте ключ OpenAI в «Настройках»")
+    spawn(_report_task(cid))
+    return redirect(f"/company/{cid}",
+                    msg="Отчёт готовится (~2–4 мин): сбор до 300 отзывов и анализ. "
+                        "Придёт в Telegram и появится в списке отчётов.")
+
+
+@app.get("/report/{rid}", response_class=HTMLResponse)
+async def report_view(rid: int):
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+    finally:
+        conn.close()
+    if rep is None:
+        return redirect("/", err="Отчёт не найден")
+    return HTMLResponse(rep["html"])
+
+
+@app.post("/report/{rid}/send")
+async def report_send(rid: int):
+    errors = await _send_report(rid)
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+    finally:
+        conn.close()
+    back = f"/company/{rep['company_id']}" if rep else "/"
+    if errors:
+        return redirect(back, err="; ".join(errors))
+    return redirect(back, msg="Отчёт отправлен в Telegram")
+
+
+@app.post("/audit")
+async def audit_by_link(request: Request):
+    form = await request.form()
+    parsed = monitor.parse_2gis_url(str(form.get("url", "")))
+    if not parsed:
+        return redirect("/", err="Не похоже на ссылку карточки 2ГИС")
+    conn = db.connect()
+    try:
+        api_key, _ = ai_reply.get_ai_settings(conn)
+    finally:
+        conn.close()
+    if not api_key:
+        return redirect("/", err="AI не настроен: добавьте ключ OpenAI в «Настройках»")
+    domain, slug, firm_id = parsed
+    spawn(_audit_task(domain, slug, firm_id))
+    return redirect("/", msg="Аудит готовится (~2–4 мин) — придёт файлом в "
+                             "админ-чаты Telegram, копия ляжет в output/.")
 
 
 @app.post("/companies/{cid}/reply-settings")

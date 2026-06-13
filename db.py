@@ -67,6 +67,25 @@ CREATE TABLE IF NOT EXISTS subscriptions(
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   chat_id    TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
   PRIMARY KEY(company_id, chat_id));
+
+CREATE TABLE IF NOT EXISTS review_topics(
+  company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  review_id    TEXT NOT NULL,
+  theme        TEXT NOT NULL,
+  severity     INTEGER NOT NULL DEFAULT 1,   -- 1 мимоходом, 2 жалоба, 3 ущерб
+  quote        TEXT NOT NULL DEFAULT '',
+  rating       INTEGER,
+  date_created TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(company_id, review_id, theme));
+
+CREATE TABLE IF NOT EXISTS insights_reports(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  created_at   TEXT NOT NULL,
+  period       TEXT NOT NULL DEFAULT '',
+  reviews_used INTEGER NOT NULL DEFAULT 0,
+  data_json    TEXT NOT NULL,
+  html         TEXT NOT NULL);
 """
 
 
@@ -202,6 +221,49 @@ def new_reviews_count(conn, company_id: int, days: int = 7) -> int:
     return row["n"]
 
 
+# ---------- аналитика (insights) ----------
+
+def replace_topics(conn, company_id: int, topics: list):
+    """Полная замена тем компании (классификация пересчитывается целиком)."""
+    conn.execute("DELETE FROM review_topics WHERE company_id=?", (company_id,))
+    for t in topics:
+        conn.execute(
+            "INSERT OR IGNORE INTO review_topics(company_id,review_id,theme,severity,"
+            "quote,rating,date_created) VALUES(?,?,?,?,?,?,?)",
+            (company_id, t["review_id"], t["theme"], t.get("severity", 1),
+             t.get("quote", ""), t.get("rating"), t.get("date_created", "")))
+    conn.commit()
+
+
+def save_report(conn, company_id: int, period: str, reviews_used: int,
+                data_json: str, html: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO insights_reports(company_id,created_at,period,reviews_used,"
+        "data_json,html) VALUES(?,?,?,?,?,?)",
+        (company_id, now_iso(), period, reviews_used, data_json, html))
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_reports(conn, company_id: int):
+    return conn.execute(
+        "SELECT id,created_at,period,reviews_used FROM insights_reports "
+        "WHERE company_id=? ORDER BY id DESC", (company_id,)).fetchall()
+
+
+def get_report(conn, report_id: int):
+    return conn.execute("SELECT * FROM insights_reports WHERE id=?",
+                        (report_id,)).fetchone()
+
+
+def prev_report_data(conn, company_id: int, before_id: int):
+    """data_json предыдущего отчёта (для динамики месяц-к-месяцу) или None."""
+    row = conn.execute(
+        "SELECT data_json FROM insights_reports WHERE company_id=? AND id<? "
+        "ORDER BY id DESC LIMIT 1", (company_id, before_id)).fetchone()
+    return row["data_json"] if row else None
+
+
 # ---------- telegram chats ----------
 
 def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
@@ -335,6 +397,23 @@ if __name__ == "__main__":
         checks.append(("cascade подписок при удалении чата",
                        subscribed_chat_ids(conn, cid) == set()))
         delete_chat(conn, 42)
+
+        # аналитика: темы и отчёты
+        replace_topics(conn, cid, [{"review_id": "r1", "theme": "цены", "severity": 3,
+                                    "quote": "дорого", "rating": 2,
+                                    "date_created": "2026-05-01"}])
+        replace_topics(conn, cid, [{"review_id": "r1", "theme": "персонал"}])
+        n = conn.execute("SELECT COUNT(*) AS n FROM review_topics "
+                         "WHERE company_id=?", (cid,)).fetchone()["n"]
+        checks.append(("topics: полная замена", n == 1))
+        rid1 = save_report(conn, cid, "янв", 10, '{"a":1}', "<html>1")
+        rid2 = save_report(conn, cid, "фев", 20, '{"a":2}', "<html>2")
+        checks.append(("reports: список новые первыми",
+                       [r["id"] for r in list_reports(conn, cid)] == [rid2, rid1]))
+        checks.append(("reports: get", get_report(conn, rid1)["html"] == "<html>1"))
+        checks.append(("reports: prev для динамики",
+                       prev_report_data(conn, cid, rid2) == '{"a":1}'
+                       and prev_report_data(conn, cid, rid1) is None))
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))

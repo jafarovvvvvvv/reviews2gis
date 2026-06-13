@@ -51,6 +51,23 @@ async def get_me(token: str) -> dict:
     return await call(token, "getMe")
 
 
+async def send_document(token: str, chat_id: str, filename: str,
+                        content: bytes, caption: str = ""):
+    """Отправить файл (отчёт-HTML и т.п.). multipart, поэтому не через call()."""
+    url = API.format(token=token.strip(), method="sendDocument")
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                url, data={"chat_id": str(chat_id), "caption": caption[:1000]},
+                files={"document": (filename, content, "text/html")})
+            data = resp.json()
+    except Exception as e:
+        raise TgError(f"сеть/API недоступны: {e}") from e
+    if not data.get("ok"):
+        raise TgError(data.get("description") or f"HTTP {resp.status_code}")
+    return data["result"]
+
+
 # ---------- форматирование уведомлений (чистые функции) ----------
 
 def stars(rating: Optional[int]) -> str:

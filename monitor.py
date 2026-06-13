@@ -118,6 +118,24 @@ async def notify_chats(conn, text: str, company_id=None) -> list:
     return errors
 
 
+async def notify_document(conn, filename: str, content: bytes, caption: str,
+                          company_id=None) -> list:
+    """Разослать файл (отчёт) тем же получателям, что и notify_chats."""
+    token = db.get_setting(conn, "bot_token")
+    chats = db.notify_targets(conn, company_id)
+    errors = []
+    if not token:
+        return ["Telegram не настроен (нет токена) — файл не отправлен"]
+    if not chats:
+        return ["нет получателей: напишите боту /start (админ)"]
+    for chat in chats:
+        try:
+            await tg.send_document(token, chat["chat_id"], filename, content, caption)
+        except tg.TgError as e:
+            errors.append(f"чат {chat['chat_id']}: {e}")
+    return errors
+
+
 async def check_company(company_id: int, baseline: bool = False) -> dict:
     """Проверить компанию: обновить карточку, найти новые отзывы, уведомить.
 
