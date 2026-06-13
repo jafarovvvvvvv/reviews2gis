@@ -1,0 +1,35 @@
+# Bedel на VPS: панель за Caddy (автоматический HTTPS Let's Encrypt).
+# Перед запуском: заполните .env (PANEL_PASSWORD, PANEL_HOSTS=ваш-домен,
+# OPENAI_API_KEY, TELEGRAM_BOT_TOKEN), укажите домен в Caddyfile.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PANEL_BIND: 0.0.0.0
+      PORT: 8765
+    volumes:
+      - ./data/monitor.db:/app/monitor.db   # БД переживает пересборку
+      - ./data/backups:/app/backups
+      - ./data/output:/app/output
+    # порт наружу НЕ публикуем — доступ только через Caddy по внутренней сети
+    expose:
+      - "8765"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

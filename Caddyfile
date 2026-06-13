@@ -1,0 +1,6 @@
+# Замените bedelreviews.kz на ваш домен (A-запись -> IP сервера).
+# Caddy сам выпустит и продлит TLS-сертификат Let's Encrypt.
+bedelreviews.kz {
+    reverse_proxy app:8765
+    encode gzip
+}

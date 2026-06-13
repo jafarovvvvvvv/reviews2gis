@@ -9,6 +9,7 @@
 Чистые функции (parse_2gis_url, extract_review) — самотесты: python monitor.py
 """
 import asyncio
+import random
 import re
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ SCRAPE_LOCK = asyncio.Lock()  # один Playwright одновременно (ad
 # автоустановка браузера: не больше одной попытки на запуск приложения
 _REPAIR_LOCK = asyncio.Lock()
 _repair_attempted = False
+
+DEAD_THRESHOLD = 3  # столько ошибок подряд у компании -> алерт «парсер умер»
 
 
 @dataclass
@@ -136,6 +139,16 @@ async def notify_document(conn, filename: str, content: bytes, caption: str,
     return errors
 
 
+async def _on_check_failed(conn, company_id: int, name: str, err: str):
+    """Учесть ошибку проверки; при DEAD_THRESHOLD подряд — алерт админам (один раз)."""
+    count = db.bump_errors(conn, company_id)
+    if count == DEAD_THRESHOLD:
+        await notify_chats(
+            conn, f"⚠️ <b>Парсер не справляется</b>: «{name}» — {count} ошибки "
+                  f"подряд. Возможно, 2ГИС сменил структуру или блокирует. "
+                  f"Последняя: {err[:200]}")
+
+
 async def check_company(company_id: int, baseline: bool = False) -> dict:
     """Проверить компанию: обновить карточку, найти новые отзывы, уведомить.
 
@@ -182,6 +195,7 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
                        f"PowerShell: python app.py")
         if err:
             db.set_company_status(conn, company_id, db.ST_ERROR, err[:300])
+            await _on_check_failed(conn, company_id, row["name"], err)
             result["errors"].append(err)
             return result
 
@@ -189,6 +203,8 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
             # ни карточка, ни отзывы не прочитались — не затираем имя, фиксируем ошибку
             db.set_company_status(conn, company_id, db.ST_ERROR,
                                   "карточка не прочиталась (блок/структура изменилась?)")
+            await _on_check_failed(conn, company_id, row["name"],
+                                   "карточка не прочиталась")
             result["errors"].append("карточка не прочиталась")
             return result
 
@@ -200,6 +216,8 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
             category=None if c.category in (NA, "") else c.category,
             rating=c.rating, reviews_count=c.reviews_count,
             status=db.ST_OK, error="")
+
+        db.clear_errors(conn, company_id)  # успешная проверка — сбросить счётчик
 
         # снимок метрик для графиков динамики (по загруженному окну отзывов)
         if c.rating is not None:
@@ -231,31 +249,54 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         conn.close()
 
 
+_check_times: list = []  # отметки времени последних проверок (лимит/час)
+
+
+def _hourly_room(cap: int) -> int:
+    """Сколько проверок ещё можно сделать в текущем часовом окне."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    _check_times[:] = [t for t in _check_times if t > cutoff]
+    return max(0, cap - len(_check_times))
+
+
 async def scheduler_loop(interval_poll_sec: int = 60):
-    """Фоновый цикл: проверять компании, у которых подошёл интервал."""
+    """Фоновый цикл: проверять компании, у которых подошёл интервал.
+
+    Очередь под масштаб: порядок перемешивается (джиттер), за час делается не
+    больше max_checks_per_hour проверок — чтобы не словить бан 2ГИС при многих
+    компаниях. Остаток разъезжается по следующим тикам."""
+    from datetime import datetime, timedelta, timezone
     await asyncio.sleep(5)  # дать приложению подняться
     while True:
         try:
             conn = db.connect()
             try:
                 interval_min = int(db.get_setting(conn, "check_interval_min", "360"))
+                cap = int(db.get_setting(conn, "max_checks_per_hour", "40"))
                 rows = db.list_companies(conn)
             finally:
                 conn.close()
-            cutoff = db.now_iso()  # ISO UTC сравнивается лексикографически
+            now = datetime.now(timezone.utc)
             due = []
             for r in rows:
                 if r["status"] in (db.ST_ADDING, db.ST_CHECKING):
                     continue  # уже в работе
+                if r["firm_id"] == "demo":
+                    continue  # демо не скрапим
                 last = r["last_checked"]
                 if last is None:
                     due.append(r["id"])
                     continue
-                from datetime import datetime, timedelta
-                last_dt = datetime.fromisoformat(last)
-                if datetime.fromisoformat(cutoff) - last_dt >= timedelta(minutes=interval_min):
+                if now - datetime.fromisoformat(last) >= timedelta(minutes=interval_min):
                     due.append(r["id"])
+            random.shuffle(due)  # джиттер: не дёргать карточки в одном порядке
             for cid in due:
+                if _hourly_room(cap) <= 0:
+                    print(f"[scheduler] достигнут лимит {cap} проверок/час — "
+                          f"остаток ({len(due)}) перенесён", flush=True)
+                    break
+                _check_times.append(datetime.now(timezone.utc))
                 await check_company(cid)
         except asyncio.CancelledError:
             raise
@@ -293,6 +334,14 @@ if __name__ == "__main__":
     checks.append(("extract: чистка текста", rv["text"] == "Очень плохо"))
     rv2 = extract_review({"rating": 5, "date_created": "2026-01-01", "text": "ок"})
     checks.append(("extract: без id не падает", rv2["review_id"] != "" and rv2["answered"] is False))
+
+    _check_times.clear()
+    from datetime import datetime, timedelta, timezone
+    checks.append(("лимит/час: пусто -> весь cap", _hourly_room(40) == 40))
+    _check_times.extend(datetime.now(timezone.utc) for _ in range(40))
+    checks.append(("лимит/час: исчерпан", _hourly_room(40) == 0))
+    _check_times[:] = [datetime.now(timezone.utc) - timedelta(hours=2) for _ in range(40)]
+    checks.append(("лимит/час: старые отметки забываются", _hourly_room(40) == 40))
 
     ok = 0
     for label, passed in checks:

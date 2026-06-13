@@ -110,6 +110,10 @@ def _migrate(conn):
         conn.execute("ALTER TABLE companies ADD COLUMN tone TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE companies ADD COLUMN reply_signature TEXT NOT NULL DEFAULT ''")
         conn.commit()
+    if "consecutive_errors" not in cols:
+        conn.execute("ALTER TABLE companies ADD COLUMN "
+                     "consecutive_errors INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 def now_iso() -> str:
@@ -164,6 +168,22 @@ def list_companies(conn):
 def set_company_status(conn, company_id: int, status: str, error: str = ""):
     conn.execute("UPDATE companies SET status=?, error=? WHERE id=?",
                  (status, error, company_id))
+    conn.commit()
+
+
+def bump_errors(conn, company_id: int) -> int:
+    """+1 к счётчику ошибок подряд, вернуть новое значение."""
+    conn.execute("UPDATE companies SET consecutive_errors=consecutive_errors+1 "
+                 "WHERE id=?", (company_id,))
+    conn.commit()
+    row = conn.execute("SELECT consecutive_errors FROM companies WHERE id=?",
+                       (company_id,)).fetchone()
+    return row["consecutive_errors"] if row else 0
+
+
+def clear_errors(conn, company_id: int):
+    conn.execute("UPDATE companies SET consecutive_errors=0 WHERE id=?",
+                 (company_id,))
     conn.commit()
 
 
@@ -389,6 +409,9 @@ if __name__ == "__main__":
         cid = add_company(conn, "123", "https://2gis.kz", "almaty", "u")
         checks.append(("company added", get_company(conn, cid)["status"] == ST_ADDING))
         checks.append(("find by firm", find_company_by_firm(conn, "123")["id"] == cid))
+        checks.append(("errors: bump", bump_errors(conn, cid) == 1 and bump_errors(conn, cid) == 2))
+        clear_errors(conn, cid)
+        checks.append(("errors: clear", get_company(conn, cid)["consecutive_errors"] == 0))
 
         base = [{"review_id": "r1", "rating": 5, "date_created": "2026-01-01",
                  "author": "A", "text": "ok", "answered": True}]

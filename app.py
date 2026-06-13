@@ -15,10 +15,14 @@
 SQLite (db.py), проверки — monitor.py, Telegram — tg.py.
 """
 import asyncio
+import hashlib
+import hmac
 import html
 import os
+import secrets
 import socket
 import sys
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -37,9 +41,38 @@ import tg
 
 load_dotenv()
 
-HOST = "127.0.0.1"
+# Адрес прослушивания: локально 127.0.0.1; в Docker за Caddy — 0.0.0.0 (PANEL_BIND)
+BIND = os.getenv("PANEL_BIND") or "127.0.0.1"
+HOST = "127.0.0.1"  # для подсказок/проверки занятости порта
 PORT = int(os.getenv("PORT") or 8765)
 DEMO = "--demo" in sys.argv  # витрина для встреч на изолированной demo.db
+
+# Логин: если PANEL_PASSWORD задан — панель требует вход (для VPS). Пусто — открыта (локально).
+PANEL_PASSWORD = os.getenv("PANEL_PASSWORD") or ""
+AUTH_ON = bool(PANEL_PASSWORD)
+# Разрешённые Host: localhost + домены из PANEL_HOSTS (через запятую) — для VPS
+ALLOWED_HOSTS = {"127.0.0.1", "localhost"} | {
+    h.strip().lower() for h in (os.getenv("PANEL_HOSTS") or "").split(",") if h.strip()}
+OPEN_PATHS = {"/login", "/healthz"}  # доступны без логина
+_SECRET = ""  # ключ подписи сессий; ставится в lifespan
+SESSION_TTL = 14 * 24 * 3600  # сессия живёт 2 недели
+
+# фоновые задачи держим в живых (иначе их соберёт GC)
+_BG_TASKS: set = set()
+
+
+def _sign_session(exp: int) -> str:
+    sig = hmac.new(_SECRET.encode(), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _valid_session(token: str) -> bool:
+    try:
+        exp_s, sig = (token or "").split(".", 1)
+    except (ValueError, AttributeError):
+        return False
+    expected = hmac.new(_SECRET.encode(), exp_s.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected) and int(exp_s) > int(time.time())
 
 # фоновые задачи держим в живых (иначе их соберёт GC)
 _BG_TASKS: set = set()
@@ -62,6 +95,11 @@ async def lifespan(app):
         conn.close()
     # стартовые настройки из .env (только если в БД ещё пусто)
     conn = db.connect()
+    global _SECRET
+    _SECRET = os.getenv("PANEL_SECRET") or db.get_setting(conn, "panel_secret")
+    if not _SECRET:  # сгенерировать и сохранить (сессии переживут перезапуск)
+        _SECRET = secrets.token_hex(32)
+        db.set_setting(conn, "panel_secret", _SECRET)
     if not db.get_setting(conn, "bot_token") and os.getenv("TELEGRAM_BOT_TOKEN"):
         db.set_setting(conn, "bot_token", os.getenv("TELEGRAM_BOT_TOKEN"))
     if not db.get_setting(conn, "openai_api_key") and os.getenv("OPENAI_API_KEY"):
@@ -86,20 +124,23 @@ TAGLINE = "вес вашей репутации"
 
 
 @app.middleware("http")
-async def local_guard(request: Request, call_next):
-    """Защита локальной панели: DNS rebinding (чужой Host) и CSRF
-    (form-POST с чужого сайта на 127.0.0.1). Браузер при кросс-сайтовом
-    POST всегда шлёт Origin — чужой Origin отклоняем; отсутствие Origin
-    означает same-origin или не-браузерный клиент (curl) — пропускаем."""
+async def guard(request: Request, call_next):
+    """Защита панели: (1) Host-allowlist (DNS rebinding), (2) CSRF по Origin для
+    POST, (3) логин по сессионной cookie, если задан PANEL_PASSWORD."""
     host = (request.headers.get("host") or "").split(":")[0].lower()
-    if host not in ("127.0.0.1", "localhost"):
+    if host not in ALLOWED_HOSTS:
         return PlainTextResponse("Forbidden: unknown host", status_code=403)
     if request.method == "POST":
         source = request.headers.get("origin") or request.headers.get("referer") or ""
         if source:
             src_host = (urllib.parse.urlparse(source).hostname or "").lower()
-            if src_host not in ("127.0.0.1", "localhost"):
+            if src_host not in ALLOWED_HOSTS:
                 return PlainTextResponse("Forbidden: cross-site POST", status_code=403)
+    if AUTH_ON and request.url.path not in OPEN_PATHS:
+        if not _valid_session(request.cookies.get("bedel_session", "")):
+            if request.method == "GET":
+                return RedirectResponse("/login", status_code=303)
+            return PlainTextResponse("Unauthorized", status_code=401)
     return await call_next(request)
 
 
@@ -311,6 +352,9 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
     brand = f'{e(BRAND).upper()}<b>.</b>'
     demo_chip = ('<span class="chip" style="background:#F7EED7;color:#B97E14">'
                  'демо-режим</span>' if DEMO else "")
+    logout_link = ('<form class="inline" method="post" action="/logout">'
+                   '<button class="small" style="margin-left:6px">Выйти</button>'
+                   '</form>') if AUTH_ON else ""
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">{meta}
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -318,7 +362,8 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
 <title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
 <header><a class="brand" href="/">{brand}</a>
 <span class="tagline">{e(TAGLINE)}</span>{demo_chip}
-<nav><a href="/">Карточки</a><a href="/settings">Настройки</a></nav></header>
+<nav><a href="/">Карточки</a><a href="/health">Состояние</a>
+<a href="/settings">Настройки</a>{logout_link}</nav></header>
 <main>{flash}{body}</main></body></html>""")
 
 
@@ -354,6 +399,85 @@ def tg_status_line(conn) -> str:
                 '<a href="/settings">назначить →</a> (админ получает все уведомления)')
     return ('<span class="badge b-err">Telegram не настроен</span> '
             '<a href="/settings">настроить →</a> (без этого уведомления не уходят)')
+
+
+# ---------- вход / здоровье ----------
+
+@app.get("/healthz", response_class=PlainTextResponse)
+async def healthz():
+    """Открытый пинг для аптайм-мониторинга (без секретов)."""
+    return "ok"
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request):
+    if not AUTH_ON or _valid_session(request.cookies.get("bedel_session", "")):
+        return RedirectResponse("/", status_code=303)
+    bad = "<div class='flash err'>Неверный пароль</div>" if request.query_params.get("e") else ""
+    body = f"""<div class="card" style="max-width:380px;margin:60px auto">
+ <h1>Вход в {html.escape(BRAND)}</h1>
+ <p class="muted">Панель защищена паролем.</p>{bad}
+ <form method="post" action="/login">
+  <input type="password" name="password" autofocus aria-label="Пароль"
+         placeholder="Пароль" style="margin-bottom:10px">
+  <button class="primary">Войти</button>
+ </form></div>"""
+    return page("Вход", body, request)
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    pwd = str(form.get("password", ""))
+    if AUTH_ON and hmac.compare_digest(pwd, PANEL_PASSWORD):
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("bedel_session", _sign_session(int(time.time()) + SESSION_TTL),
+                        max_age=SESSION_TTL, httponly=True, samesite="lax")
+        return resp
+    return RedirectResponse("/login?e=1", status_code=303)
+
+
+@app.post("/logout")
+async def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie("bedel_session")
+    return resp
+
+
+@app.get("/health", response_class=HTMLResponse)
+async def health_page(request: Request):
+    e = html.escape
+    conn = db.connect()
+    try:
+        companies = db.list_companies(conn)
+        interval = db.get_setting(conn, "check_interval_min", "360")
+        cap = db.get_setting(conn, "max_checks_per_hour", "40")
+    finally:
+        conn.close()
+    errored = [c for c in companies if c["status"] == db.ST_ERROR]
+    dead = [c for c in companies if c["consecutive_errors"] >= monitor.DEAD_THRESHOLD]
+    health = ('<span class="chip err">парсер под угрозой</span>' if dead else
+              '<span class="chip ok">парсер жив</span>' if companies else
+              '<span class="chip busy">нет компаний</span>')
+    rows = "".join(
+        f'<tr><td>{e(c["name"])}</td><td>{ST_BADGE.get(c["status"], "")}</td>'
+        f'<td class="mono">{c["consecutive_errors"]}</td>'
+        f'<td class="mono">{fmt_dt(c["last_checked"])}</td>'
+        f'<td class="meta">{e((c["error"] or "")[:80])}</td></tr>'
+        for c in companies)
+    body = f"""
+<h1>Состояние системы</h1>
+<div class="sysbar">{health}
+ <span class="muted">компаний: {len(companies)} · с ошибкой: {len(errored)} ·
+ интервал <span class="mono">{e(interval)}</span> мин · лимит
+ <span class="mono">{e(cap)}</span>/час</span></div>
+<div class="card"><h2>Карточки</h2>
+ <table><tr><th>Компания</th><th>Статус</th><th>Ошибок подряд</th>
+ <th>Проверено</th><th>Последняя ошибка</th></tr>{rows or ''}</table>
+ {'<p class="muted">Нет компаний.</p>' if not companies else ''}
+</div>
+<p><a href="/">← к карточкам</a></p>"""
+    return page("Состояние", body, request)
 
 
 # ---------- компании ----------
@@ -863,6 +987,7 @@ async def settings_page(request: Request):
         token = db.get_setting(conn, "bot_token")
         bot_username = db.get_setting(conn, "bot_username")
         interval = db.get_setting(conn, "check_interval_min", "360")
+        max_per_hour = db.get_setting(conn, "max_checks_per_hour", "40")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
         chats = db.list_chats(conn)
         ai_key, ai_model = ai_reply.get_ai_settings(conn)
@@ -907,6 +1032,9 @@ async def settings_page(request: Request):
   <p><b>Интервал автопроверки, минут</b><br>
    <input type="number" name="interval" value="{e(interval)}" min="30" style="width:120px">
    <span class="muted">не ставьте меньше 30 — частые проверки повышают риск блокировки 2ГИС</span></p>
+  <p><b>Лимит проверок в час</b><br>
+   <input type="number" name="max_per_hour" value="{e(max_per_hour)}" min="1" style="width:120px">
+   <span class="muted">потолок под масштаб: при многих компаниях остаток едет на следующий час</span></p>
   <p><label><input type="checkbox" name="notify_all" {'checked' if notify_all else ''}>
    уведомлять обо <b>всех</b> новых отзывах (иначе — только о негативе, оценка ≤3)</label></p>
   <p><b>AI-ответы на отзывы</b> {ai_status}<br>
@@ -951,11 +1079,16 @@ async def settings_save(request: Request):
     form = await request.form()
     new_token = str(form.get("bot_token", "")).strip()
     interval = str(form.get("interval", "360")).strip()
+    max_per_hour = str(form.get("max_per_hour", "40")).strip()
     notify_all = "1" if form.get("notify_all") else "0"
     try:
         interval = str(max(30, int(interval)))
     except ValueError:
         interval = "360"
+    try:
+        max_per_hour = str(max(1, int(max_per_hour)))
+    except ValueError:
+        max_per_hour = "40"
 
     openai_key = str(form.get("openai_key", "")).strip()
     openai_model = str(form.get("openai_model", "")).strip() or ai_reply.DEFAULT_MODEL
@@ -966,6 +1099,7 @@ async def settings_save(request: Request):
             db.set_setting(conn, "bot_token", new_token)
         token = db.get_setting(conn, "bot_token")
         db.set_setting(conn, "check_interval_min", interval)
+        db.set_setting(conn, "max_checks_per_hour", max_per_hour)
         db.set_setting(conn, "notify_all", notify_all)
         if openai_key:  # пустое поле = оставить прежний ключ
             db.set_setting(conn, "openai_api_key", openai_key)
@@ -1014,9 +1148,10 @@ async def settings_test():
 
 async def _serve():
     import uvicorn
-    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
+    config = uvicorn.Config(app, host=BIND, port=PORT, log_level="warning")
     server = uvicorn.Server(config)
-    print(f"Панель мониторинга: http://{HOST}:{PORT}", flush=True)
+    auth = "с логином" if AUTH_ON else "без логина (локально)"
+    print(f"Панель {BRAND} ({auth}): http://{HOST}:{PORT}", flush=True)
     await server.serve()
 
 

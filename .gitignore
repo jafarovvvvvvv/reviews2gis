@@ -21,6 +21,10 @@ explore_dump/
 monitor.db
 *.db
 
+# --- Деплой: данные и бэкапы (реальные отзывы/секреты) — не коммитим ---
+data/
+backups/
+
 # --- Python ---
 __pycache__/
 *.pyc
