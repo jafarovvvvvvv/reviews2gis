@@ -149,6 +149,9 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         row = db.get_company(conn, company_id)
         if row is None:
             return {"new": [], "errors": ["компания удалена"]}
+        if row["firm_id"] == "demo":  # демо-компания не скрапится
+            db.set_company_status(conn, company_id, db.ST_OK, "")
+            return {"new": [], "errors": []}
         # Не было ни одной успешной проверки -> это baseline, даже если проверку
         # запустили вручную: первичная загрузка могла упасть (нет браузера и т.п.),
         # и первый успешный прогон не должен счесть все старые отзывы «новыми»
@@ -197,6 +200,13 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
             category=None if c.category in (NA, "") else c.category,
             rating=c.rating, reviews_count=c.reviews_count,
             status=db.ST_OK, error="")
+
+        # снимок метрик для графиков динамики (по загруженному окну отзывов)
+        if c.rating is not None:
+            answered_pct = (round(100 * sum(1 for r in reviews if r.get("answered"))
+                                  / len(reviews)) if reviews else None)
+            db.add_rating_snapshot(conn, company_id, c.rating, c.reviews_count,
+                                   answered_pct)
 
         # уведомления: старые первыми, чтобы лента в Telegram шла хронологично
         new.sort(key=lambda r: r.get("date_created") or "")

@@ -39,6 +39,7 @@ load_dotenv()
 
 HOST = "127.0.0.1"
 PORT = int(os.getenv("PORT") or 8765)
+DEMO = "--demo" in sys.argv  # витрина для встреч на изолированной demo.db
 
 # фоновые задачи держим в живых (иначе их соберёт GC)
 _BG_TASKS: set = set()
@@ -52,6 +53,13 @@ def spawn(coro):
 
 @asynccontextmanager
 async def lifespan(app):
+    if DEMO:
+        import demo
+        db.DB_PATH = Path(__file__).parent / "demo.db"
+        conn = db.connect()
+        if demo.seed(conn):
+            print("  [demo] демо-данные созданы (demo.db)", flush=True)
+        conn.close()
     # стартовые настройки из .env (только если в БД ещё пусто)
     conn = db.connect()
     if not db.get_setting(conn, "bot_token") and os.getenv("TELEGRAM_BOT_TOKEN"):
@@ -62,8 +70,9 @@ async def lifespan(app):
         db.set_setting(conn, "openai_model",
                        os.getenv("OPENAI_MODEL") or ai_reply.DEFAULT_MODEL)
     conn.close()
-    tasks = [asyncio.create_task(monitor.scheduler_loop()),
-             asyncio.create_task(bot.bot_loop())]
+    # в демо фоновые задачи не нужны (компания не скрапится, токена может не быть)
+    tasks = [] if DEMO else [asyncio.create_task(monitor.scheduler_loop()),
+                             asyncio.create_task(bot.bot_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -177,6 +186,19 @@ blockquote.neg{background:var(--red-soft);border-color:var(--red)}
 blockquote .meta{margin-top:5px}
 pre{white-space:pre-wrap;background:#F4F7F4;border-radius:10px;padding:12px;
     font-family:inherit;font-size:.95em}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:640px){.charts{grid-template-columns:1fr}}
+.chart .ct{font-family:'JetBrains Mono',monospace;font-size:11px;fill:#5C7064}
+.chartlabel{font-family:'JetBrains Mono',monospace;font-size:.7em;letter-spacing:.1em;
+   text-transform:uppercase;color:#5C7064;margin-bottom:2px}
+.distrib{display:flex;flex-direction:column;gap:5px;margin-top:4px}
+.distrow{display:flex;align-items:center;gap:10px}
+.distrow .dl{width:26px;font-size:.85em;color:#5C7064}
+.distrow .dbar{flex:1;background:#EEF2EE;border-radius:6px;height:14px;overflow:hidden}
+.distrow .dbar i{display:block;height:100%;border-radius:6px}
+.distrow .dbar i.g{background:#1E7A46}.distrow .dbar i.a{background:#B97E14}
+.distrow .dbar i.r{background:#D8472B}
+.distrow .dn{width:30px;text-align:right;font-size:.85em;color:#5C7064}
 .kv{display:flex;gap:30px;flex-wrap:wrap;margin:10px 0 14px}
 .kv b{font-size:1.5em;font-family:'JetBrains Mono',Consolas,monospace;font-weight:600}
 .kv span{display:block;color:var(--muted);font-size:.82em}
@@ -192,7 +214,8 @@ ol.help li{margin:6px 0}
 FAVICON = ("data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 "
            "viewBox=%220 0 100 100%22><path d=%22M50 6C29 6 13 22 13 43c0 27 37 51 "
            "37 51s37-24 37-51C87 22 71 6 50 6z%22 fill=%22%231E7A46%22/>"
-           "<circle cx=%2250%22 cy=%2242%22 r=%2215%22 fill=%22white%22/></svg>")
+           "<path d=%22M50 24L54.7 35.5L67.1 36.4L57.6 44.5L60.6 56.6L50 50"
+           "L39.4 56.6L42.4 44.5L32.9 36.4L45.3 35.5Z%22 fill=%22white%22/></svg>")
 
 FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
          '<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700'
@@ -218,6 +241,63 @@ def health_pin(rating, status: str, extra_cls: str = "") -> str:
             f'{f"{rating:.1f}".replace(".", ",")}</div>')
 
 
+def svg_line_chart(points, color="#1E7A46", w=560, h=160, pad=34,
+                   force_min=None, force_max=None, fmt=str) -> str:
+    """Линейный график из [(подпись, число)]. Пусто, если точек <2.
+
+    Подписи значений — у левого края (ось Y), даты — отдельной строкой внизу,
+    чтобы не накладывались."""
+    pts = [(lbl, v) for lbl, v in points if v is not None]
+    if len(pts) < 2:
+        return ('<p class="muted">Графика пока нет — нужно ≥2 проверки в разные '
+                'дни. Появится по мере накопления истории.</p>')
+    vals = [v for _, v in pts]
+    vmin = force_min if force_min is not None else min(vals)
+    vmax = force_max if force_max is not None else max(vals)
+    if vmax <= vmin:
+        vmax = vmin + 1
+    n = len(pts)
+    top, floor = 18, h - 34            # вертикальные границы зоны графика
+    fx = lambda i: pad + (w - pad - 14) * i / (n - 1)
+    fy = lambda v: top + (floor - top) * (1 - (v - vmin) / (vmax - vmin))
+    poly = " ".join(f"{fx(i):.1f},{fy(v):.1f}" for i, (_, v) in enumerate(pts))
+    area = f"{fx(0):.1f},{floor:.1f} " + poly + f" {fx(n - 1):.1f},{floor:.1f}"
+    dots = "".join(f'<circle cx="{fx(i):.1f}" cy="{fy(v):.1f}" r="3" '
+                   f'fill="{color}"/>' for i, (_, v) in enumerate(pts))
+    e = html.escape
+    return f'''<svg viewBox="0 0 {w} {h}" width="100%" role="img" class="chart">
+ <polygon points="{area}" fill="{color}" opacity="0.09"/>
+ <polyline points="{poly}" fill="none" stroke="{color}" stroke-width="2.5"
+   stroke-linejoin="round" stroke-linecap="round"/>{dots}
+ <text x="2" y="{top + 4}" class="ct">{e(fmt(vmax))}</text>
+ <text x="2" y="{floor}" class="ct">{e(fmt(vmin))}</text>
+ <text x="{pad}" y="{h - 8}" class="ct">{e(pts[0][0])}</text>
+ <text x="{w - 14}" y="{h - 8}" class="ct" text-anchor="end">{e(pts[-1][0])}</text>
+</svg>'''
+
+
+def rating_distribution(reviews) -> str:
+    """5 горизонтальных столбиков: сколько отзывов с каждой оценкой (из окна)."""
+    counts = {s: 0 for s in range(1, 6)}
+    for r in reviews:
+        rt = r["rating"]
+        if rt in counts:
+            counts[rt] += 1
+    total = sum(counts.values())
+    if not total:
+        return '<p class="muted">Отзывы ещё не загружены.</p>'
+    rows = []
+    for s in range(5, 0, -1):
+        n = counts[s]
+        pct = round(100 * n / total)
+        cls = "g" if s >= 5 else ("a" if s == 4 else "r")
+        rows.append(
+            f'<div class="distrow"><span class="dl">{s}★</span>'
+            f'<span class="dbar"><i class="{cls}" style="width:{pct}%"></i></span>'
+            f'<span class="dn mono">{n}</span></div>')
+    return f'<div class="distrib">{"".join(rows)}</div>'
+
+
 def page(title: str, body: str, request: Request, refresh: bool = False) -> HTMLResponse:
     e = html.escape
     msg = request.query_params.get("msg", "")
@@ -229,13 +309,15 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
         flash += f'<div class="flash err">{e(err)}</div>'
     meta = '<meta http-equiv="refresh" content="7">' if refresh else ""
     brand = f'{e(BRAND).upper()}<b>.</b>'
+    demo_chip = ('<span class="chip" style="background:#F7EED7;color:#B97E14">'
+                 'демо-режим</span>' if DEMO else "")
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">{meta}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href='{FAVICON}'>{FONTS}
 <title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
 <header><a class="brand" href="/">{brand}</a>
-<span class="tagline">{e(TAGLINE)}</span>
+<span class="tagline">{e(TAGLINE)}</span>{demo_chip}
 <nav><a href="/">Карточки</a><a href="/settings">Настройки</a></nav></header>
 <main>{flash}{body}</main></body></html>""")
 
@@ -434,6 +516,7 @@ async def company_page(cid: int, request: Request):
         all_chats = db.list_chats(conn)
         subs = db.subscribed_chat_ids(conn, cid)
         reports = db.list_reports(conn, cid)
+        history = db.rating_history(conn, cid)
     finally:
         conn.close()
 
@@ -475,6 +558,26 @@ async def company_page(cid: int, request: Request):
         routing = ('<p class="muted">Клиентских чатов пока нет: добавьте бота в чат '
                    'клиента и отправьте там /start — чат появится здесь.</p>')
 
+    # графики динамики
+    def short_date(iso):
+        try:
+            return datetime.fromisoformat(iso).strftime("%d.%m")
+        except (ValueError, TypeError):
+            return ""
+    rating_pts = [(short_date(h["ts"]), h["rating"]) for h in history]
+    count_pts = [(short_date(h["ts"]), h["reviews_count"]) for h in history]
+    rating_chart = svg_line_chart(
+        rating_pts, color="#1E7A46", force_min=3.0, force_max=5.0,
+        fmt=lambda v: f"{v:.1f}".replace(".", ","))
+    count_chart = svg_line_chart(count_pts, color="#2B5FD9", fmt=lambda v: str(int(v)))
+    dist_html = rating_distribution(reviews)
+    r = c["reviews_count"]
+    answered_now = (history[-1]["answered_pct"] if history
+                    and history[-1]["answered_pct"] is not None else None)
+    answered_line = (f'<div class="kv" style="margin-top:6px"><div>'
+                     f'<b>{answered_now}%</b><span>ответов владельца (окно)</span>'
+                     f'</div></div>' if answered_now is not None else "")
+
     busy = c["status"] in (db.ST_ADDING, db.ST_CHECKING)
     body = f"""
 <div class="card">
@@ -498,6 +601,15 @@ async def company_page(cid: int, request: Request):
  <form class="inline" method="post" action="/companies/{cid}/delete"
        onsubmit="return confirm('Удалить компанию и все её отзывы?')">
    <button class="danger">Удалить</button></form>
+</div>
+<div class="card"><h2>Динамика</h2>
+ <div class="charts">
+  <div><div class="chartlabel">Рейтинг (3,0–5,0)</div>{rating_chart}</div>
+  <div><div class="chartlabel">Всего отзывов</div>{count_chart}</div>
+ </div>
+ <div style="margin-top:16px"><div class="chartlabel">Распределение оценок
+   (последние {len(reviews)})</div>{dist_html}</div>
+ {answered_line}
 </div>
 <div class="card"><h2>Кому слать уведомления</h2>
  <p class="muted">Админ-чаты получают все компании всегда: <b>{admin_line}</b>.

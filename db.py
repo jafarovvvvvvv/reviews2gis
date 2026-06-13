@@ -86,6 +86,14 @@ CREATE TABLE IF NOT EXISTS insights_reports(
   reviews_used INTEGER NOT NULL DEFAULT 0,
   data_json    TEXT NOT NULL,
   html         TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS rating_history(
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id    INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  ts            TEXT NOT NULL,
+  rating        REAL,
+  reviews_count INTEGER,
+  answered_pct  INTEGER);
 """
 
 
@@ -108,8 +116,9 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect(path=DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+def connect(path=None) -> sqlite3.Connection:
+    # путь читается при каждом вызове (demo-режим переустанавливает DB_PATH)
+    conn = sqlite3.connect(path or DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
@@ -264,6 +273,31 @@ def prev_report_data(conn, company_id: int, before_id: int):
     return row["data_json"] if row else None
 
 
+# ---------- история рейтинга (графики динамики) ----------
+
+def add_rating_snapshot(conn, company_id: int, rating, reviews_count,
+                        answered_pct=None, ts=None) -> bool:
+    """Снимок метрик. Пропускаем, если рейтинг и кол-во не изменились с прошлого
+    снимка — иначе частые проверки засоряют историю одинаковыми точками."""
+    last = conn.execute(
+        "SELECT rating,reviews_count FROM rating_history WHERE company_id=? "
+        "ORDER BY id DESC LIMIT 1", (company_id,)).fetchone()
+    if last and last["rating"] == rating and last["reviews_count"] == reviews_count:
+        return False
+    conn.execute(
+        "INSERT INTO rating_history(company_id,ts,rating,reviews_count,answered_pct) "
+        "VALUES(?,?,?,?,?)", (company_id, ts or now_iso(), rating, reviews_count,
+                              answered_pct))
+    conn.commit()
+    return True
+
+
+def rating_history(conn, company_id: int):
+    return conn.execute(
+        "SELECT ts,rating,reviews_count,answered_pct FROM rating_history "
+        "WHERE company_id=? ORDER BY id", (company_id,)).fetchall()
+
+
 # ---------- telegram chats ----------
 
 def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
@@ -414,6 +448,15 @@ if __name__ == "__main__":
         checks.append(("reports: prev для динамики",
                        prev_report_data(conn, cid, rid2) == '{"a":1}'
                        and prev_report_data(conn, cid, rid1) is None))
+
+        # история рейтинга
+        checks.append(("history: первый снимок", add_rating_snapshot(conn, cid, 4.0, 100) is True))
+        checks.append(("history: дубль пропущен", add_rating_snapshot(conn, cid, 4.0, 100) is False))
+        checks.append(("history: изменение записано", add_rating_snapshot(conn, cid, 4.1, 105, 50) is True))
+        hist = rating_history(conn, cid)
+        checks.append(("history: порядок и значения",
+                       [h["rating"] for h in hist] == [4.0, 4.1]
+                       and hist[1]["answered_pct"] == 50))
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))
