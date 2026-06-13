@@ -71,8 +71,9 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 
-# Рабочее имя продукта для витрины (поменять — одна строка)
-BRAND = "Пульс Карты"
+# Имя продукта (bedel, каз. — авторитет, репутация, вес в обществе). Домен bedelreviews.kz
+BRAND = "Bedel"
+TAGLINE = "вес вашей репутации"
 
 
 @app.middleware("http")
@@ -110,6 +111,8 @@ header{background:var(--ink);padding:13px 26px;display:flex;gap:24px;align-items
 .brand{font-family:Unbounded,Manrope,sans-serif;font-weight:700;font-size:.98em;
        letter-spacing:.1em;color:#fff;text-transform:uppercase;text-decoration:none}
 .brand b{color:#7BD389}
+.tagline{color:#7E9384;font-size:.82em;font-style:italic;letter-spacing:.02em;
+         border-left:1px solid #34433B;padding-left:14px}
 header nav{display:flex;gap:18px;margin-left:auto}
 header nav a{color:#B9CCBE;text-decoration:none;font-weight:600;padding:4px 2px}
 header nav a:hover{color:#fff}
@@ -182,8 +185,8 @@ form.inline{display:inline}
 ol.help li{margin:6px 0}
 .links a{margin-right:10px;white-space:nowrap}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
-@media (max-width:640px){header{padding:12px 16px}header nav{margin-left:0}
-  main{margin-top:14px}.addform{flex-direction:column}}
+@media (max-width:640px){header{padding:12px 16px}header nav{margin-left:auto}
+  .tagline{display:none}main{margin-top:14px}.addform{flex-direction:column}}
 """
 
 FAVICON = ("data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 "
@@ -225,13 +228,14 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
     if err:
         flash += f'<div class="flash err">{e(err)}</div>'
     meta = '<meta http-equiv="refresh" content="7">' if refresh else ""
-    brand = e(BRAND).upper().replace(" ", "<b>·</b>", 1)
+    brand = f'{e(BRAND).upper()}<b>.</b>'
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">{meta}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href='{FAVICON}'>{FONTS}
 <title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
 <header><a class="brand" href="/">{brand}</a>
+<span class="tagline">{e(TAGLINE)}</span>
 <nav><a href="/">Карточки</a><a href="/settings">Настройки</a></nav></header>
 <main>{flash}{body}</main></body></html>""")
 

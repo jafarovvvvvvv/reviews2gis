@@ -558,7 +558,7 @@ if __name__ == "__main__":
         "Клиника <X>", "медицина", agg,
         {"summary": "Главная боль — цены.", "actions": ["Действие 1", "Д2", "Д3"],
          "recommendations": {"цены": "Опубликовать прайс."}},
-        dyn, reviews_used=3, brand="Пульс Карты")
+        dyn, reviews_used=3, brand="Bedel")
     checks.append(("html: экранирование и секции",
                    "Клиника &lt;X&gt;" in html_out and "Карта болей" in html_out
                    and "Опубликовать прайс." in html_out
