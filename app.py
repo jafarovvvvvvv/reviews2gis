@@ -429,7 +429,8 @@ async def login_form(request: Request):
 async def login_submit(request: Request):
     form = await request.form()
     pwd = str(form.get("password", ""))
-    if AUTH_ON and hmac.compare_digest(pwd, PANEL_PASSWORD):
+    # сравниваем в байтах: hmac.compare_digest для str падает на не-ASCII паролях
+    if AUTH_ON and hmac.compare_digest(pwd.encode("utf-8"), PANEL_PASSWORD.encode("utf-8")):
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie("bedel_session", _sign_session(int(time.time()) + SESSION_TTL),
                         max_age=SESSION_TTL, httponly=True, samesite="lax")
