@@ -94,6 +94,12 @@ CREATE TABLE IF NOT EXISTS rating_history(
   rating        REAL,
   reviews_count INTEGER,
   answered_pct  INTEGER);
+
+CREATE TABLE IF NOT EXISTS auto_runs(
+  company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL,        -- 'digest' (еженедельно) | 'report' (ежемесячно)
+  last_ts    TEXT NOT NULL,
+  PRIMARY KEY(company_id, kind));
 """
 
 
@@ -318,6 +324,42 @@ def rating_history(conn, company_id: int):
         "WHERE company_id=? ORDER BY id", (company_id,)).fetchall()
 
 
+def rating_days_ago(conn, company_id: int, days: int):
+    """Рейтинг из истории ~days дней назад (ближайший снимок до отсечки) или None."""
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    row = conn.execute(
+        "SELECT rating FROM rating_history WHERE company_id=? AND ts<=? "
+        "ORDER BY ts DESC LIMIT 1", (company_id, cutoff)).fetchone()
+    if row is None:  # истории столько нет — берём самый ранний снимок
+        row = conn.execute("SELECT rating FROM rating_history WHERE company_id=? "
+                           "ORDER BY ts LIMIT 1", (company_id,)).fetchone()
+    return row["rating"] if row else None
+
+
+# ---------- авто-расписания (дайджест/отчёт) ----------
+
+def auto_due(conn, company_id: int, kind: str, period_days: int) -> bool:
+    """Пора ли запускать авто-задачу: не было ни разу или прошло >= period_days."""
+    from datetime import datetime, timezone, timedelta
+    row = conn.execute("SELECT last_ts FROM auto_runs WHERE company_id=? AND kind=?",
+                       (company_id, kind)).fetchone()
+    if row is None:
+        return True
+    try:
+        last = datetime.fromisoformat(row["last_ts"])
+    except (ValueError, TypeError):
+        return True
+    return datetime.now(timezone.utc) - last >= timedelta(days=period_days)
+
+
+def mark_auto(conn, company_id: int, kind: str):
+    conn.execute("INSERT INTO auto_runs(company_id,kind,last_ts) VALUES(?,?,?) "
+                 "ON CONFLICT(company_id,kind) DO UPDATE SET last_ts=excluded.last_ts",
+                 (company_id, kind, now_iso()))
+    conn.commit()
+
+
 # ---------- telegram chats ----------
 
 def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
@@ -480,6 +522,14 @@ if __name__ == "__main__":
         checks.append(("history: порядок и значения",
                        [h["rating"] for h in hist] == [4.0, 4.1]
                        and hist[1]["answered_pct"] == 50))
+        checks.append(("history: рейтинг N дней назад (мало истории -> ранний)",
+                       rating_days_ago(conn, cid, 30) == 4.0))
+
+        # авто-расписания
+        checks.append(("auto: впервые due", auto_due(conn, cid, "digest", 7) is True))
+        mark_auto(conn, cid, "digest")
+        checks.append(("auto: только что -> не due", auto_due(conn, cid, "digest", 7) is False))
+        checks.append(("auto: другой kind независим", auto_due(conn, cid, "report", 30) is True))
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))

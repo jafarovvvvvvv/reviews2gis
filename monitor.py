@@ -260,6 +260,71 @@ def _hourly_room(cap: int) -> int:
     return max(0, cap - len(_check_times))
 
 
+async def send_weekly_digest(company_id: int) -> list:
+    """Собрать и разослать еженедельный дайджест по компании. Список ошибок."""
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, company_id)
+        if c is None:
+            return ["компания удалена"]
+        delta = None
+        if c["rating"] is not None:
+            week_ago = db.rating_days_ago(conn, company_id, 7)
+            if week_ago is not None:
+                delta = round(c["rating"] - week_ago, 2)
+        new7 = db.new_reviews_count(conn, company_id, days=7)
+        neg_unanswered = sum(
+            1 for r in db.recent_reviews(conn, company_id, limit=50)
+            if tg.is_negative(r["rating"]) and not r["answered"])
+        text = tg.fmt_weekly_digest(c["name"], c["rating"], delta, new7, neg_unanswered)
+        return await notify_chats(conn, text, company_id=company_id)
+    finally:
+        conn.close()
+
+
+async def run_auto_tasks():
+    """Авто-дайджесты (раз в 7 дней) и авто-отчёты (раз в 30 дней) для компаний,
+    у которых это включено в настройках. Отчёт строим максимум один за тик."""
+    conn = db.connect()
+    try:
+        digest_on = db.get_setting(conn, "auto_digest", "0") == "1"
+        report_on = db.get_setting(conn, "auto_report", "0") == "1"
+        companies = [c for c in db.list_companies(conn)
+                     if c["firm_id"] != "demo" and c["status"] == db.ST_OK]
+    finally:
+        conn.close()
+    if digest_on:
+        for c in companies:
+            conn = db.connect()
+            due = db.auto_due(conn, c["id"], "digest", 7)
+            conn.close()
+            if due:
+                await send_weekly_digest(c["id"])
+                conn = db.connect(); db.mark_auto(conn, c["id"], "digest"); conn.close()
+    if report_on:
+        for c in companies:  # дорого (LLM) — не больше одного отчёта за тик
+            conn = db.connect()
+            due = db.auto_due(conn, c["id"], "report", 30)
+            conn.close()
+            if due:
+                import insights
+                try:
+                    rid = await insights.build_report(c["id"])
+                    conn = db.connect()
+                    rep = db.get_report(conn, rid)
+                    fname = f"otchet_{c['id']}_{rep['created_at'][:10]}.html"
+                    await notify_document(
+                        conn, fname, rep["html"].encode("utf-8"),
+                        f"📊 Ежемесячный отчёт — {c['name']} · {rep['period']}",
+                        company_id=c["id"])
+                    db.mark_auto(conn, c["id"], "report")
+                    conn.close()
+                except Exception as e:
+                    print(f"[auto-report] {c['name']}: {e}", flush=True)
+                    conn = db.connect(); db.mark_auto(conn, c["id"], "report"); conn.close()
+                break
+
+
 async def scheduler_loop(interval_poll_sec: int = 60):
     """Фоновый цикл: проверять компании, у которых подошёл интервал.
 
@@ -298,6 +363,7 @@ async def scheduler_loop(interval_poll_sec: int = 60):
                     break
                 _check_times.append(datetime.now(timezone.utc))
                 await check_company(cid)
+            await run_auto_tasks()  # дайджесты/авто-отчёты по расписанию
         except asyncio.CancelledError:
             raise
         except Exception as e:

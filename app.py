@@ -1116,6 +1116,8 @@ async def settings_page(request: Request):
         interval = db.get_setting(conn, "check_interval_min", "360")
         max_per_hour = db.get_setting(conn, "max_checks_per_hour", "40")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
+        auto_digest = db.get_setting(conn, "auto_digest", "0") == "1"
+        auto_report = db.get_setting(conn, "auto_report", "0") == "1"
         chats = db.list_chats(conn)
         ai_key, ai_model = ai_reply.get_ai_settings(conn)
     finally:
@@ -1164,6 +1166,10 @@ async def settings_page(request: Request):
    <span class="muted">потолок под масштаб: при многих компаниях остаток едет на следующий час</span></p>
   <p><label><input type="checkbox" name="notify_all" {'checked' if notify_all else ''}>
    уведомлять обо <b>всех</b> новых отзывах (иначе — только о негативе, оценка ≤3)</label></p>
+  <p><label><input type="checkbox" name="auto_digest" {'checked' if auto_digest else ''}>
+   слать клиентам <b>еженедельный дайджест</b> (рейтинг, новые отзывы, негатив)</label></p>
+  <p><label><input type="checkbox" name="auto_report" {'checked' if auto_report else ''}>
+   строить <b>ежемесячный отчёт болей</b> автоматически и слать получателям</label></p>
   <p><b>AI-ответы на отзывы</b> {ai_status}<br>
    <span class="muted">Ключ OpenAI API; модель менять только осознанно.</span><br>
    <input type="text" name="openai_key" value="" placeholder="{ai_key_hint}"
@@ -1208,6 +1214,8 @@ async def settings_save(request: Request):
     interval = str(form.get("interval", "360")).strip()
     max_per_hour = str(form.get("max_per_hour", "40")).strip()
     notify_all = "1" if form.get("notify_all") else "0"
+    auto_digest = "1" if form.get("auto_digest") else "0"
+    auto_report = "1" if form.get("auto_report") else "0"
     try:
         interval = str(max(30, int(interval)))
     except ValueError:
@@ -1228,6 +1236,8 @@ async def settings_save(request: Request):
         db.set_setting(conn, "check_interval_min", interval)
         db.set_setting(conn, "max_checks_per_hour", max_per_hour)
         db.set_setting(conn, "notify_all", notify_all)
+        db.set_setting(conn, "auto_digest", auto_digest)
+        db.set_setting(conn, "auto_report", auto_report)
         if openai_key:  # пустое поле = оставить прежний ключ
             db.set_setting(conn, "openai_api_key", openai_key)
         db.set_setting(conn, "openai_model", openai_model)

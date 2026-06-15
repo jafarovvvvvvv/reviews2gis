@@ -117,6 +117,29 @@ def fmt_check_error(company_name: str, error: str) -> str:
             f"{html.escape(error)}")
 
 
+def fmt_weekly_digest(name, rating, delta, new_reviews, neg_unanswered) -> str:
+    """Еженедельный дайджест клиенту. delta — изменение рейтинга за неделю (или None)."""
+    e = html.escape
+    rs = "—" if rating is None else f"{rating:.1f}".replace(".", ",")
+    if delta is None or abs(delta) < 0.05:
+        trend = "без изменений за неделю"
+    elif delta > 0:
+        trend = f"📈 +{delta:.1f}".replace(".", ",") + " за неделю"
+    else:
+        trend = f"📉 {delta:.1f}".replace(".", ",") + " за неделю"
+    lines = [
+        f"📊 <b>Итоги недели — {e(name)}</b>",
+        f"Рейтинг: <b>{rs}</b> ({trend})",
+        f"Новых отзывов за 7 дней: {new_reviews}",
+    ]
+    if neg_unanswered:
+        lines.append(f"⚠️ Негатива без ответа: {neg_unanswered} — стоит ответить, "
+                     f"мы подготовили варианты.")
+    else:
+        lines.append("✅ Весь негатив отработан.")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     import sys
     for _s in (sys.stdout, sys.stderr):
@@ -154,6 +177,15 @@ if __name__ == "__main__":
     checks.append(("ai: статичный шаблон не дублируется", "Черновик ответа" not in ai))
     no_ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"}, ai_replies=[])
     checks.append(("ai: пустой список -> старый шаблон", "Черновик ответа" in no_ai))
+
+    dg = fmt_weekly_digest("Клиника", 4.6, 0.2, 5, 2)
+    checks.append(("дайджест: рост и негатив", "📈" in dg and "4,6" in dg
+                   and "Негатива без ответа: 2" in dg))
+    dg2 = fmt_weekly_digest("X", 4.6, 0.0, 0, 0)
+    checks.append(("дайджест: без изменений и негатив отработан",
+                   "без изменений" in dg2 and "отработан" in dg2))
+    dg3 = fmt_weekly_digest("X", 4.0, -0.3, 3, 0)
+    checks.append(("дайджест: падение", "📉" in dg3))
 
     ok = 0
     for label, passed in checks:

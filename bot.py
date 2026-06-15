@@ -38,6 +38,7 @@ HELP_ADMIN = (
     "/check [N] — проверить все (или №N)\n"
     "/reply <N> — AI-ответ на последний отзыв компании №N\n"
     "/report <N> — аналитический отчёт болей по компании №N\n"
+    "/digest <N> — еженедельный дайджест по компании №N сейчас\n"
     "/status — настройки и состояние\n"
     "/interval <мин> — интервал автопроверки\n"
     "/mode all|neg — все отзывы / только негатив\n"
@@ -300,6 +301,15 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
                          f"Готовлю отчёт по «{e(c['name'])}»: сбор до 300 отзывов "
                          f"и анализ, ~2–4 минуты…")
             _spawn(_build_and_send_report(c["id"], token, chat_id))
+
+        elif cmd == "digest":
+            c = _company_by_num(companies, args)
+            if c is None:
+                await _reply(token, chat_id, "Укажите номер из /list: /digest 2")
+                return
+            errs = await monitor.send_weekly_digest(c["id"])
+            await _reply(token, chat_id,
+                         "Дайджест отправлен." if not errs else "; ".join(errs[:3]))
 
         elif cmd == "test":
             await _reply(token, chat_id, "🔔 Тест: уведомления работают.")
