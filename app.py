@@ -157,7 +157,8 @@ async def guard(request: Request, call_next):
             if src_host not in ALLOWED_HOSTS:
                 return PlainTextResponse("Forbidden: cross-site POST", status_code=403)
     path = request.url.path
-    public = path in OPEN_PATHS or path.startswith("/c/")  # /c/ — кабинет клиента
+    # /c/ — кабинет клиента, /lp — публичный лендинг
+    public = path in OPEN_PATHS or path.startswith("/c/") or path == "/lp"
     if AUTH_ON and not public:
         if not _valid_session(request.cookies.get("bedel_session", "")):
             if request.method == "GET":
@@ -458,6 +459,15 @@ def tg_status_line(conn) -> str:
 async def healthz():
     """Открытый пинг для аптайм-мониторинга (без секретов)."""
     return "ok"
+
+
+@app.get("/lp", response_class=HTMLResponse)
+async def landing():
+    """Публичный лендинг (маркетинговая страница). Файл brand/landing.html."""
+    f = Path(__file__).parent / "brand" / "landing.html"
+    if not f.exists():
+        return HTMLResponse("<h1>Лендинг не найден</h1>", status_code=404)
+    return HTMLResponse(f.read_text(encoding="utf-8"))
 
 
 @app.get("/login", response_class=HTMLResponse)
