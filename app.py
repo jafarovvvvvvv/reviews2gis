@@ -74,6 +74,26 @@ def _valid_session(token: str) -> bool:
     expected = hmac.new(_SECRET.encode(), exp_s.encode(), hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected) and int(exp_s) > int(time.time())
 
+
+def cabinet_token(company_id: int) -> str:
+    """Неугадываемая read-only ссылка на кабинет клиента для одной компании.
+    Привязана к _SECRET — смена секрета отзывает все ссылки."""
+    sig = hmac.new(_SECRET.encode(), f"cab:{company_id}".encode(),
+                   hashlib.sha256).hexdigest()[:32]
+    return f"{company_id}-{sig}"
+
+
+def cabinet_verify(token: str):
+    """Токен -> company_id или None."""
+    try:
+        cid_s, sig = (token or "").split("-", 1)
+        cid = int(cid_s)
+    except (ValueError, AttributeError):
+        return None
+    expected = hmac.new(_SECRET.encode(), f"cab:{cid}".encode(),
+                        hashlib.sha256).hexdigest()[:32]
+    return cid if hmac.compare_digest(sig, expected) else None
+
 # фоновые задачи держим в живых (иначе их соберёт GC)
 _BG_TASKS: set = set()
 
@@ -136,7 +156,9 @@ async def guard(request: Request, call_next):
             src_host = (urllib.parse.urlparse(source).hostname or "").lower()
             if src_host not in ALLOWED_HOSTS:
                 return PlainTextResponse("Forbidden: cross-site POST", status_code=403)
-    if AUTH_ON and request.url.path not in OPEN_PATHS:
+    path = request.url.path
+    public = path in OPEN_PATHS or path.startswith("/c/")  # /c/ — кабинет клиента
+    if AUTH_ON and not public:
         if not _valid_session(request.cookies.get("bedel_session", "")):
             if request.method == "GET":
                 return RedirectResponse("/login", status_code=303)
@@ -339,6 +361,35 @@ def rating_distribution(reviews) -> str:
     return f'<div class="distrib">{"".join(rows)}</div>'
 
 
+def render_dynamics_card(history, reviews) -> str:
+    """Карточка «Динамика»: графики рейтинга/числа отзывов, распределение, % ответов.
+    Общая для страницы компании и кабинета клиента."""
+    def short_date(iso):
+        try:
+            return datetime.fromisoformat(iso).strftime("%d.%m")
+        except (ValueError, TypeError):
+            return ""
+    rating_pts = [(short_date(h["ts"]), h["rating"]) for h in history]
+    count_pts = [(short_date(h["ts"]), h["reviews_count"]) for h in history]
+    rating_chart = svg_line_chart(rating_pts, color="#1E7A46", force_min=3.0,
+                                  force_max=5.0, fmt=lambda v: f"{v:.1f}".replace(".", ","))
+    count_chart = svg_line_chart(count_pts, color="#2B5FD9", fmt=lambda v: str(int(v)))
+    answered_now = (history[-1]["answered_pct"] if history
+                    and history[-1]["answered_pct"] is not None else None)
+    answered_line = (f'<div class="kv" style="margin-top:6px"><div>'
+                     f'<b>{answered_now}%</b><span>ответов владельца (окно)</span>'
+                     f'</div></div>' if answered_now is not None else "")
+    return f"""<div class="card"><h2>Динамика</h2>
+ <div class="charts">
+  <div><div class="chartlabel">Рейтинг (3,0–5,0)</div>{rating_chart}</div>
+  <div><div class="chartlabel">Всего отзывов</div>{count_chart}</div>
+ </div>
+ <div style="margin-top:16px"><div class="chartlabel">Распределение оценок
+   (последние {len(reviews)})</div>{rating_distribution(reviews)}</div>
+ {answered_line}
+</div>"""
+
+
 def page(title: str, body: str, request: Request, refresh: bool = False) -> HTMLResponse:
     e = html.escape
     msg = request.query_params.get("msg", "")
@@ -443,6 +494,98 @@ async def logout():
     resp = RedirectResponse("/login", status_code=303)
     resp.delete_cookie("bedel_session")
     return resp
+
+
+# ---------- кабинет клиента (read-only по токену) ----------
+
+def client_page(title: str, body: str) -> HTMLResponse:
+    """Минимальный публичный шаблон без навигации/управления — для клиента."""
+    e = html.escape
+    brand = f'{e(BRAND).upper()}<b>.</b>'
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href='{FAVICON}'>{FONTS}
+<title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
+<header><span class="brand">{brand}</span>
+<span class="tagline">{e(TAGLINE)}</span></header>
+<main>{body}</main></body></html>""")
+
+
+@app.get("/c/{token}", response_class=HTMLResponse)
+async def client_cabinet(token: str):
+    e = html.escape
+    cid = cabinet_verify(token)
+    if cid is None:
+        return HTMLResponse("<h1>Ссылка недействительна</h1>", status_code=404)
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, cid)
+        if c is None:
+            return HTMLResponse("<h1>Компания не найдена</h1>", status_code=404)
+        reviews = db.recent_reviews(conn, cid, limit=30)
+        history = db.rating_history(conn, cid)
+        reports = db.list_reports(conn, cid)
+    finally:
+        conn.close()
+
+    rating = "—" if c["rating"] is None else f"{c['rating']:.1f}".replace(".", ",")
+    count = "—" if c["reviews_count"] is None else c["reviews_count"]
+    quotes = []
+    for rv in reviews:
+        neg = tg.is_negative(rv["rating"])
+        ans = ('<span class="badge b-ok">есть ответ</span>' if rv["answered"]
+               else '<span class="badge b-err">без ответа</span>')
+        quotes.append(f"""<blockquote class="{'neg' if neg else ''}">{e(rv['text'] or '(без текста)')}
+ <div class="meta">{tg.stars(rv['rating'])} · {e((rv['date_created'] or '')[:10])} ·
+ {e(rv['author'] or 'аноним')} · {ans}</div></blockquote>""")
+    reviews_html = "".join(quotes) or '<p class="muted">Отзывы ещё не загружены.</p>'
+
+    report_link = ""
+    if reports:
+        rid = reports[0]["id"]
+        report_link = (f'<div class="card"><h2>Аналитический отчёт</h2>'
+                       f'<p class="muted">Разбор болей клиентов и рекомендации '
+                       f'за {e(reports[0]["period"])}.</p>'
+                       f'<a class="btn" href="/c/{token}/report/{rid}" '
+                       f'target="_blank" rel="noopener">Открыть отчёт →</a></div>')
+
+    body = f"""
+<div class="card">
+ <div style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap">
+  {health_pin(c['rating'], c['status'], 'big')}
+  <div style="flex:1;min-width:240px">
+   <h1 style="margin:0 0 4px">{e(c['name'])}</h1>
+   <div class="meta">{e(c['category'] or '')} · {e(c['city_slug'])} ·
+     <a href="{e(c['url'])}">карточка в 2ГИС</a></div>
+  </div>
+ </div>
+ <div class="kv">
+  <div><b>{rating}</b><span>рейтинг</span></div>
+  <div><b>{count}</b><span>отзывов</span></div>
+  <div><b>{fmt_dt(c['last_checked'])}</b><span>обновлено</span></div>
+ </div>
+</div>
+{render_dynamics_card(history, reviews)}
+{report_link}
+<div class="card"><h2>Последние отзывы</h2>{reviews_html}</div>
+<p class="muted">Эта страница обновляется автоматически. Подготовлено {e(BRAND)}.</p>"""
+    return client_page(c["name"], body)
+
+
+@app.get("/c/{token}/report/{rid}", response_class=HTMLResponse)
+async def client_report(token: str, rid: int):
+    cid = cabinet_verify(token)
+    if cid is None:
+        return HTMLResponse("<h1>Ссылка недействительна</h1>", status_code=404)
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+    finally:
+        conn.close()
+    if rep is None or rep["company_id"] != cid:  # отчёт только своей компании
+        return HTMLResponse("<h1>Отчёт не найден</h1>", status_code=404)
+    return HTMLResponse(rep["html"])
 
 
 @app.get("/health", response_class=HTMLResponse)
@@ -683,25 +826,8 @@ async def company_page(cid: int, request: Request):
         routing = ('<p class="muted">Клиентских чатов пока нет: добавьте бота в чат '
                    'клиента и отправьте там /start — чат появится здесь.</p>')
 
-    # графики динамики
-    def short_date(iso):
-        try:
-            return datetime.fromisoformat(iso).strftime("%d.%m")
-        except (ValueError, TypeError):
-            return ""
-    rating_pts = [(short_date(h["ts"]), h["rating"]) for h in history]
-    count_pts = [(short_date(h["ts"]), h["reviews_count"]) for h in history]
-    rating_chart = svg_line_chart(
-        rating_pts, color="#1E7A46", force_min=3.0, force_max=5.0,
-        fmt=lambda v: f"{v:.1f}".replace(".", ","))
-    count_chart = svg_line_chart(count_pts, color="#2B5FD9", fmt=lambda v: str(int(v)))
-    dist_html = rating_distribution(reviews)
-    r = c["reviews_count"]
-    answered_now = (history[-1]["answered_pct"] if history
-                    and history[-1]["answered_pct"] is not None else None)
-    answered_line = (f'<div class="kv" style="margin-top:6px"><div>'
-                     f'<b>{answered_now}%</b><span>ответов владельца (окно)</span>'
-                     f'</div></div>' if answered_now is not None else "")
+    dynamics_card = render_dynamics_card(history, reviews)
+    cab_url = f"/c/{cabinet_token(cid)}"
 
     busy = c["status"] in (db.ST_ADDING, db.ST_CHECKING)
     body = f"""
@@ -727,14 +853,14 @@ async def company_page(cid: int, request: Request):
        onsubmit="return confirm('Удалить компанию и все её отзывы?')">
    <button class="danger">Удалить</button></form>
 </div>
-<div class="card"><h2>Динамика</h2>
- <div class="charts">
-  <div><div class="chartlabel">Рейтинг (3,0–5,0)</div>{rating_chart}</div>
-  <div><div class="chartlabel">Всего отзывов</div>{count_chart}</div>
- </div>
- <div style="margin-top:16px"><div class="chartlabel">Распределение оценок
-   (последние {len(reviews)})</div>{dist_html}</div>
- {answered_line}
+{dynamics_card}
+<div class="card"><h2>Ссылка для клиента</h2>
+ <p class="muted">Read-only страница: рейтинг, графики, отзывы и последний отчёт.
+ Без управления и настроек — можно смело отдавать клиенту.</p>
+ <p><a class="btn" href="{cab_url}" target="_blank" rel="noopener">Открыть кабинет клиента →</a></p>
+ <pre id="caburl" style="font-size:.85em">{e(cab_url)}</pre>
+ <button onclick="(function(){{var u=location.origin+document.getElementById('caburl').innerText;
+   navigator.clipboard&&navigator.clipboard.writeText(u);}})()">Копировать полную ссылку</button>
 </div>
 <div class="card"><h2>Кому слать уведомления</h2>
  <p class="muted">Админ-чаты получают все компании всегда: <b>{admin_line}</b>.
