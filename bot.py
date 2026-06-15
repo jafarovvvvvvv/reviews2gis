@@ -262,30 +262,7 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
             if c is None:
                 await _reply(token, chat_id, "Укажите номер из /list: /reply 2")
                 return
-            rv = db.latest_review(conn, c["id"])
-            if rv is None:
-                await _reply(token, chat_id, "У этой компании ещё нет отзывов в базе.")
-                return
-            api_key, _ = ai_reply.get_ai_settings(conn)
-            if not api_key:
-                await _reply(token, chat_id, "AI не настроен: добавьте ключ OpenAI "
-                                             "в «Настройках» панели.")
-                return
-            await _reply(token, chat_id, "Генерирую варианты…")
-            try:
-                variants = await ai_reply.generate_for_company(conn, c, dict(rv))
-            except ai_reply.AiReplyError as ex:
-                await _reply(token, chat_id, f"⚠ {e(str(ex))}")
-                return
-            if not variants:
-                await _reply(token, chat_id, "Модель не вернула вариантов — "
-                                             "повторите /reply.")
-                return
-            text = (rv["text"] or "(без текста)")[:200]
-            parts = [f"Отзыв ({tg.stars(rv['rating'])}): «{e(text)}»"]
-            for i, v in enumerate(variants, 1):
-                parts.append(f"Вариант {i} (тап — скопируется):\n<pre>{e(v)}</pre>")
-            await _reply(token, chat_id, "\n".join(parts))
+            await _send_reply_variants(c["id"], token, chat_id)
 
         elif cmd == "report":
             c = _company_by_num(companies, args)
@@ -329,7 +306,72 @@ def _company_by_num(companies, args: str):
     return companies[i - 1] if 1 <= i <= len(companies) else None
 
 
+async def _send_reply_variants(company_id: int, token: str, chat_id: str):
+    """Сгенерировать AI-ответы на последний отзыв компании и прислать в чат.
+    Общая логика для команды /reply и inline-кнопки «Ещё вариант»."""
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, company_id)
+        if c is None:
+            await _reply(token, chat_id, "Компания не найдена.")
+            return
+        rv = db.latest_review(conn, company_id)
+        if rv is None:
+            await _reply(token, chat_id, "У этой компании ещё нет отзывов в базе.")
+            return
+        api_key, _ = ai_reply.get_ai_settings(conn)
+        if not api_key:
+            await _reply(token, chat_id, "AI не настроен: добавьте ключ OpenAI "
+                                         "в «Настройках» панели.")
+            return
+        try:
+            variants = await ai_reply.generate_for_company(conn, c, dict(rv))
+        except ai_reply.AiReplyError as ex:
+            await _reply(token, chat_id, f"⚠ {html.escape(str(ex))}")
+            return
+    finally:
+        conn.close()
+    if not variants:
+        await _reply(token, chat_id, "Модель не вернула вариантов — повторите.")
+        return
+    text = (rv["text"] or "(без текста)")[:200]
+    parts = [f"Отзыв ({tg.stars(rv['rating'])}): «{html.escape(text)}»"]
+    for i, v in enumerate(variants, 1):
+        parts.append(f"Вариант {i} (тап — скопируется):\n<pre>{html.escape(v)}</pre>")
+    await _reply(token, chat_id, "\n".join(parts))
+
+
+async def handle_callback(cb: dict, token: str):
+    """Нажатие inline-кнопки. Действия — только из админ-чатов."""
+    data = cb.get("data") or ""
+    chat = (cb.get("message") or {}).get("chat") or {}
+    chat_id = str(chat.get("id") or "")
+    cb_id = cb.get("id")
+    conn = db.connect()
+    try:
+        row = db.get_chat(conn, chat_id)
+        is_admin = bool(row and row["is_admin"])
+    finally:
+        conn.close()
+    if not is_admin:
+        await tg.answer_callback(token, cb_id, "Доступно только из админ-чата")
+        return
+    action, _, arg = data.partition(":")
+    if action == "reply" and arg.isdigit():
+        await tg.answer_callback(token, cb_id, "Генерирую ещё вариант…")
+        _spawn(_send_reply_variants(int(arg), token, chat_id))
+    elif action == "check" and arg.isdigit():
+        await tg.answer_callback(token, cb_id, "Запускаю проверку…")
+        _spawn(_check_and_report([int(arg)], token, chat_id))
+    else:
+        await tg.answer_callback(token, cb_id)
+
+
 async def handle_update(update: dict, token: str, bot_username: str):
+    cb = update.get("callback_query")
+    if cb:
+        await handle_callback(cb, token)
+        return
     msg = update.get("message") or update.get("edited_message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
@@ -380,7 +422,7 @@ async def bot_loop():
         try:
             updates = await tg.call(token, "getUpdates", http_timeout=40,
                                     offset=offset, timeout=25,
-                                    allowed_updates=["message"])
+                                    allowed_updates=["message", "callback_query"])
         except asyncio.CancelledError:
             raise
         except tg.TgError as e:

@@ -41,9 +41,34 @@ async def call(token: str, method: str, http_timeout: float = 20, **params):
     return data["result"]
 
 
-async def send_message(token: str, chat_id: str, text: str):
-    return await call(token, "sendMessage", chat_id=chat_id, text=text,
-                      parse_mode="HTML", disable_web_page_preview=True)
+async def send_message(token: str, chat_id: str, text: str, reply_markup=None):
+    params = dict(chat_id=chat_id, text=text, parse_mode="HTML",
+                  disable_web_page_preview=True)
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    return await call(token, "sendMessage", **params)
+
+
+async def answer_callback(token: str, callback_id: str, text: str = ""):
+    """Погасить «часики» на нажатой inline-кнопке (+опц. всплывашка)."""
+    try:
+        await call(token, "answerCallbackQuery", callback_query_id=callback_id,
+                   text=text)
+    except TgError:
+        pass
+
+
+def btn_cb(text: str, data: str) -> dict:
+    return {"text": text, "callback_data": data}
+
+
+def btn_url(text: str, url: str) -> dict:
+    return {"text": text, "url": url}
+
+
+def inline_kb(*rows) -> dict:
+    """rows — списки кнопок (btn_cb/btn_url). Пустые ряды отбрасываются."""
+    return {"inline_keyboard": [r for r in rows if r]}
 
 
 async def get_me(token: str) -> dict:
@@ -186,6 +211,12 @@ if __name__ == "__main__":
                    "без изменений" in dg2 and "отработан" in dg2))
     dg3 = fmt_weekly_digest("X", 4.0, -0.3, 3, 0)
     checks.append(("дайджест: падение", "📉" in dg3))
+
+    kb = inline_kb([btn_cb("Ещё", "reply:5")], [btn_url("2ГИС", "https://2gis.kz/x")], [])
+    checks.append(("inline_kb: 2 ряда (пустой отброшен)",
+                   len(kb["inline_keyboard"]) == 2))
+    checks.append(("btn_cb: callback_data", kb["inline_keyboard"][0][0]["callback_data"] == "reply:5"))
+    checks.append(("btn_url: url", kb["inline_keyboard"][1][0]["url"] == "https://2gis.kz/x"))
 
     ok = 0
     for label, passed in checks:

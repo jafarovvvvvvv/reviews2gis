@@ -102,7 +102,7 @@ async def _install_browsers() -> str:
             return f"установка не удалась: {e}"
 
 
-async def notify_chats(conn, text: str, company_id=None) -> list:
+async def notify_chats(conn, text: str, company_id=None, reply_markup=None) -> list:
     """Разослать text получателям: админ-чаты (получают всё) + чаты,
     подписанные на company_id. Возвращает список ошибок."""
     token = db.get_setting(conn, "bot_token")
@@ -115,7 +115,7 @@ async def notify_chats(conn, text: str, company_id=None) -> list:
                 "чат на компанию на её странице"]
     for chat in chats:
         try:
-            await tg.send_message(token, chat["chat_id"], text)
+            await tg.send_message(token, chat["chat_id"], text, reply_markup=reply_markup)
         except tg.TgError as e:
             errors.append(f"чат {chat['chat_id']}: {e}")
     return errors
@@ -240,9 +240,12 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
                 except ai_reply.AiReplyError as e:
                     print(f"[ai] {e}", flush=True)
                     result["errors"].append(str(e))
+                kb = tg.inline_kb(
+                    [tg.btn_cb("✍ Ещё вариант ответа", f"reply:{company_id}")],
+                    [tg.btn_url("Открыть в 2ГИС", row["url"])])
                 result["errors"] += await notify_chats(
                     conn, tg.fmt_review_alert(c.name, row["url"], rv, ai_replies=ai),
-                    company_id=company_id)
+                    company_id=company_id, reply_markup=kb)
         result["new"] = new
         return result
     finally:
