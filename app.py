@@ -75,22 +75,26 @@ def _valid_session(token: str) -> bool:
     return hmac.compare_digest(sig, expected) and int(exp_s) > int(time.time())
 
 
-def cabinet_token(company_id: int) -> str:
-    """Неугадываемая read-only ссылка на кабинет клиента для одной компании.
-    Привязана к _SECRET — смена секрета отзывает все ссылки."""
-    sig = hmac.new(_SECRET.encode(), f"cab:{company_id}".encode(),
+def cabinet_token(company_id: int, nonce: str) -> str:
+    """Неугадываемая read-only ссылка на кабинет клиента. В подпись входит nonce
+    компании — его обновление отзывает старую ссылку."""
+    sig = hmac.new(_SECRET.encode(), f"cab:{company_id}:{nonce}".encode(),
                    hashlib.sha256).hexdigest()[:32]
     return f"{company_id}-{sig}"
 
 
-def cabinet_verify(token: str):
-    """Токен -> company_id или None."""
+def cabinet_verify(conn, token: str):
+    """Токен -> company_id, если ссылка валидна, кабинет включён и nonce совпал."""
     try:
         cid_s, sig = (token or "").split("-", 1)
         cid = int(cid_s)
     except (ValueError, AttributeError):
         return None
-    expected = hmac.new(_SECRET.encode(), f"cab:{cid}".encode(),
+    row = db.get_company(conn, cid)
+    if row is None or not row["cabinet_enabled"]:
+        return None
+    expected = hmac.new(_SECRET.encode(),
+                        f"cab:{cid}:{row['cabinet_nonce']}".encode(),
                         hashlib.sha256).hexdigest()[:32]
     return cid if hmac.compare_digest(sig, expected) else None
 
@@ -525,11 +529,12 @@ def client_page(title: str, body: str) -> HTMLResponse:
 @app.get("/c/{token}", response_class=HTMLResponse)
 async def client_cabinet(token: str):
     e = html.escape
-    cid = cabinet_verify(token)
-    if cid is None:
-        return HTMLResponse("<h1>Ссылка недействительна</h1>", status_code=404)
     conn = db.connect()
     try:
+        cid = cabinet_verify(conn, token)
+        if cid is None:
+            return HTMLResponse("<h1>Ссылка недействительна или отключена</h1>",
+                                status_code=404)
         c = db.get_company(conn, cid)
         if c is None:
             return HTMLResponse("<h1>Компания не найдена</h1>", status_code=404)
@@ -585,11 +590,11 @@ async def client_cabinet(token: str):
 
 @app.get("/c/{token}/report/{rid}", response_class=HTMLResponse)
 async def client_report(token: str, rid: int):
-    cid = cabinet_verify(token)
-    if cid is None:
-        return HTMLResponse("<h1>Ссылка недействительна</h1>", status_code=404)
     conn = db.connect()
     try:
+        cid = cabinet_verify(conn, token)
+        if cid is None:
+            return HTMLResponse("<h1>Ссылка недействительна</h1>", status_code=404)
         rep = db.get_report(conn, rid)
     finally:
         conn.close()
@@ -837,7 +842,8 @@ async def company_page(cid: int, request: Request):
                    'клиента и отправьте там /start — чат появится здесь.</p>')
 
     dynamics_card = render_dynamics_card(history, reviews)
-    cab_url = f"/c/{cabinet_token(cid)}"
+    cab_on = bool(c["cabinet_enabled"])
+    cab_url = f"/c/{cabinet_token(cid, c['cabinet_nonce'])}"
 
     busy = c["status"] in (db.ST_ADDING, db.ST_CHECKING)
     body = f"""
@@ -866,11 +872,25 @@ async def company_page(cid: int, request: Request):
 {dynamics_card}
 <div class="card"><h2>Ссылка для клиента</h2>
  <p class="muted">Read-only страница: рейтинг, графики, отзывы и последний отчёт.
- Без управления и настроек — можно смело отдавать клиенту.</p>
- <p><a class="btn" href="{cab_url}" target="_blank" rel="noopener">Открыть кабинет клиента →</a></p>
- <pre id="caburl" style="font-size:.85em">{e(cab_url)}</pre>
- <button onclick="(function(){{var u=location.origin+document.getElementById('caburl').innerText;
-   navigator.clipboard&&navigator.clipboard.writeText(u);}})()">Копировать полную ссылку</button>
+ Без управления и настроек — можно смело отдавать клиенту. Ключ доступа — в самой
+ ссылке; «обновить» выдаёт новый ключ и мгновенно гасит старую ссылку.</p>
+ <div class="chips" style="margin-bottom:10px">{
+   '<span class="chip ok">кабинет включён</span>' if cab_on
+   else '<span class="chip err">кабинет отключён</span>'}</div>
+ {(f'<p><a class="btn" href="{cab_url}" target="_blank" rel="noopener">Открыть кабинет клиента →</a></p>'
+   f'<pre id="caburl" style="font-size:.85em">{e(cab_url)}</pre>'
+   f'<button onclick="(function(){{{{var u=location.origin+document.getElementById(\'caburl\').innerText;'
+   f'navigator.clipboard&&navigator.clipboard.writeText(u);}}}})()">Копировать полную ссылку</button>')
+   if cab_on else '<p class="muted">Включите кабинет, чтобы получить ссылку.</p>'}
+ <div style="margin-top:12px">
+  <form class="inline" method="post" action="/companies/{cid}/cabinet">
+   <input type="hidden" name="action" value="{'disable' if cab_on else 'enable'}">
+   <button class="small">{'Отключить кабинет' if cab_on else 'Включить кабинет'}</button></form>
+  <form class="inline" method="post" action="/companies/{cid}/cabinet"
+        onsubmit="return confirm('Обновить ссылку? Старая перестанет работать.')">
+   <input type="hidden" name="action" value="rotate">
+   <button class="small">Обновить ссылку</button></form>
+ </div>
 </div>
 <div class="card"><h2>Кому слать уведомления</h2>
  <p class="muted">Админ-чаты получают все компании всегда: <b>{admin_line}</b>.
@@ -1027,6 +1047,30 @@ async def audit_by_link(request: Request):
     spawn(_audit_task(domain, slug, firm_id))
     return redirect("/", msg="Аудит готовится (~2–4 мин) — придёт файлом в "
                              "админ-чаты Telegram, копия ляжет в output/.")
+
+
+@app.post("/companies/{cid}/cabinet")
+async def companies_cabinet(cid: int, request: Request):
+    form = await request.form()
+    action = str(form.get("action", ""))
+    conn = db.connect()
+    try:
+        if db.get_company(conn, cid) is None:
+            return redirect("/", err="Компания не найдена")
+        if action == "enable":
+            db.set_cabinet(conn, cid, enabled=True)
+            msg = "Кабинет клиента включён"
+        elif action == "disable":
+            db.set_cabinet(conn, cid, enabled=False)
+            msg = "Кабинет клиента отключён — ссылка больше не работает"
+        elif action == "rotate":
+            db.set_cabinet(conn, cid, nonce=secrets.token_hex(8))
+            msg = "Ссылка обновлена — старая больше не работает"
+        else:
+            msg = "Неизвестное действие"
+    finally:
+        conn.close()
+    return redirect(f"/company/{cid}", msg=msg)
 
 
 @app.post("/companies/{cid}/reply-settings")

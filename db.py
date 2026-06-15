@@ -120,6 +120,11 @@ def _migrate(conn):
         conn.execute("ALTER TABLE companies ADD COLUMN "
                      "consecutive_errors INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+    if "cabinet_nonce" not in cols:
+        # nonce — для отзыва ссылки кабинета; enabled — включён ли кабинет
+        conn.execute("ALTER TABLE companies ADD COLUMN cabinet_nonce TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE companies ADD COLUMN cabinet_enabled INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
 
 
 def now_iso() -> str:
@@ -190,6 +195,17 @@ def bump_errors(conn, company_id: int) -> int:
 def clear_errors(conn, company_id: int):
     conn.execute("UPDATE companies SET consecutive_errors=0 WHERE id=?",
                  (company_id,))
+    conn.commit()
+
+
+def set_cabinet(conn, company_id: int, nonce=None, enabled=None):
+    """Управление кабинетом клиента: nonce (обновление ссылки) и/или enabled."""
+    if nonce is not None:
+        conn.execute("UPDATE companies SET cabinet_nonce=? WHERE id=?",
+                     (nonce, company_id))
+    if enabled is not None:
+        conn.execute("UPDATE companies SET cabinet_enabled=? WHERE id=?",
+                     (int(enabled), company_id))
     conn.commit()
 
 
