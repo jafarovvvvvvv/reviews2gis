@@ -137,16 +137,20 @@ h2{font-family:Unbounded,sans-serif;font-weight:700;font-size:1.85em;letter-spac
 footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;border-top:1px solid var(--line)}
 
 /* scroll reveal */
-.reveal{opacity:0;transform:translateY(22px);transition:opacity .7s var(--ease),transform .7s var(--ease)}
+.reveal{opacity:0;transform:translateY(30px);transition:opacity .8s var(--ease),transform .8s var(--ease)}
 .reveal.in{opacity:1;transform:none}
 
 @media(max-width:860px){
   .hero{grid-template-columns:1fr;gap:32px;padding:44px 0 52px}.hero h1{font-size:2.15em}
   .stats,.cards3,.tiers{grid-template-columns:1fr}
 }
+/* Уважаем «уменьшить движение»: убираем зацикленную пульсацию, плавный скролл и
+   крупные сдвиги, но оставляем мягкое проявление по непрозрачности — чтобы
+   страница всё равно «оживала», без укачивающего движения. */
 @media(prefers-reduced-motion:reduce){
-  *{animation:none!important}.reveal{opacity:1;transform:none;transition:none}
+  .tg .bar .live,.bub{animation:none!important}
   html{scroll-behavior:auto}
+  .reveal{transform:none;transition:opacity .6s ease}
 }
 </style>
 </head>
