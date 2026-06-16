@@ -60,12 +60,18 @@ header.scrolled{background:rgba(241,244,240,.86);backdrop-filter:blur(10px);
 .hero .note svg{width:16px;height:16px;color:var(--green);flex:none}
 
 /* telegram alert mock — фирменный момент, оживает на загрузке */
-/* декоративные параллакс-пятна (двигаются при скролле) */
-.blob{position:absolute;border-radius:50%;filter:blur(60px);opacity:.5;z-index:0;pointer-events:none}
-.blob.b1{width:340px;height:340px;background:#bfe6cb;top:-80px;right:-60px}
-.blob.b2{width:260px;height:260px;background:#cfe0ff;bottom:-40px;left:-50px}
+/* декоративные параллакс-пятна. Мягкость — радиальным градиентом, БЕЗ filter:blur
+   (blur заставлял браузер растрировать заново каждый кадр = лаги). will-change —
+   выносим на отдельный композитный слой, сдвиг по transform тогда дешёвый. */
+.blob{position:absolute;border-radius:50%;z-index:0;pointer-events:none;
+      will-change:transform}
+.blob.b1{width:440px;height:440px;top:-130px;right:-110px;
+  background:radial-gradient(circle,rgba(123,211,137,.55),rgba(123,211,137,0) 70%)}
+.blob.b2{width:380px;height:380px;bottom:-120px;left:-100px;
+  background:radial-gradient(circle,rgba(140,170,255,.5),rgba(140,170,255,0) 70%)}
 .wrap,section .wrap{position:relative;z-index:1}
-.tg{position:relative;background:#0E1621;border-radius:22px;padding:20px;box-shadow:0 24px 60px rgba(18,38,32,.28)}
+.tg{position:relative;background:#0E1621;border-radius:22px;padding:20px;
+    box-shadow:0 24px 60px rgba(18,38,32,.28);will-change:transform}
 .tg .bar{display:flex;align-items:center;gap:9px;color:#8ba;font-size:.82em;margin-bottom:14px}
 .tg .bar .live{width:9px;height:9px;border-radius:50%;background:var(--light);
                box-shadow:0 0 0 0 rgba(123,211,137,.6);animation:pulse 2.4s infinite}
@@ -246,7 +252,7 @@ footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;borde
   </div>
 </div></section>
 
-<section style="background:var(--card);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
+<section id="how" style="background:var(--card);border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
  <div class="wrap">
   <h2 class="reveal">Как работает Bedel</h2>
   <p class="sub reveal">Вы подключаете карточку — остальное на нас.</p>
@@ -335,6 +341,34 @@ footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;borde
     })(t0);
   }
 
+  // Печатает текст ответа бота по буквам (после всплытия пузырька ~1.4с)
+  function typeReply(){
+    const el = document.querySelector('.bub.reply .txt');
+    if (!el) return;
+    const full = el.textContent; el.textContent = '';
+    el.style.minHeight = '3.6em';  // не прыгает по высоте во время набора
+    let i = 0;
+    setTimeout(function step(){
+      el.textContent = full.slice(0, ++i);
+      if (i < full.length) setTimeout(step, 18);
+      else el.style.minHeight = '';
+    }, 1400);
+  }
+
+  // Магнитные кнопки: лёгкое притяжение к курсору
+  function magnetic(){
+    document.querySelectorAll('.btn.primary').forEach(btn => {
+      const xTo = gsap.quickTo(btn, 'x', {duration:0.4, ease:'power3'});
+      const yTo = gsap.quickTo(btn, 'y', {duration:0.4, ease:'power3'});
+      btn.addEventListener('mousemove', e => {
+        const r = btn.getBoundingClientRect();
+        xTo((e.clientX - (r.left + r.width/2)) * 0.35);
+        yTo((e.clientY - (r.top + r.height/2)) * 0.5);
+      });
+      btn.addEventListener('mouseleave', () => { xTo(0); yTo(0); });
+    });
+  }
+
   const hasGSAP = window.gsap && window.ScrollTrigger;
   if (hasGSAP && !reduce){
     document.documentElement.classList.add('gsap-on');
@@ -348,25 +382,37 @@ footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;borde
       gsap.ticker.lagSmoothing(0);
     }
 
-    // Параллакс: элементы с data-speed уезжают со своей скоростью
+    // Параллакс: элементы с data-speed едут со своей скоростью (3 шт — дёшево).
     document.querySelectorAll('[data-speed]').forEach(el => {
       const sp = parseFloat(el.dataset.speed);
-      gsap.to(el, {y:()=> (sp-1)*ScrollTrigger.maxScroll(window)*-0.06,
-        ease:'none', scrollTrigger:{trigger:el, start:'top bottom',
-        end:'bottom top', scrub:true}});
+      gsap.to(el, {yPercent:(sp-1)*40, ease:'none', force3D:true,
+        scrollTrigger:{trigger:el, start:'top bottom', end:'bottom top', scrub:0.4}});
     });
 
-    // Появление блоков: выезжают снизу, привязано к прокрутке (scrub).
-    // fromTo с явным to:autoAlpha:1 — заканчиваются видимыми независимо от CSS.
+    // Появление блоков — ОДНОРАЗОВО при входе (без scrub = без нагрузки каждый кадр).
+    // Карточки «Как работает» исключаем — у них своя пошаговая анимация ниже.
     gsap.utils.toArray('.reveal').forEach(el => {
-      gsap.fromTo(el, {y:46, autoAlpha:0}, {y:0, autoAlpha:1, ease:'power2.out',
-        scrollTrigger:{trigger:el, start:'top 90%', end:'top 60%', scrub:true}});
+      if (el.classList.contains('feature') && el.closest('#how')) return;
+      gsap.fromTo(el, {y:40, autoAlpha:0}, {y:0, autoAlpha:1, duration:0.7,
+        ease:'power2.out', scrollTrigger:{trigger:el, start:'top 86%',
+        toggleActions:'play none none none'}});
     });
+
+    // «Как работает» — шаги появляются по очереди (stagger) при входе секции.
+    const howCards = gsap.utils.toArray('#how .feature');
+    if (howCards.length) gsap.fromTo(howCards, {y:54, autoAlpha:0},
+      {y:0, autoAlpha:1, duration:0.7, stagger:0.22, ease:'power3.out',
+       scrollTrigger:{trigger:'#how .cards3', start:'top 80%'}});
 
     // Счётчики статистики — при доскролле до полосы
     const band = document.querySelector('.stats');
     if (band) ScrollTrigger.create({trigger:band, start:'top 85%', once:true,
       onEnter:()=> band.querySelectorAll('[data-count]').forEach(countUp)});
+
+    // Набор текста в ответе бота (после того как пузырёк всплыл)
+    typeReply();
+    // Магнитные кнопки (только мышь)
+    if (matchMedia('(pointer:fine)').matches) magnetic();
 
   } else {
     // ---- Фолбэк без GSAP / при reduced-motion: контент виден, мягкое появление ----
