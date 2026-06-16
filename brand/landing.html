@@ -37,8 +37,9 @@ a{color:var(--green-deep)}
 /* header */
 header{position:sticky;top:0;z-index:50;transition:background .25s,box-shadow .25s,border-color .25s;
        border-bottom:1px solid transparent}
-header.scrolled{background:rgba(241,244,240,.86);backdrop-filter:blur(10px);
-                border-bottom-color:var(--line)}
+/* плотный фон вместо backdrop-filter:blur — blur заставлял перерисовывать
+   шапку на каждом кадре прокрутки (лаги) */
+header.scrolled{background:#EEF1ED;border-bottom-color:var(--line)}
 .hbar{display:flex;align-items:center;gap:14px;padding:15px 0}
 .brand{font-family:Unbounded,sans-serif;font-weight:800;font-size:1.2em;letter-spacing:.04em;
        text-decoration:none;color:var(--ink)}
@@ -319,11 +320,10 @@ footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;borde
   Без накрутки отзывов. Работаем по правилам 2ГИС и закона РК о персональных данных.
 </div></footer>
 
-<!-- Движок скролл-анимаций: GSAP + ScrollTrigger + Lenis (CDN). Если не
-     загрузятся (офлайн) — ниже фолбэк на IntersectionObserver, контент виден. -->
+<!-- Движок скролл-анимаций: GSAP + ScrollTrigger (CDN), нативный скролл.
+     Если не загрузятся (офлайн) — фолбэк на IntersectionObserver, контент виден. -->
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/ScrollTrigger.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/lenis@1.1.18/dist/lenis.min.js"></script>
 <script>
 (function(){
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -373,20 +373,14 @@ footer{padding:36px 0;color:var(--muted);font-size:.88em;text-align:center;borde
   if (hasGSAP && !reduce){
     document.documentElement.classList.add('gsap-on');
     gsap.registerPlugin(ScrollTrigger);
-
-    // Lenis — плавный инерционный скролл, синхронизирован с ScrollTrigger
-    if (window.Lenis){
-      const lenis = new Lenis({lerp:0.1, wheelMultiplier:1});
-      lenis.on('scroll', ScrollTrigger.update);
-      gsap.ticker.add((t)=> lenis.raf(t*1000));
-      gsap.ticker.lagSmoothing(0);
-    }
+    // Нативный скролл (без Lenis) — аппаратно-ускорен, не «висит». Динамику даёт
+    // параллакс + появление блоков ниже.
 
     // Параллакс: элементы с data-speed едут со своей скоростью (3 шт — дёшево).
     document.querySelectorAll('[data-speed]').forEach(el => {
       const sp = parseFloat(el.dataset.speed);
       gsap.to(el, {yPercent:(sp-1)*40, ease:'none', force3D:true,
-        scrollTrigger:{trigger:el, start:'top bottom', end:'bottom top', scrub:0.4}});
+        scrollTrigger:{trigger:el, start:'top bottom', end:'bottom top', scrub:true}});
     });
 
     // Появление блоков — ОДНОРАЗОВО при входе (без scrub = без нагрузки каждый кадр).
