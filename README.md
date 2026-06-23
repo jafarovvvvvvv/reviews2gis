@@ -246,8 +246,8 @@ AI-ответа) и «Открыть в 2ГИС»; нажатия обрабат
 
 Технические заметки: uvicorn запускается через `server.serve()` внутри
 Proactor-цикла (Windows) — иначе Playwright не сможет поднять браузер;
-формы — urlencoded (без python-multipart); HTML рендерится f-строками без
-шаблонизатора.
+формы — urlencoded, но `request.form()` в Starlette требует `python-multipart`
+(в requirements.txt); HTML рендерится f-строками без шаблонизатора.
 
 ### Дизайн панели
 
