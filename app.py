@@ -131,6 +131,7 @@ async def lifespan(app):
     if not db.get_setting(conn, "openai_model"):
         db.set_setting(conn, "openai_model",
                        os.getenv("OPENAI_MODEL") or ai_reply.DEFAULT_MODEL)
+    db.reset_stale_statuses(conn)
     conn.close()
     # в демо фоновые задачи не нужны (компания не скрапится, токена может не быть)
     tasks = [] if DEMO else [asyncio.create_task(monitor.scheduler_loop()),

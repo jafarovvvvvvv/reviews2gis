@@ -182,6 +182,14 @@ def set_company_status(conn, company_id: int, status: str, error: str = ""):
     conn.commit()
 
 
+def reset_stale_statuses(conn):
+    """При старте: сбросить компании, зависшие в checking/adding из-за краша."""
+    conn.execute(
+        "UPDATE companies SET status=? WHERE status IN (?,?)",
+        (ST_OK, ST_CHECKING, ST_ADDING))
+    conn.commit()
+
+
 def bump_errors(conn, company_id: int) -> int:
     """+1 к счётчику ошибок подряд, вернуть новое значение."""
     conn.execute("UPDATE companies SET consecutive_errors=consecutive_errors+1 "
