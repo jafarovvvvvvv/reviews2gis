@@ -36,6 +36,7 @@
 | `backup.py` | бэкап `monitor.db` через SQLite backup API + ротация (для cron) |
 | `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `DEPLOY.md` | деплой на VPS: образ с Chromium, Caddy+HTTPS, чек-лист |
 | `brand/landing.html` | продающий лендинг (статика); отдаётся публично на `/lp` |
+| `brand/pitch-context.md` | сводка проекта (что есть/чего нет) — контекст для ИИ-консультанта по раскрутке |
 | `explore.py`, `explore2.py` | разовая разведка структуры 2GIS (как выяснены селекторы/эндпоинты) |
 
 ## Установка и запуск
