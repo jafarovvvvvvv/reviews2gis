@@ -5,6 +5,8 @@ HTTP-способ чтения карточки 2GIS — без браузера
 картинки) и на слабом канале регулярно падает с `Page.goto: Timeout 60000ms`.
 Все нужные данные при этом лежат в самом HTML и в публичном reviews-API:
 
+  • страница /{slug}/search/{категория}/page/{N} -> ссылки /firm/{id}
+    (13 фирм на страницу; проверено: обычный GET, HTTP 200, ~830 КБ);
   • страница /{slug}/firm/{id}  -> og:title (название, категория),
     og:description (рейтинг, кол-во), "reviewApiKey" (живой ключ API),
     "type":"phone" (телефон), прямые ссылки на соцсети;
@@ -61,6 +63,12 @@ BLOCK_BODY_MAX = 120_000  # больше этого — нормальная с�
 # трекеры/служебные пути, которые НЕ являются ссылками бизнеса
 SOCIAL_BLOCKLIST = ("facebook.com/tr", "facebook.com/plugins", "vk.com/js",
                     "vk.com/widget", "instagram.com/embed", "instagram.com/static")
+
+# Поиск: ID фирмы в ссылке. 6+ цифр — чтобы не хватать служебные короткие числа.
+FIRM_ID_RE = re.compile(r"/firm/(\d{6,})")
+SEARCH_PAGE_MAX = 30      # предохранитель от бесконечной пагинации
+SEARCH_EMPTY_STOP = 2     # столько страниц без новых ID подряд -> конец выдачи
+SEARCH_PAUSE = (0.6, 1.4)  # пауза между страницами поиска, сек
 
 
 class BlockedError(Exception):
@@ -197,6 +205,15 @@ def _socials_from_html(html: str) -> str | None:
     return "; ".join(found[:3]) if found else None
 
 
+def extract_firm_ids(html: str) -> list:
+    """HTML страницы поиска -> ID фирм в порядке появления, без повторов.
+
+    Общий парсер для обоих способов: и HTTP, и браузер в итоге имеют один и тот
+    же HTML выдачи.
+    """
+    return list(dict.fromkeys(FIRM_ID_RE.findall(html or "")))
+
+
 def _created(r: dict) -> datetime:
     try:
         return datetime.fromisoformat(r["date_created"])
@@ -276,12 +293,41 @@ def looks_blocked(body: str, status: int = 200) -> bool:
     return any(sig in low for sig in BLOCK_SIGNALS)
 
 
+# ========================= каскад способов ================================
+# Способы чтения в порядке предпочтения; первый успешный побеждает. Живёт
+# здесь, а не в monitor.py, чтобы каскадом могли пользоваться и мониторинг,
+# и лидогенерация (leadgen.py), и аналитика (insights.py) — без общего импорта
+# тяжёлого monitor. Выбор способа — настройка «fetch_mode» в панели.
+
+FETCH_MODES = {
+    "auto": ("http", "browser"),   # по умолчанию: быстрый HTTP, браузер в резерв
+    "http": ("http",),             # только HTTP (для отладки)
+    "browser": ("browser",),       # только браузер (старое поведение)
+}
+
+
+def fetch_ways(mode: str) -> tuple:
+    """Имя режима -> кортеж способов. Неизвестный режим -> «auto»."""
+    return FETCH_MODES.get(mode) or FETCH_MODES["auto"]
+
+
+def fetcher_class(way: str):
+    """Способ -> класс-читатель. Браузер импортируется лениво: пока HTTP
+    справляется, процесс не тянет Playwright вообще."""
+    if way == "http":
+        return HttpFetcher
+    if way == "browser":
+        from scraper import Scraper  # локально: scraper импортирует этот модуль
+        return Scraper
+    raise KeyError(f"неизвестный способ чтения: {way}")
+
+
 # ============================ HTTP-способ =================================
 
 class HttpFetcher:
     """Читает карточку и отзывы по HTTP. API совместим с scraper.Scraper в
-    той части, которой пользуются monitor.py и insights.py:
-    `parse_firm`, `last_reviews_data`, `fetch_reviews_deep`."""
+    той части, которой пользуются monitor.py, insights.py и leadgen.py:
+    `collect_firm_ids`, `parse_firm`, `last_reviews_data`, `fetch_reviews_deep`."""
 
     name = "http"
 
@@ -334,6 +380,46 @@ class HttpFetcher:
             if attempt < RETRIES:
                 await asyncio.sleep(0.8 * (attempt + 1) + random.uniform(0, 0.4))
         raise last or FetchError("не удалось выполнить запрос")
+
+    # ---------- поиск: список фирм по категории ----------
+    async def collect_firm_ids(self, count: int) -> list:
+        """ID фирм из выдачи /{slug}/search/{категория}/page/{N}.
+
+        Страница поиска отдаётся обычным GET (проверено: HTTP 200, ~830 КБ,
+        13 ID на страницу) — браузер для этого не нужен.
+
+        Ошибка на ПЕРВОЙ странице — это провал способа (бросаем, вызывающий
+        уйдёт в браузер). Ошибка дальше — отдаём то, что успели собрать.
+        """
+        ids: list = []
+        empty = 0
+        cat = urllib.parse.quote(self.cfg.category)
+        page = 1
+        while len(ids) < count and empty < SEARCH_EMPTY_STOP and page <= SEARCH_PAGE_MAX:
+            url = f"{self.cfg.domain}/{self.cfg.city_slug}/search/{cat}/page/{page}"
+            try:
+                r = await self._get(url, self._headers())
+                if looks_blocked(r.text, r.status_code):
+                    raise BlockedError(
+                        f"поиск: страница похожа на заглушку/капчу (HTTP {r.status_code})")
+                if r.status_code != 200:
+                    raise FetchError(f"поиск: HTTP {r.status_code}")
+            except BlockedError:
+                raise
+            except FetchError:
+                if not ids:
+                    raise
+                _log(f"  [search] страница {page} не отдалась — беру собранное")
+                break
+            new = [i for i in extract_firm_ids(r.text) if i not in ids]
+            _log(f"  [search] страница {page}: новых компаний {len(new)} "
+                 f"(всего {len(ids) + len(new)} из {count})")
+            empty = 0 if new else empty + 1
+            ids.extend(new)
+            page += 1
+            if len(ids) < count:
+                await asyncio.sleep(random.uniform(*SEARCH_PAUSE))
+        return ids[:count]
 
     # ---------- карточка ----------
     async def parse_firm(self, firm_id: str) -> Company:
@@ -481,6 +567,19 @@ if __name__ == "__main__":
     checks.append(("html: пустой не падает",
                    empty["name"] is None and empty["rating"] is None))
 
+    SEARCH = (
+        '<a href="/almaty/firm/70000001026831262">Клиника</a>'
+        '<a href="/almaty/firm/70000001026831262/tab/reviews">отзывы той же</a>'
+        '<a href="/almaty/firm/70000001099887766?m=1">Вторая</a>'
+        '<a href="/almaty/search/стоматология/page/2">дальше</a>'
+        '<a href="/firm/12345">короткий id — не фирма</a>'
+    )
+    sids = extract_firm_ids(SEARCH)
+    checks.append(("поиск: id по порядку без повторов",
+                   sids == ["70000001026831262", "70000001099887766"]))
+    checks.append(("поиск: короткий номер отброшен", "12345" not in sids))
+    checks.append(("поиск: пустой HTML", extract_firm_ids("") == []))
+
     NOW = datetime(2026, 7, 27, tzinfo=timezone.utc)
 
     def rv(days_ago, rating, answer=None, text="текст"):
@@ -522,6 +621,18 @@ if __name__ == "__main__":
     checks.append(("блок: длинная страница со словом captcha — не блок",
                    looks_blocked("captcha" + "x" * BLOCK_BODY_MAX) is False))
     checks.append(("блок: обычная страница", looks_blocked("<html>привет</html>") is False))
+
+    checks.append(("каскад: auto = http, потом браузер",
+                   fetch_ways("auto") == ("http", "browser")))
+    checks.append(("каскад: неизвестный режим -> auto",
+                   fetch_ways("чепуха") == ("http", "browser")))
+    checks.append(("каскад: http -> HttpFetcher", fetcher_class("http") is HttpFetcher))
+    try:
+        fetcher_class("телепатия")
+        bad_way = False
+    except KeyError:
+        bad_way = True
+    checks.append(("каскад: неизвестный способ -> KeyError", bad_way))
 
     _KEY_CACHE["key"] = DEFAULT_REVIEW_KEY
     remember_key("11111111-2222-3333-4444-555555555555")

@@ -24,6 +24,7 @@ import httpx
 
 import ai_reply
 import db
+import fetcher
 
 BATCH_SIZE = 25          # отзывов на один запрос классификации
 TEXT_LIMIT = 350         # обрезка текста отзыва в промпте
@@ -408,13 +409,13 @@ async def _deep_fetch(domain: str, city_slug: str, firm_id: str, deep_limit: int
         mode = db.get_setting(conn, "fetch_mode", "auto")
     finally:
         conn.close()
-    ways = monitor.FETCH_MODES.get(mode) or monitor.FETCH_MODES["auto"]
+    ways = fetcher.fetch_ways(mode)
     cfg = monitor.MonitorCfg(city_slug=city_slug, domain=domain)
     errors = []
     async with monitor.SCRAPE_LOCK:
         for way in ways:
             try:
-                async with monitor._FETCHERS[way](cfg) as s:
+                async with fetcher.fetcher_class(way)(cfg) as s:
                     c = await s.parse_firm(firm_id)  # обновляет ключ reviews-API
                     raw = await s.fetch_reviews_deep(firm_id, deep_limit)
                 if raw:

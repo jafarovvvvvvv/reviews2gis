@@ -5,7 +5,8 @@
 Проверка одной компании = parse_firm (обновляет название/рейтинг/кол-во) +
 сырые отзывы из той же сессии (last_reviews_data).
 
-КАСКАД СПОСОБОВ (fetch_mode в настройках, по умолчанию "auto"):
+КАСКАД СПОСОБОВ (fetch_mode в настройках, по умолчанию "auto") задан в
+fetcher.py — FETCH_MODES / fetch_ways / fetcher_class:
   1. HTTP (fetcher.HttpFetcher) — основной: ~0.9 с на карточку, браузер не нужен;
   2. браузер (scraper.Scraper) — резерв: медленно (~9 с), но переживёт JS-рендер.
 Если первый способ не смог — молча пробуем второй и пишем в лог, кто сработал.
@@ -26,9 +27,8 @@ import ai_reply
 import db
 import fetcher
 import tg
-from fetcher import BlockedError, HttpFetcher
+from fetcher import FETCH_MODES, BlockedError, fetch_ways, fetcher_class
 from lead_scoring import NA
-from scraper import Scraper
 
 # ссылка на карточку: https://2gis.kz/almaty/firm/700000010… (+ /tab/…, ?…)
 URL_DOMAIN_RE = re.compile(
@@ -43,13 +43,9 @@ _repair_attempted = False
 
 DEAD_THRESHOLD = 3  # столько ошибок подряд у компании -> алерт «парсер умер»
 
-# Способы чтения карточки в порядке предпочтения. Первый успешный побеждает.
-FETCH_MODES = {
-    "auto": ("http", "browser"),   # по умолчанию: быстрый HTTP, браузер в резерв
-    "http": ("http",),             # только HTTP (для отладки)
-    "browser": ("browser",),       # только браузер (старое поведение)
-}
-_FETCHERS = {"http": HttpFetcher, "browser": Scraper}
+# Каскад способов (FETCH_MODES/fetch_ways/fetcher_class) живёт в fetcher.py —
+# им пользуются и мониторинг, и лидогенерация, и аналитика. Реэкспорт здесь —
+# ради прежних обращений monitor.FETCH_MODES.
 
 
 @dataclass
@@ -91,13 +87,13 @@ async def _scrape(row, mode: str = "auto"):
     Возвращает (Company, raw_reviews, способ). Бросает последнюю ошибку, только
     если не сработал ни один способ — тогда это действительно поломка.
     """
-    ways = FETCH_MODES.get(mode) or FETCH_MODES["auto"]
+    ways = fetch_ways(mode)
     cfg = MonitorCfg(city_slug=row["city_slug"], domain=row["domain"])
     errors = []
     async with SCRAPE_LOCK:
         for i, way in enumerate(ways):
             try:
-                async with _FETCHERS[way](cfg) as s:
+                async with fetcher_class(way)(cfg) as s:
                     c = await s.parse_firm(row["firm_id"])
                     data = s.last_reviews_data
                     # пустая карточка без отзывов = способ не справился
@@ -466,13 +462,13 @@ if __name__ == "__main__":
     rv2 = extract_review({"rating": 5, "date_created": "2026-01-01", "text": "ок"})
     checks.append(("extract: без id не падает", rv2["review_id"] != "" and rv2["answered"] is False))
 
-    # --- каскад способов ---
-    checks.append(("каскад: auto = http, потом браузер",
-                   FETCH_MODES["auto"] == ("http", "browser")))
-    checks.append(("каскад: у каждого способа есть класс",
-                   all(w in _FETCHERS for ws in FETCH_MODES.values() for w in ws)))
-    checks.append(("каскад: неизвестный режим -> auto",
-                   (FETCH_MODES.get("чепуха") or FETCH_MODES["auto"]) == ("http", "browser")))
+    # --- каскад способов (сам каскад тестируется в fetcher.py) ---
+    checks.append(("каскад: у каждого способа есть класс-читатель",
+                   all(fetcher_class(w) is not None
+                       for ws in FETCH_MODES.values() for w in ws)))
+    checks.append(("каскад: у читателей есть parse_firm",
+                   all(hasattr(fetcher_class(w), "parse_firm")
+                       for ws in FETCH_MODES.values() for w in ws)))
 
     # --- антиспам алертов ---
     class _FakeConn:

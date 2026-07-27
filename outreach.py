@@ -1,7 +1,7 @@
 """
 Генерация материалов для рассылки (outreach) из собранных лидов.
 
-Вход — список Company после прогона скрапера. Выход — «пакет для рассылки»
+Вход — список Company после прогона (leadgen.py). Выход — «пакет для рассылки»
 в папке output/outreach_<город>_<категория>_<дата>/:
   index.html       — дашборд: лиды по приоритету, готовое персональное
                      сообщение (кнопка «копировать»), ссылка wa.me с уже
@@ -311,24 +311,43 @@ def render_dashboard_html(rows: list, cfg) -> str:
 </body></html>"""
 
 
-# ---------- запись пакета ----------
+# ---------- строки рассылки ----------
 
-def write_outreach_pack(companies: list, cfg) -> Path:
-    """Собрать пакет рассылки. Возвращает путь к папке пакета."""
+def audit_filename(c: Company, i: int = 0) -> str:
+    """Имя файла аудита лида. Общее для пакета на диске и ссылок в веб-панели."""
+    return f"audit_{c.firm_id if c.firm_id != NA else i}.html"
+
+
+def build_rows(companies: list, cfg) -> list:
+    """Лиды -> строки рассылки: сообщение, ссылка WhatsApp, файл аудита.
+
+    Чистая функция (без диска и сети): по ней строится и пакет в output/,
+    и таблица результатов на странице «Поиск лидов» в панели — так обе
+    поверхности показывают ровно один и тот же текст.
+    """
     companies = sorted(companies, key=sort_key)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pack = Path(cfg.output_dir) / f"outreach_{cfg.city_slug}_{cfg.category}_{ts}"
-    pack.mkdir(parents=True, exist_ok=True)
-
     rows = []
     for i, c in enumerate(companies):
         competitor = pick_benchmark(companies, exclude=c)
         message = build_message(c, competitor, cfg)
-        audit_file = f"audit_{c.firm_id if c.firm_id != NA else i}.html"
-        (pack / audit_file).write_text(
-            render_audit_html(c, competitor, cfg), encoding="utf-8")
-        rows.append({"c": c, "message": message,
-                     "wa": wa_link(c.phone, message), "audit_file": audit_file})
+        rows.append({"c": c, "competitor": competitor, "message": message,
+                     "wa": wa_link(c.phone, message),
+                     "audit_file": audit_filename(c, i)})
+    return rows
+
+
+# ---------- запись пакета ----------
+
+def write_outreach_pack(companies: list, cfg) -> Path:
+    """Собрать пакет рассылки. Возвращает путь к папке пакета."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pack = Path(cfg.output_dir) / f"outreach_{cfg.city_slug}_{cfg.category}_{ts}"
+    pack.mkdir(parents=True, exist_ok=True)
+
+    rows = build_rows(companies, cfg)
+    for row in rows:
+        (pack / row["audit_file"]).write_text(
+            render_audit_html(row["c"], row["competitor"], cfg), encoding="utf-8")
 
     (pack / "index.html").write_text(render_dashboard_html(rows, cfg), encoding="utf-8")
 
@@ -404,6 +423,21 @@ if __name__ == "__main__":
         [{"c": lead, "message": msg, "wa": wa, "audit_file": "audit_1.html"}], cfg)
     checks.append(("дашборд: ссылки", "audit_1.html" in dash and "wa.me" in dash))
     checks.append(("дашборд: instagram", "instagram.com/aruna_dent" in dash))
+
+    hot = Company(firm_id="3", name="Смайл", rating=4.0, reviews_count=60,
+                  has_fresh_reviews=True, owner_responds=False,
+                  phone="+7 (727) 000-11-22")
+    hot.compute_priority()  # 🔥 Высокий — должен встать первым
+    rows = build_rows([lead, hot, top], cfg)
+    checks.append(("строки: отсортированы по приоритету",
+                   [r["c"].name for r in rows][0] == "Смайл"))
+    checks.append(("строки: файл аудита по firm_id",
+                   rows[0]["audit_file"] == "audit_3.html"))
+    checks.append(("строки: сообщение и WhatsApp на месте",
+                   "«Смайл»" in rows[0]["message"]
+                   and "wa.me/77270001122" in (rows[0]["wa"] or "")))
+    checks.append(("строки: без телефона WhatsApp пустой",
+                   [r for r in rows if r["c"].name == "Dent Lux"][0]["wa"] is None))
 
     checks.append(("benchmark исключает себя",
                    pick_benchmark([lead, top], exclude=top) is lead))

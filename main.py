@@ -1,19 +1,21 @@
 """
-Парсер карточек 2GIS — сбор лид-данных локального бизнеса.
+Парсер карточек 2GIS — сбор лид-данных локального бизнеса (CLI).
+
+То же самое умеет веб-панель: `python app.py` -> страница «Поиск лидов»
+(форма, прогресс, таблица лидов, кнопка «в мониторинг»). Общая логика прогона —
+в leadgen.py; здесь только разбор аргументов и вывод в консоль.
 
 Примеры запуска:
   python main.py                                  # параметры из .env
   python main.py --city Алматы --category стоматология --count 30
   python main.py --firm 70000001026831262         # отладка одной карточки
+  python main.py --mode browser                   # принудительно через браузер
 
-Результат: CSV в папке output/, отсортированный по приоритету лида.
+Результат: CSV в папке output/ + пакет для рассылки, оба отсортированы по
+приоритету лида.
 """
 import asyncio
-import csv
-import io
 import sys
-from datetime import datetime
-from pathlib import Path
 
 # консоль Windows -> UTF-8 (иначе падает на эмодзи/кириллице)
 for _s in (sys.stdout, sys.stderr):
@@ -22,39 +24,23 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+import leadgen
 from config import load_config
-from lead_scoring import (Company, CSV_HEADERS, sort_key,
-                          PRIORITY_HIGH, PRIORITY_MEDIUM, PRIORITY_LOW)
-from outreach import build_message, write_outreach_pack
-from scraper import Scraper, BlockedError
+from fetcher import BlockedError
+from lead_scoring import Company
+from outreach import build_message
 
 
 def log(msg=""):
     print(msg, flush=True)
 
 
-def write_csv(companies, cfg) -> Path:
-    Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = Path(cfg.output_dir) / f"2gis_{cfg.city_slug}_{cfg.category}_{ts}.csv"
-    # utf-8-sig (BOM) — чтобы Excel корректно открыл кириллицу
-    with open(fname, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_HEADERS, delimiter=";")
-        w.writeheader()
-        for c in companies:
-            w.writerow(c.to_row())
-    return fname
-
-
 def print_summary(companies):
-    counts = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 0, PRIORITY_LOW: 0}
-    for c in companies:
-        counts[c.priority] = counts.get(c.priority, 0) + 1
+    counts = leadgen.priority_counts(companies)
     log("\n=== ИТОГ ===")
     log(f"  Всего компаний: {len(companies)}")
-    log(f"  {PRIORITY_HIGH}: {counts[PRIORITY_HIGH]}")
-    log(f"  {PRIORITY_MEDIUM}: {counts[PRIORITY_MEDIUM]}")
-    log(f"  {PRIORITY_LOW}: {counts[PRIORITY_LOW]}")
+    for priority, n in counts.items():
+        log(f"  {priority}: {n}")
 
 
 def print_company(c: Company):
@@ -69,8 +55,8 @@ def print_company(c: Company):
 async def run_single(cfg):
     """Отладочный режим: одна карточка."""
     log(f"Режим одной карточки: firm={cfg.firm}")
-    async with Scraper(cfg) as s:
-        c = await s.parse_firm(cfg.firm)
+    c, way = await leadgen.fetch_one(cfg, cfg.firm, cfg.mode)
+    log(f"(способ: {way})")
     print_company(c)
     log("\n--- сообщение-открывашка ---")
     log(build_message(c, None, cfg))
@@ -79,56 +65,30 @@ async def run_single(cfg):
 async def run_full(cfg):
     log("=" * 60)
     log(f"2GIS парсер лидов | город: {cfg.city} ({cfg.city_slug}) | "
-        f"категория: {cfg.category} | нужно: {cfg.count}")
+        f"категория: {cfg.category} | нужно: {cfg.count} | способ: {cfg.mode}")
     log("=" * 60)
 
-    companies: list[Company] = []
-    blocked = False
-    async with Scraper(cfg) as s:
-        # 1. собрать список ID
-        try:
-            ids = await s.collect_firm_ids(cfg.count)
-        except BlockedError as e:
-            log(f"\n[!] ОСТАНОВКА: {e}")
-            log("    2GIS показал капчу/блок на этапе поиска. Попробуйте позже "
-                "или с другого IP, уменьшите частоту.")
-            return
-        log(f"\nСобрано ID компаний: {len(ids)} (цель {cfg.count})\n")
-        if not ids:
-            log("[!] Не найдено ни одной компании. Проверьте город/категорию.")
-            return
+    def report(stage, done=0, total=0):
+        log(f"[{done}/{total or '?'}] {stage}")
 
-        total = len(ids)
-        for i, fid in enumerate(ids, 1):
-            log(f"[{i}/{total}] Компания id={fid}")
-            try:
-                c = await s.parse_firm(fid)
-            except BlockedError as e:
-                log(f"\n[!] ОСТАНОВКА на компании {i}/{total}: {e}")
-                log("    Сохраняю то, что уже собрано, и выхожу.")
-                blocked = True
-                break
-            companies.append(c)
-            print_company(c)
-            if i < total:
-                await s._human_pause()  # пауза между компаниями
-
-    if not companies:
-        log("\n[!] Нечего сохранять.")
+    try:
+        res = await leadgen.run_leads(cfg, cfg.mode, report)
+    except BlockedError as e:
+        log(f"\n[!] ОСТАНОВКА: {e}")
+        log("    2GIS показал капчу/блок. Попробуйте позже или с другого IP, "
+            "уменьшите количество.")
+        return
+    except Exception as e:
+        log(f"\n[!] Не удалось собрать лидов: {e}")
         return
 
-    # 2. сортировка по приоритету
-    companies.sort(key=sort_key)
-
-    # 3. CSV + пакет для рассылки
-    out = write_csv(companies, cfg)
-    pack = write_outreach_pack(companies, cfg)
-    print_summary(companies)
-    log(f"\nCSV сохранён: {out}")
-    log(f"Пакет для рассылки: {pack / 'index.html'}")
+    for c in res["companies"]:
+        print_company(c)
+    print_summary(res["companies"])
+    log(f"\nСпособ, который сработал: {res['way']}")
+    log(f"CSV сохранён: {res['csv']}")
+    log(f"Пакет для рассылки: {res['pack'] / 'index.html'}")
     log("  (откройте в браузере: готовые сообщения, ссылки WhatsApp, аудиты)")
-    if blocked:
-        log("(данные неполные — был обнаружен блок)")
 
 
 def main():
