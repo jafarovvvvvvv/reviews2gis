@@ -1171,6 +1171,7 @@ async def settings_page(request: Request):
         interval = db.get_setting(conn, "check_interval_min", "360")
         max_per_hour = db.get_setting(conn, "max_checks_per_hour", "40")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
+        fetch_mode = db.get_setting(conn, "fetch_mode", "auto")
         auto_digest = db.get_setting(conn, "auto_digest", "0") == "1"
         auto_report = db.get_setting(conn, "auto_report", "0") == "1"
         chats = db.list_chats(conn)
@@ -1219,6 +1220,14 @@ async def settings_page(request: Request):
   <p><b>Лимит проверок в час</b><br>
    <input type="number" name="max_per_hour" value="{e(max_per_hour)}" min="1" style="width:120px">
    <span class="muted">потолок под масштаб: при многих компаниях остаток едет на следующий час</span></p>
+  <p><b>Способ чтения карточек</b><br>
+   <select name="fetch_mode" style="width:260px">
+    <option value="auto" {'selected' if fetch_mode == 'auto' else ''}>Авто: HTTP, браузер в резерве</option>
+    <option value="http" {'selected' if fetch_mode == 'http' else ''}>Только HTTP (быстро)</option>
+    <option value="browser" {'selected' if fetch_mode == 'browser' else ''}>Только браузер (медленно)</option>
+   </select>
+   <span class="muted">HTTP — ~0.9 с на карточку, браузер — ~9 с и падает по таймауту
+   на слабом канале. Меняйте, только если 2ГИС перестанет отдавать данные простым запросом.</span></p>
   <p><label><input type="checkbox" name="notify_all" {'checked' if notify_all else ''}>
    уведомлять обо <b>всех</b> новых отзывах (иначе — только о негативе, оценка ≤3)</label></p>
   <p><label><input type="checkbox" name="auto_digest" {'checked' if auto_digest else ''}>
@@ -1269,6 +1278,9 @@ async def settings_save(request: Request):
     interval = str(form.get("interval", "360")).strip()
     max_per_hour = str(form.get("max_per_hour", "40")).strip()
     notify_all = "1" if form.get("notify_all") else "0"
+    fetch_mode = str(form.get("fetch_mode", "auto")).strip()
+    if fetch_mode not in monitor.FETCH_MODES:
+        fetch_mode = "auto"
     auto_digest = "1" if form.get("auto_digest") else "0"
     auto_report = "1" if form.get("auto_report") else "0"
     try:
@@ -1291,6 +1303,7 @@ async def settings_save(request: Request):
         db.set_setting(conn, "check_interval_min", interval)
         db.set_setting(conn, "max_checks_per_hour", max_per_hour)
         db.set_setting(conn, "notify_all", notify_all)
+        db.set_setting(conn, "fetch_mode", fetch_mode)
         db.set_setting(conn, "auto_digest", auto_digest)
         db.set_setting(conn, "auto_report", auto_report)
         if openai_key:  # пустое поле = оставить прежний ключ

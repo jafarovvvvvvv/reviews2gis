@@ -1,10 +1,18 @@
 """
-Мониторинг отзывов: разбор ссылки 2GIS, проверка компании через Scraper,
-диф новых отзывов против БД и рассылка уведомлений в Telegram.
+Мониторинг отзывов: разбор ссылки 2GIS, проверка компании, диф новых отзывов
+против БД и рассылка уведомлений в Telegram.
 
 Проверка одной компании = parse_firm (обновляет название/рейтинг/кол-во) +
-сырые отзывы из той же сессии (scraper.last_reviews_data). Playwright в один
-момент времени один — SCRAPE_LOCK.
+сырые отзывы из той же сессии (last_reviews_data).
+
+КАСКАД СПОСОБОВ (fetch_mode в настройках, по умолчанию "auto"):
+  1. HTTP (fetcher.HttpFetcher) — основной: ~0.9 с на карточку, браузер не нужен;
+  2. браузер (scraper.Scraper) — резерв: медленно (~9 с), но переживёт JS-рендер.
+Если первый способ не смог — молча пробуем второй и пишем в лог, кто сработал.
+Замеры, на которых основан порядок, — в README.
+
+Playwright в один момент времени один — SCRAPE_LOCK (HTTP лок не нужен, но
+берём его же, чтобы не долбить 2GIS параллельно).
 
 Чистые функции (parse_2gis_url, extract_review) — самотесты: python monitor.py
 """
@@ -16,7 +24,9 @@ from dataclasses import dataclass
 
 import ai_reply
 import db
+import fetcher
 import tg
+from fetcher import BlockedError, HttpFetcher
 from lead_scoring import NA
 from scraper import Scraper
 
@@ -32,6 +42,14 @@ _REPAIR_LOCK = asyncio.Lock()
 _repair_attempted = False
 
 DEAD_THRESHOLD = 3  # столько ошибок подряд у компании -> алерт «парсер умер»
+
+# Способы чтения карточки в порядке предпочтения. Первый успешный побеждает.
+FETCH_MODES = {
+    "auto": ("http", "browser"),   # по умолчанию: быстрый HTTP, браузер в резерв
+    "http": ("http",),             # только HTTP (для отладки)
+    "browser": ("browser",),       # только браузер (старое поведение)
+}
+_FETCHERS = {"http": HttpFetcher, "browser": Scraper}
 
 
 @dataclass
@@ -67,13 +85,36 @@ def extract_review(raw: dict) -> dict:
     }
 
 
-async def _scrape(row):
-    """Открыть карточку и забрать сырые отзывы (один Playwright за раз)."""
+async def _scrape(row, mode: str = "auto"):
+    """Прочитать карточку и сырые отзывы, перебирая способы по каскаду.
+
+    Возвращает (Company, raw_reviews, способ). Бросает последнюю ошибку, только
+    если не сработал ни один способ — тогда это действительно поломка.
+    """
+    ways = FETCH_MODES.get(mode) or FETCH_MODES["auto"]
+    cfg = MonitorCfg(city_slug=row["city_slug"], domain=row["domain"])
+    errors = []
     async with SCRAPE_LOCK:
-        cfg = MonitorCfg(city_slug=row["city_slug"], domain=row["domain"])
-        async with Scraper(cfg) as s:
-            c = await s.parse_firm(row["firm_id"])
-            return c, s.last_reviews_data
+        for i, way in enumerate(ways):
+            try:
+                async with _FETCHERS[way](cfg) as s:
+                    c = await s.parse_firm(row["firm_id"])
+                    data = s.last_reviews_data
+                    # пустая карточка без отзывов = способ не справился
+                    if c.name == NA and data is None:
+                        raise fetcher.FetchError("ни карточка, ни отзывы не прочитались")
+                    if i:  # сработал не первый способ — это стоит видеть в логах
+                        print(f"[monitor] «{row['name']}»: способ «{way}» "
+                              f"выручил после отказа «{ways[0]}»", flush=True)
+                    return c, data, way
+            except BlockedError:
+                raise  # блок не лечится сменой способа — с тем же IP смысла нет
+            except Exception as e:
+                errors.append(f"{way}: {e}")
+                if i + 1 < len(ways):
+                    print(f"[monitor] способ «{way}» не смог ({str(e)[:120]}) — "
+                          f"пробую «{ways[i + 1]}»", flush=True)
+    raise fetcher.FetchError("; ".join(errors) or "не осталось способов")
 
 
 async def _install_browsers() -> str:
@@ -139,14 +180,41 @@ async def notify_document(conn, filename: str, content: bytes, caption: str,
     return errors
 
 
+# Компании, по которым алерт «не читается» уже отправлен. Пока компания здесь,
+# новых сообщений о ней нет — придёт только «✅ снова читается».
+_alerted: set = set()
+
+
 async def _on_check_failed(conn, company_id: int, name: str, err: str):
-    """Учесть ошибку проверки; при DEAD_THRESHOLD подряд — алерт админам (один раз)."""
+    """Учесть ошибку проверки; при DEAD_THRESHOLD подряд — ОДИН алерт админам.
+
+    Повторные ошибки той же компании молчат: пока проблема не устранена, слать
+    одно и то же каждые несколько минут бессмысленно (раньше так и было —
+    Telegram захлёбывался одинаковыми «Парсер не справляется»).
+    """
     count = db.bump_errors(conn, company_id)
-    if count == DEAD_THRESHOLD:
+    if count < DEAD_THRESHOLD or company_id in _alerted:
+        return
+    _alerted.add(company_id)
+    total = len(_alerted)
+    tail = (f"\n\nВсего компаний с проблемой: <b>{total}</b> — похоже на общий "
+            f"сбой (сеть/блокировка), а не на конкретную карточку."
+            if total > 1 else "")
+    await notify_chats(
+        conn, f"⚠️ <b>Не читается карточка</b>: «{name}» — {count} ошибки подряд. "
+              f"Проверки продолжаются, о восстановлении сообщу.\n"
+              f"Причина: {err[:200]}{tail}")
+
+
+async def _on_check_ok(conn, company_id: int, name: str, way: str):
+    """Успешная проверка: сбросить счётчик и, если по компании был алерт,
+    сообщить о восстановлении."""
+    db.clear_errors(conn, company_id)
+    if company_id in _alerted:
+        _alerted.discard(company_id)
         await notify_chats(
-            conn, f"⚠️ <b>Парсер не справляется</b>: «{name}» — {count} ошибки "
-                  f"подряд. Возможно, 2ГИС сменил структуру или блокирует. "
-                  f"Последняя: {err[:200]}")
+            conn, f"✅ <b>Снова читается</b>: «{name}» — данные обновляются "
+                  f"(способ: {way}).")
 
 
 async def check_company(company_id: int, baseline: bool = False) -> dict:
@@ -172,19 +240,21 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         baseline = baseline or row["last_checked"] is None
         db.set_company_status(conn, company_id,
                               db.ST_ADDING if baseline else db.ST_CHECKING)
+        mode = db.get_setting(conn, "fetch_mode", "auto")
         c = data = None
         err = ""
         try:
-            c, data = await _scrape(row)
+            c, data, way = await _scrape(row, mode)
         except Exception as e:
             err = str(e)
         if err and "Executable doesn't exist" in err:
-            # самовосстановление: ставим браузер и пробуем ещё раз
+            # самовосстановление: ставим браузер и пробуем ещё раз.
+            # (при mode=auto досюда обычно не доходит — HTTP-способ уже справился)
             print(f"[monitor] {err}", flush=True)  # полный текст с путём — в консоль
             fail = await _install_browsers()
             if not fail:
                 try:
-                    c, data = await _scrape(row)
+                    c, data, way = await _scrape(row, mode)
                     err = ""
                 except Exception as e2:
                     err = str(e2)
@@ -199,15 +269,6 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
             result["errors"].append(err)
             return result
 
-        if c.name == NA and data is None:
-            # ни карточка, ни отзывы не прочитались — не затираем имя, фиксируем ошибку
-            db.set_company_status(conn, company_id, db.ST_ERROR,
-                                  "карточка не прочиталась (блок/структура изменилась?)")
-            await _on_check_failed(conn, company_id, row["name"],
-                                   "карточка не прочиталась")
-            result["errors"].append("карточка не прочиталась")
-            return result
-
         reviews = [extract_review(r) for r in (data or {}).get("reviews") or []]
         new = db.save_reviews(conn, company_id, reviews, mark_new=not baseline)
         db.update_company_info(
@@ -217,7 +278,8 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
             rating=c.rating, reviews_count=c.reviews_count,
             status=db.ST_OK, error="")
 
-        db.clear_errors(conn, company_id)  # успешная проверка — сбросить счётчик
+        # успешная проверка: сбросить счётчик + сообщить, если был алерт
+        await _on_check_ok(conn, company_id, c.name if c.name != NA else row["name"], way)
 
         # снимок метрик для графиков динамики (по загруженному окну отзывов)
         if c.rating is not None:
@@ -403,6 +465,62 @@ if __name__ == "__main__":
     checks.append(("extract: чистка текста", rv["text"] == "Очень плохо"))
     rv2 = extract_review({"rating": 5, "date_created": "2026-01-01", "text": "ок"})
     checks.append(("extract: без id не падает", rv2["review_id"] != "" and rv2["answered"] is False))
+
+    # --- каскад способов ---
+    checks.append(("каскад: auto = http, потом браузер",
+                   FETCH_MODES["auto"] == ("http", "browser")))
+    checks.append(("каскад: у каждого способа есть класс",
+                   all(w in _FETCHERS for ws in FETCH_MODES.values() for w in ws)))
+    checks.append(("каскад: неизвестный режим -> auto",
+                   (FETCH_MODES.get("чепуха") or FETCH_MODES["auto"]) == ("http", "browser")))
+
+    # --- антиспам алертов ---
+    class _FakeConn:
+        pass
+
+    sent = []
+
+    async def _fake_notify(conn, text, company_id=None, reply_markup=None):
+        sent.append(text)
+        return []
+
+    _real_notify, _real_bump, _real_clear = notify_chats, db.bump_errors, db.clear_errors
+    _counters = {}
+    try:
+        globals()["notify_chats"] = _fake_notify
+        db.bump_errors = lambda conn, cid: _counters.__setitem__(
+            cid, _counters.get(cid, 0) + 1) or _counters[cid]
+        db.clear_errors = lambda conn, cid: _counters.pop(cid, None)
+
+        _alerted.clear()
+        conn = _FakeConn()
+        for _ in range(2):
+            asyncio.run(_on_check_failed(conn, 1, "Клиника", "таймаут"))
+        checks.append(("алерты: до порога молчим", sent == []))
+        asyncio.run(_on_check_failed(conn, 1, "Клиника", "таймаут"))
+        checks.append(("алерты: на 3-й ошибке одно сообщение", len(sent) == 1))
+        for _ in range(5):
+            asyncio.run(_on_check_failed(conn, 1, "Клиника", "таймаут"))
+        checks.append(("алерты: повторы молчат", len(sent) == 1))
+
+        asyncio.run(_on_check_ok(conn, 1, "Клиника", "http"))
+        checks.append(("алерты: восстановление сообщается",
+                       len(sent) == 2 and "Снова читается" in sent[1]))
+        asyncio.run(_on_check_ok(conn, 1, "Клиника", "http"))
+        checks.append(("алерты: без поломки — молчим о восстановлении", len(sent) == 2))
+
+        sent.clear()
+        _alerted.clear()
+        _counters.clear()
+        for cid, nm in ((1, "A"), (2, "B")):
+            for _ in range(3):
+                asyncio.run(_on_check_failed(conn, cid, nm, "таймаут"))
+        checks.append(("алерты: у второй компании — пометка об общем сбое",
+                       len(sent) == 2 and "общий сбой" in sent[1]))
+    finally:
+        globals()["notify_chats"] = _real_notify
+        db.bump_errors, db.clear_errors = _real_bump, _real_clear
+        _alerted.clear()
 
     _check_times.clear()
     from datetime import datetime, timedelta, timezone

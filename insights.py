@@ -397,17 +397,32 @@ def _note(progress, msg):
 
 
 async def _deep_fetch(domain: str, city_slug: str, firm_id: str, deep_limit: int):
-    """Карточка + до deep_limit отзывов. Возвращает (Company, list[dict])."""
+    """Карточка + до deep_limit отзывов. Возвращает (Company, list[dict]).
+
+    Идёт по тому же каскаду способов, что и мониторинг (HTTP -> браузер):
+    для 300 отзывов это 6 запросов к API — браузер тут особенно избыточен.
+    """
     import monitor  # импорт здесь — против циклов на уровне модулей
-    from scraper import Scraper
+    conn = db.connect()
+    try:
+        mode = db.get_setting(conn, "fetch_mode", "auto")
+    finally:
+        conn.close()
+    ways = monitor.FETCH_MODES.get(mode) or monitor.FETCH_MODES["auto"]
+    cfg = monitor.MonitorCfg(city_slug=city_slug, domain=domain)
+    errors = []
     async with monitor.SCRAPE_LOCK:
-        cfg = monitor.MonitorCfg(city_slug=city_slug, domain=domain)
-        async with Scraper(cfg) as s:
-            c = await s.parse_firm(firm_id)  # обновляет ключ reviews-API
-            raw = await s.fetch_reviews_deep(firm_id, deep_limit)
-    if not raw:
-        raise InsightsError("не удалось собрать отзывы (блок/пустая карточка)")
-    return c, [monitor.extract_review(r) for r in raw]
+        for way in ways:
+            try:
+                async with monitor._FETCHERS[way](cfg) as s:
+                    c = await s.parse_firm(firm_id)  # обновляет ключ reviews-API
+                    raw = await s.fetch_reviews_deep(firm_id, deep_limit)
+                if raw:
+                    return c, [monitor.extract_review(r) for r in raw]
+                errors.append(f"{way}: отзывов не собрано")
+            except Exception as e:
+                errors.append(f"{way}: {e}")
+    raise InsightsError("не удалось собрать отзывы (" + "; ".join(errors) + ")")
 
 
 async def _analyze(reviews: list, name: str, category: str, api_key: str,
