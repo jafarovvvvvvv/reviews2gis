@@ -12,8 +12,12 @@ from typing import Optional
 
 import httpx
 
+import metrics
+
 API = "https://api.telegram.org/bot{token}/{method}"
-NEGATIVE_MAX = 3  # оценка <=3 — негатив (как NEGATIVE_RATING_MAX в scraper)
+# Порог негатива один на весь проект — metrics.NEGATIVE_MAX. Раньше он был
+# продублирован здесь и в fetcher/insights, и определения разъезжались.
+NEGATIVE_MAX = metrics.NEGATIVE_MAX
 
 # шаблон черновика ответа на негатив (подставляется в уведомление)
 NEGATIVE_DRAFT = (
@@ -101,7 +105,8 @@ def stars(rating: Optional[int]) -> str:
 
 
 def is_negative(rating: Optional[int]) -> bool:
-    return rating is not None and rating <= NEGATIVE_MAX
+    """Негатив — по общему определению (metrics.is_negative)."""
+    return metrics.is_negative(rating)
 
 
 def fmt_review_alert(company_name: str, company_url: str, rv: dict,

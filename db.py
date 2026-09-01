@@ -95,6 +95,33 @@ CREATE TABLE IF NOT EXISTS rating_history(
   reviews_count INTEGER,
   answered_pct  INTEGER);
 
+CREATE TABLE IF NOT EXISTS lead_snapshots(
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  firm_id             TEXT NOT NULL,
+  city_slug           TEXT NOT NULL DEFAULT '',
+  category            TEXT NOT NULL DEFAULT '',
+  name                TEXT NOT NULL DEFAULT '',
+  url                 TEXT NOT NULL DEFAULT '',
+  collected_at        TEXT NOT NULL,          -- когда данные сняты с 2ГИС
+  rating              REAL,                   -- рейтинг филиала от 2ГИС
+  rating_confirmed    INTEGER,
+  ratings_count       INTEGER,                -- всего оценок (база рейтинга)
+  reviews_count       INTEGER,                -- текстовых отзывов
+  branch_scope        TEXT NOT NULL DEFAULT '',
+  branches_count      INTEGER,
+  org_rating          REAL,
+  loaded_reviews      INTEGER,
+  unanswered_count    INTEGER,
+  unanswered_fresh    INTEGER,
+  negative_count      INTEGER,
+  negative_unanswered INTEGER,
+  fresh_count         INTEGER,
+  priority            TEXT NOT NULL DEFAULT '',
+  priority_reason     TEXT NOT NULL DEFAULT '',
+  data_json           TEXT NOT NULL DEFAULT '');
+
+CREATE INDEX IF NOT EXISTS idx_snap_firm ON lead_snapshots(firm_id, collected_at);
+
 CREATE TABLE IF NOT EXISTS auto_runs(
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   kind       TEXT NOT NULL,        -- 'digest' (еженедельно) | 'report' (ежемесячно)
@@ -119,6 +146,10 @@ def _migrate(conn):
     if "consecutive_errors" not in cols:
         conn.execute("ALTER TABLE companies ADD COLUMN "
                      "consecutive_errors INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    snap_cols = {r["name"] for r in conn.execute("PRAGMA table_info(lead_snapshots)")}
+    if snap_cols and "unanswered_fresh" not in snap_cols:
+        conn.execute("ALTER TABLE lead_snapshots ADD COLUMN unanswered_fresh INTEGER")
         conn.commit()
     if "cabinet_nonce" not in cols:
         # nonce — для отзыва ссылки кабинета; enabled — включён ли кабинет
@@ -386,6 +417,72 @@ def mark_auto(conn, company_id: int, kind: str):
 
 # ---------- telegram chats ----------
 
+# ---------- снимки лидов (история прогонов лидогенерации) ----------
+# Снимок = числа компании на момент сбора. По ним разбор показывает динамику
+# («было -> стало») и решает, не устарели ли данные.
+
+SNAPSHOT_FIELDS = ("rating", "rating_confirmed", "ratings_count", "reviews_count",
+                   "branch_scope", "branches_count", "org_rating", "loaded_reviews",
+                   "unanswered_count", "unanswered_fresh", "negative_count",
+                   "negative_unanswered", "fresh_count", "priority", "priority_reason")
+
+
+def add_lead_snapshot(conn, c, city_slug: str = "", category: str = "") -> int:
+    """Сохранить снимок компании. Возвращает id снимка."""
+    import json
+    vals = {f: getattr(c, f, None) for f in SNAPSHOT_FIELDS}
+    vals["rating_confirmed"] = (None if vals["rating_confirmed"] is None
+                                else int(vals["rating_confirmed"]))
+    vals["branch_scope"] = vals["branch_scope"] or ""
+    vals["priority"] = vals["priority"] or ""
+    vals["priority_reason"] = vals["priority_reason"] or ""
+    cols = ("firm_id,city_slug,category,name,url,collected_at," + ",".join(SNAPSHOT_FIELDS)
+            + ",data_json")
+    holders = ",".join("?" * (6 + len(SNAPSHOT_FIELDS) + 1))
+    payload = json.dumps({"negative_quotes": getattr(c, "negative_quotes", []),
+                          "last_review_date": getattr(c, "last_review_date", None),
+                          "has_fresh_reviews": getattr(c, "has_fresh_reviews", None),
+                          "owner_responds": getattr(c, "owner_responds", None),
+                          "negative_without_response":
+                              getattr(c, "negative_without_response", None)},
+                         ensure_ascii=False)
+    cur = conn.execute(
+        f"INSERT INTO lead_snapshots({cols}) VALUES({holders})",
+        (getattr(c, "firm_id", ""), city_slug, category, getattr(c, "name", ""),
+         getattr(c, "url", ""), getattr(c, "collected_at", None) or now_iso(),
+         *[vals[f] for f in SNAPSHOT_FIELDS], payload))
+    conn.commit()
+    return cur.lastrowid
+
+
+def last_lead_snapshot(conn, firm_id: str):
+    """Последний снимок компании (или None)."""
+    return conn.execute(
+        "SELECT * FROM lead_snapshots WHERE firm_id=? "
+        "ORDER BY collected_at DESC, id DESC LIMIT 1", (firm_id,)).fetchone()
+
+
+def prev_lead_snapshot(conn, firm_id: str, before_id: int):
+    """Снимок, предшествующий указанному (для блока динамики)."""
+    return conn.execute(
+        "SELECT * FROM lead_snapshots WHERE firm_id=? AND id<? "
+        "ORDER BY collected_at DESC, id DESC LIMIT 1", (firm_id, before_id)).fetchone()
+
+
+def latest_snapshots_in(conn, city_slug: str, category: str):
+    """По одному (последнему) снимку на компанию в городе+категории.
+
+    Нужен для детерминированного выбора конкурента: сравниваем свежайшие
+    известные числа, а не что попало из разных прогонов.
+    """
+    return conn.execute(
+        "SELECT s.* FROM lead_snapshots s "
+        "JOIN (SELECT firm_id, MAX(id) AS mid FROM lead_snapshots "
+        "      WHERE city_slug=? AND category=? GROUP BY firm_id) t "
+        "  ON s.id = t.mid "
+        "ORDER BY s.firm_id", (city_slug, category)).fetchall()
+
+
 def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
     """Зарегистрировать чат. Возвращает True, если чат новый.
 
@@ -557,6 +654,52 @@ if __name__ == "__main__":
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))
+
+        # --- снимки лидов ---
+        from lead_scoring import Company
+        snap_c = Company(firm_id="777", name="Тест-клиника", rating=5.0,
+                         ratings_count=1174, reviews_count=778, branches_count=2,
+                         unanswered_count=10, negative_unanswered=9, negative_count=9,
+                         fresh_count=4, has_fresh_reviews=True, owner_responds=True,
+                         collected_at="2026-09-01T07:00:00+00:00")
+        snap_c.compute_priority()
+        sid1 = add_lead_snapshot(conn, snap_c, "kostanay", "стоматология")
+        checks.append(("снимок: сохранён", sid1 > 0))
+        last = last_lead_snapshot(conn, "777")
+        checks.append(("снимок: читается последний",
+                       last["rating"] == 5.0 and last["ratings_count"] == 1174
+                       and last["reviews_count"] == 778))
+        checks.append(("снимок: оценки и отзывы не перепутаны",
+                       last["ratings_count"] != last["reviews_count"]))
+        checks.append(("снимок: дата сбора сохранена",
+                       last["collected_at"] == "2026-09-01T07:00:00+00:00"))
+        checks.append(("снимок: причина приоритета сохранена",
+                       bool(last["priority_reason"])))
+        checks.append(("снимок: предыдущего пока нет",
+                       prev_lead_snapshot(conn, "777", sid1) is None))
+
+        snap_c.rating = 4.9
+        snap_c.unanswered_count = 12
+        snap_c.collected_at = "2026-09-02T07:00:00+00:00"
+        sid2 = add_lead_snapshot(conn, snap_c, "kostanay", "стоматология")
+        checks.append(("снимок: последний — самый свежий",
+                       last_lead_snapshot(conn, "777")["id"] == sid2))
+        prev = prev_lead_snapshot(conn, "777", sid2)
+        checks.append(("снимок: предыдущий найден для динамики",
+                       prev["id"] == sid1 and prev["rating"] == 5.0))
+
+        other = Company(firm_id="888", name="Конкурент", rating=4.95,
+                        reviews_count=200, collected_at="2026-09-01T07:00:00+00:00")
+        other.compute_priority()
+        add_lead_snapshot(conn, other, "kostanay", "стоматология")
+        add_lead_snapshot(conn, Company(firm_id="999", name="Другой город", rating=5.0,
+                                        collected_at="2026-09-01T07:00:00+00:00"),
+                          "almaty", "стоматология")
+        pool = latest_snapshots_in(conn, "kostanay", "стоматология")
+        checks.append(("снимки: по одному на компанию в городе+категории",
+                       {r["firm_id"] for r in pool} == {"777", "888"}))
+        checks.append(("снимки: берётся свежий снимок компании",
+                       [r["rating"] for r in pool if r["firm_id"] == "777"] == [4.9]))
         conn.close()
 
         # миграция старой схемы chats (без is_admin)

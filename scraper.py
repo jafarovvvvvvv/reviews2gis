@@ -25,12 +25,13 @@ import asyncio
 import random
 import re
 import urllib.parse
+from datetime import datetime, timezone
 
 from playwright.async_api import async_playwright
 
 from lead_scoring import Company, NA
-from fetcher import (BlockedError, api_base, apply_reviews, parse_card_html,
-                     remember_key, review_key)
+from fetcher import (BlockedError, api_base, apply_card_fields, apply_reviews,
+                     parse_card_html, remember_key, review_key)
 
 # BlockedError импортируется из fetcher (общий тип для обоих способов) —
 # main.py и monitor.py ловят его по-прежнему из scraper.
@@ -227,6 +228,7 @@ class Scraper:
 
         await self._extract_card_fields(c, firm_id)
         await self._extract_reviews(c, firm_id)
+        c.collected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         c.compute_priority()
         return c
 
@@ -241,19 +243,10 @@ class Scraper:
 
         f = parse_card_html(html)
         remember_key(f["key"], f["api_base"])  # ДИНАМИЧЕСКИЙ ключ из конфига страницы
-        if f["name"]:
-            c.name = f["name"]
-        if f["category"]:
-            c.category = f["category"]
-        if f["rating"] is not None:
-            c.rating = f["rating"]
-        if f["reviews_count"] is not None:
-            c.reviews_count = f["reviews_count"]
-        c.website = f["website"] or NA
+        apply_card_fields(c, f)  # тот же разбор полей, что и у HTTP-способа
 
         # телефон: обычно уже есть в HTML; если нет — жмём «Показать телефон»
         # (единственное, что умеет браузер и не умеет простой запрос)
-        c.phone = f["phone"] or NA
         if c.phone == NA:
             try:
                 c.phone = await self._extract_phone()

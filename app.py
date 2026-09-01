@@ -30,13 +30,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
+                               RedirectResponse)
 
 import ai_reply
 import bot
 import db
 import insights
+import leadgen
+import metrics
 import monitor
+import outreach
 import tg
 
 load_dotenv()
@@ -275,6 +279,18 @@ form.inline{display:inline}
 .sysbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
 ol.help li{margin:6px 0}
 .links a{margin-right:10px;white-space:nowrap}
+.leadform{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.leadform .f{flex:1 1 200px}.leadform .f.narrow{flex:0 0 130px}
+.leadform label{display:block;font-family:'JetBrains Mono',Consolas,monospace;
+   font-size:.68em;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);
+   font-weight:600;margin-bottom:4px}
+.bar{height:9px;border-radius:99px;background:var(--line);overflow:hidden;margin:9px 0 6px}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--green);
+   transition:width .4s}
+.runline{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.runline .grow{flex:1 1 220px;min-width:180px}
+details.msg{max-width:460px}
+details.msg pre{margin:8px 0 0;font-size:.9em}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media (max-width:640px){header{padding:12px 16px}header nav{margin-left:auto}
   .tagline{display:none}main{margin-top:14px}.addform{flex-direction:column}}
@@ -419,7 +435,8 @@ def page(title: str, body: str, request: Request, refresh: bool = False) -> HTML
 <title>{e(title)} — {e(BRAND)}</title><style>{CSS}</style></head><body>
 <header><a class="brand" href="/">{brand}</a>
 <span class="tagline">{e(TAGLINE)}</span>{demo_chip}
-<nav><a href="/">Карточки</a><a href="/health">Состояние</a>
+<nav><a href="/">Карточки</a><a href="/leads">Поиск лидов</a>
+<a href="/health">Состояние</a>
 <a href="/settings">Настройки</a>{logout_link}</nav></header>
 <main>{flash}{body}</main></body></html>""")
 
@@ -1050,6 +1067,307 @@ async def audit_by_link(request: Request):
                              "админ-чаты Telegram, копия ляжет в output/.")
 
 
+# ---------- поиск лидов (лидогенерация) ----------
+
+def _lead_defaults(conn) -> tuple:
+    """Последние введённые город/категория/количество (или из .env)."""
+    return (db.get_setting(conn, "lead_city") or os.getenv("CITY") or "Алматы",
+            db.get_setting(conn, "lead_category") or os.getenv("CATEGORY") or "стоматология",
+            db.get_setting(conn, "lead_count") or str(leadgen.DEF_COUNT))
+
+
+def _lead_cfg(conn, city: str, category: str, count) -> leadgen.LeadCfg:
+    """Конфиг прогона: город/категория из формы, подпись — из настроек панели."""
+    return leadgen.LeadCfg(
+        city=city, category=category, count=count,
+        sender_name=db.get_setting(conn, "sender_name") or os.getenv("SENDER_NAME") or "",
+        sender_contact=(db.get_setting(conn, "sender_contact")
+                        or os.getenv("SENDER_CONTACT") or ""))
+
+
+def _run_status(run) -> str:
+    """Статус прогона: чип + при работе — полоса прогресса."""
+    chip = {leadgen.ST_RUNNING: '<span class="chip busy">идёт…</span>',
+            leadgen.ST_DONE: '<span class="chip ok">готово</span>',
+            leadgen.ST_ERROR: '<span class="chip err">ошибка</span>'}[run.status]
+    bar = (f'<div class="bar"><i style="width:{run.percent}%"></i></div>'
+           if run.busy else "")
+    return chip + bar
+
+
+def _pack_url(pack: str, filename: str = "index.html") -> str:
+    return (f"/leads/pack/{urllib.parse.quote(pack)}/"
+            f"{urllib.parse.quote(filename)}")
+
+
+@app.get("/leads", response_class=HTMLResponse)
+async def leads_page(request: Request):
+    e = html.escape
+    conn = db.connect()
+    try:
+        city, category, count = _lead_defaults(conn)
+        sender = db.get_setting(conn, "sender_name") or os.getenv("SENDER_NAME") or ""
+        mode = db.get_setting(conn, "fetch_mode", "auto")
+    finally:
+        conn.close()
+
+    runs = leadgen.list_runs()
+    run_cards = "".join(f"""<div class="runline" style="margin-bottom:12px">
+ <div class="grow"><a href="/leads/{r.id}"><b>{e(r.title)}</b></a>
+  <div class="meta">{e(r.stage)} · запущен {fmt_dt(r.started_at)}</div>
+  {_run_status(r)}</div>
+ <div class="mono meta">{len(r.rows) or r.cfg.count} шт.</div>
+</div>""" for r in runs)
+    runs_card = (f'<div class="card"><h2>Прогоны</h2>{run_cards}'
+                 f'<p class="muted">Журнал прогонов живёт до перезапуска панели; '
+                 f'сами пакеты остаются на диске (ниже).</p></div>' if runs else "")
+
+    packs = leadgen.list_packs()
+    pack_rows = "".join(
+        f'<tr><td class="mono">{fmt_dt(p["ts"])}</td><td>{e(p["name"])}</td>'
+        f'<td class="mono">{p["leads"]}</td>'
+        f'<td class="links"><a href="{_pack_url(p["name"])}" target="_blank">открыть</a>'
+        f'<a href="{_pack_url(p["name"], "outreach.csv")}">CSV</a></td></tr>'
+        for p in packs)
+    packs_card = (f'<div class="card"><h2>Пакеты для рассылки</h2>'
+                  f'<table><tr><th>Собран</th><th>Пакет</th><th>Лидов</th><th></th></tr>'
+                  f'{pack_rows}</table></div>' if packs else "")
+
+    sender_warn = ("" if sender else
+                   '<div class="flash err" style="font-weight:400">В сообщениях будет '
+                   'заглушка <b>[Имя]</b> — впишите своё имя в '
+                   '<a href="/settings">настройках</a>, чтобы открывашки были готовы '
+                   'к отправке.</div>')
+    busy_note = ('<p class="muted">Прогон уже идёт — новый запустится только после '
+                 'него.</p>' if leadgen.any_busy() else "")
+
+    body = f"""
+<h1>Поиск лидов</h1>
+<div class="sysbar"><span class="badge b-ok">способ чтения: {e(mode)}</span>
+ <span class="muted">компании берутся из поиска 2ГИС по городу и категории,
+ приоритет считается по отзывам</span></div>
+{sender_warn}
+<div class="card">
+ <form class="leadform" method="post" action="/leads/run">
+  <div class="f"><label for="lead-city">Город</label>
+   <input id="lead-city" type="text" name="city" required value="{e(city)}"></div>
+  <div class="f"><label for="lead-cat">Категория</label>
+   <input id="lead-cat" type="text" name="category" required value="{e(category)}"
+          placeholder="стоматология, автосервис, барбершоп…"></div>
+  <div class="f narrow"><label for="lead-count">Сколько</label>
+   <input id="lead-count" type="number" name="count" min="1"
+          max="{leadgen.MAX_COUNT}" value="{e(count)}"></div>
+  <div><button class="primary">Найти лидов</button></div>
+ </form>
+ <p class="muted" style="margin-bottom:0">Прогон идёт в фоне (~1,5 сек на компанию):
+ читаем карточки, считаем приоритет и собираем пакет для рассылки — сообщения
+ с реальными цифрами, ссылки WhatsApp, аудиты. {busy_note}</p>
+</div>
+{runs_card}{packs_card}"""
+    return page("Поиск лидов", body, request, refresh=leadgen.any_busy())
+
+
+@app.post("/leads/run")
+async def leads_run(request: Request):
+    form = await request.form()
+    city = str(form.get("city", "")).strip()
+    category = str(form.get("category", "")).strip()
+    count = leadgen.clean_count(form.get("count"))
+    if not city or not category:
+        return redirect("/leads", err="Заполните город и категорию")
+    if leadgen.any_busy():
+        return redirect("/leads", err="Прогон уже идёт — дождитесь окончания: "
+                                      "параллельные запросы к 2ГИС повышают риск блокировки")
+    conn = db.connect()
+    try:
+        db.set_setting(conn, "lead_city", city)
+        db.set_setting(conn, "lead_category", category)
+        db.set_setting(conn, "lead_count", str(count))
+        mode = db.get_setting(conn, "fetch_mode", "auto")
+        cfg = _lead_cfg(conn, city, category, count)
+    finally:
+        conn.close()
+    run = leadgen.new_run(cfg)
+    # SCRAPE_LOCK общий с мониторингом: пока идёт прогон, плановые проверки ждут
+    spawn(leadgen.run_task(run, mode, lock=monitor.SCRAPE_LOCK))
+    minutes = max(1, round(cfg.count * 1.5 / 60))
+    return redirect(f"/leads/{run.id}",
+                    msg=f"Ищу лидов: {cfg.category}, {cfg.city} — {cfg.count} шт. "
+                        f"(≈{minutes} мин). Страница обновляется сама.")
+
+
+@app.get("/leads/pack/{pack}/{filename}")
+async def leads_pack_file(pack: str, filename: str):
+    """Отдать файл готового пакета рассылки из output/ (дашборд, аудит, CSV)."""
+    path = leadgen.pack_file(pack, filename)
+    if path is None:
+        return PlainTextResponse("Файл пакета не найден", status_code=404)
+    if path.suffix == ".csv":
+        return FileResponse(path, media_type="text/csv", filename=path.name)
+    return HTMLResponse(path.read_text(encoding="utf-8"))
+
+
+@app.get("/leads/{rid}", response_class=HTMLResponse)
+async def lead_run_page(rid: str, request: Request):
+    # rid строкой: битый адрес должен приводить к понятной странице, а не к 422
+    e = html.escape
+    run = leadgen.get_run(rid)
+    if run is None:
+        return redirect("/leads", err="Прогон не найден (журнал очищается при "
+                                      "перезапуске панели) — пакеты ищите в списке ниже")
+    conn = db.connect()
+    try:
+        monitored = {c["firm_id"]: c["id"] for c in db.list_companies(conn)}
+    finally:
+        conn.close()
+
+    trs = []
+    for i, row in enumerate(run.rows):
+        c = row["c"]
+        links = [f'<a href="{e(c.url)}" target="_blank">2ГИС</a>']
+        # «разбор» — живой: проверит свежесть данных, при необходимости
+        # перечитает карточку и добавит динамику к прошлому замеру.
+        # «файл» — тот же разбор из пакета на диске (для оффлайн-рассылки).
+        links.append(f'<a href="/leads/{run.id}/audit/{e(c.firm_id)}" '
+                     f'target="_blank">разбор</a>')
+        if run.pack:
+            links.append(f'<a href="{_pack_url(run.pack, row["audit_file"])}" '
+                         f'target="_blank">файл</a>')
+        if row["wa"]:
+            links.append(f'<a href="{e(row["wa"])}" target="_blank">WhatsApp ➤</a>')
+        ig = outreach.instagram_link(c.website)
+        if ig:
+            links.append(f'<a href="{e(ig)}" target="_blank">Instagram</a>')
+        if c.firm_id in monitored:
+            action = (f'<a href="/company/{monitored[c.firm_id]}">'
+                      f'<span class="chip ok">в мониторинге</span></a>')
+        else:
+            action = (f'<form method="post" action="/leads/{run.id}/monitor">'
+                      f'<input type="hidden" name="firm_id" value="{e(c.firm_id)}">'
+                      f'<button class="small">В мониторинг</button></form>')
+        # ВСЕ числа — из общего слоя (metrics), никакого счёта на месте:
+        # иначе таблица снова разойдётся с разбором по той же компании
+        n = metrics.company_numbers(c)
+        branches = n["branches_count"]
+        scope_hint = (f' · {branches} '
+                      f'{outreach.plural(branches, "филиал", "филиала", "филиалов")}'
+                      if branches and branches > 1 else "")
+        trs.append(f"""<tr>
+ <td>{e(c.priority)}<div class="meta">{e(c.priority_reason)}</div></td>
+ <td><b>{e(c.name)}</b><div class="meta">{e(c.phone)}</div></td>
+ <td class="mono">{e(metrics.fmt_rating(n["rating"]))}
+  <div class="meta">{e(metrics.fmt_int(n["ratings_count"]))} оценок ·
+   {e(metrics.fmt_int(n["reviews_count"]))} отзывов{e(scope_hint)}</div></td>
+ <td class="mono">{e(metrics.fmt_int(n["unanswered_count"]))}
+  <div class="meta">негатива: {e(metrics.fmt_int(n["negative_unanswered"]))} ·
+   {e(metrics.WINDOW_LABEL)}</div></td>
+ <td class="links">{' '.join(links)}</td>
+ <td><details class="msg"><summary>сообщение</summary>
+  <pre id="m{i}">{e(row["message"])}</pre>
+  <button class="small" onclick="copyMsg('m{i}',this)">Копировать</button></details></td>
+ <td>{action}</td>
+</tr>""")
+
+    counts = run.counts()
+    summary = "".join(f'<div><b>{n}</b><span>{e(p)}</span></div>'
+                      for p, n in counts.items())
+    table = (f'<table><tr><th>Приоритет и причина</th><th>Компания</th>'
+             f'<th>Рейтинг 2ГИС</th><th>Без ответа</th>'
+             f'<th>Ссылки</th><th>Открывашка</th><th>Мониторинг</th></tr>'
+             f'{"".join(trs)}</table>' if trs else "")
+    err_note = (f'<div class="flash err">{e(run.error)}</div>' if run.error else "")
+    pack_links = (f'<div class="links" style="margin-top:12px">'
+                  f'<a href="{_pack_url(run.pack)}" target="_blank">пакет для рассылки '
+                  f'(дашборд)</a>'
+                  f'<a href="{_pack_url(run.pack, "outreach.csv")}">outreach.csv</a>'
+                  f'<span class="meta">папка output/{e(run.pack)}</span></div>'
+                  if run.pack else "")
+
+    collected = ""
+    if run.rows:
+        stamps = [r["c"].collected_at for r in run.rows if r["c"].collected_at]
+        if stamps:
+            collected = (f' · данные собраны '
+                         f'{e(outreach.fmt_collected(max(stamps)))}')
+    body = f"""
+<h1>{e(run.title)}</h1>
+<div class="sysbar">{_run_status(run)}
+ <span class="muted">{e(run.stage)}{f' · способ: {e(run.way)}' if run.way else ''}
+ {collected}</span></div>
+{err_note}
+<div class="card">
+ <div class="kv">{summary or '<div><b>—</b><span>лидов пока нет</span></div>'}</div>
+ {pack_links}
+</div>
+{f'<div class="card">{table}</div>' if table else ''}
+<p><a href="/leads">← к поиску лидов</a></p>
+<script>
+function copyMsg(id, btn){{
+  const text = document.getElementById(id).innerText;
+  const done = () => {{ btn.textContent = 'Скопировано ✓';
+                        setTimeout(() => btn.textContent = 'Копировать', 1500); }};
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(text).then(done);
+  else {{ const ta = document.createElement('textarea');
+         ta.value = text; document.body.appendChild(ta);
+         ta.select(); document.execCommand('copy'); ta.remove(); done(); }}
+}}
+</script>"""
+    return page(run.title, body, request, refresh=run.busy)
+
+
+@app.get("/leads/{rid}/audit/{firm_id}", response_class=HTMLResponse)
+async def lead_audit(rid: str, firm_id: str):
+    """Живой разбор лида: гарантированно свежие данные + динамика.
+
+    Данные старше AUDIT_MAX_AGE_HOURS перечитываются с 2ГИС; если это не
+    удалось — отдаём понятную ошибку, а не разбор со старыми числами.
+    """
+    e = html.escape
+    run = leadgen.get_run(rid)
+    if run is None:
+        return redirect("/leads", err="Прогон не найден")
+    if not any(r["c"].firm_id == firm_id for r in run.rows):
+        return redirect(f"/leads/{run.id}", err="Лид не найден в этом прогоне")
+    conn = db.connect()
+    try:
+        mode = db.get_setting(conn, "fetch_mode", "auto")
+    finally:
+        conn.close()
+    try:
+        html_out, _, _ = await leadgen.build_audit(firm_id, run.cfg, mode)
+    except leadgen.StaleDataError as ex:
+        return HTMLResponse(
+            f"<h1>Разбор не построен</h1><p>{e(str(ex))}</p>"
+            f"<p><a href='/leads/{run.id}'>← к результатам прогона</a></p>",
+            status_code=503)
+    return HTMLResponse(html_out)
+
+
+@app.post("/leads/{rid}/monitor")
+async def lead_to_monitor(rid: str, request: Request):
+    """Понравившийся лид -> под мониторинг (одна кнопка в таблице результатов)."""
+    form = await request.form()
+    firm_id = str(form.get("firm_id", "")).strip()
+    run = leadgen.get_run(rid)
+    if run is None:
+        return redirect("/leads", err="Прогон не найден")
+    lead = next((r["c"] for r in run.rows if r["c"].firm_id == firm_id), None)
+    if lead is None:
+        return redirect(f"/leads/{run.id}", err="Лид не найден в этом прогоне")
+    conn = db.connect()
+    try:
+        if db.find_company_by_firm(conn, firm_id):
+            return redirect(f"/leads/{run.id}", err=f"«{lead.name}» уже под наблюдением")
+        cid = db.add_company(conn, firm_id, run.cfg.domain, run.cfg.city_slug, lead.url)
+    finally:
+        conn.close()
+    spawn(monitor.check_company(cid, baseline=True))
+    return redirect(f"/leads/{run.id}",
+                    msg=f"«{lead.name}» добавлена: загружаем карточку и запоминаем "
+                        f"текущие отзывы. Уведомления пойдут о новых.")
+
+
 @app.post("/companies/{cid}/cabinet")
 async def companies_cabinet(cid: int, request: Request):
     form = await request.form()
@@ -1176,6 +1494,9 @@ async def settings_page(request: Request):
         auto_report = db.get_setting(conn, "auto_report", "0") == "1"
         chats = db.list_chats(conn)
         ai_key, ai_model = ai_reply.get_ai_settings(conn)
+        sender_name = db.get_setting(conn, "sender_name") or os.getenv("SENDER_NAME") or ""
+        sender_contact = (db.get_setting(conn, "sender_contact")
+                          or os.getenv("SENDER_CONTACT") or "")
     finally:
         conn.close()
     ai_status = (f'<span class="badge b-ok">подключены · {e(ai_model)}</span>'
@@ -1234,6 +1555,13 @@ async def settings_page(request: Request):
    слать клиентам <b>еженедельный дайджест</b> (рейтинг, новые отзывы, негатив)</label></p>
   <p><label><input type="checkbox" name="auto_report" {'checked' if auto_report else ''}>
    строить <b>ежемесячный отчёт болей</b> автоматически и слать получателям</label></p>
+  <p><b>Подпись в письмах лидам</b><br>
+   <span class="muted">Имя подставляется в сообщение-открывашку, контакт — в
+   подпись аудита («Поиск лидов»). Пусто — в тексте останется [Имя].</span><br>
+   <input type="text" name="sender_name" value="{e(sender_name)}"
+          placeholder="Ваше имя" style="margin-bottom:6px">
+   <input type="text" name="sender_contact" value="{e(sender_contact)}"
+          placeholder="Телефон или Instagram для подписи аудита"></p>
   <p><b>AI-ответы на отзывы</b> {ai_status}<br>
    <span class="muted">Ключ OpenAI API; модель менять только осознанно.</span><br>
    <input type="text" name="openai_key" value="" placeholder="{ai_key_hint}"
@@ -1294,6 +1622,8 @@ async def settings_save(request: Request):
 
     openai_key = str(form.get("openai_key", "")).strip()
     openai_model = str(form.get("openai_model", "")).strip() or ai_reply.DEFAULT_MODEL
+    sender_name = str(form.get("sender_name", "")).strip()
+    sender_contact = str(form.get("sender_contact", "")).strip()
 
     conn = db.connect()
     try:
@@ -1306,6 +1636,9 @@ async def settings_save(request: Request):
         db.set_setting(conn, "fetch_mode", fetch_mode)
         db.set_setting(conn, "auto_digest", auto_digest)
         db.set_setting(conn, "auto_report", auto_report)
+        # пустое поле здесь — осознанная очистка подписи, поэтому пишем как есть
+        db.set_setting(conn, "sender_name", sender_name)
+        db.set_setting(conn, "sender_contact", sender_contact)
         if openai_key:  # пустое поле = оставить прежний ключ
             db.set_setting(conn, "openai_api_key", openai_key)
         db.set_setting(conn, "openai_model", openai_model)

@@ -50,6 +50,7 @@ class Config:
     output_dir: str
     sender_name: str = ""     # имя в сообщении-открывашке (SENDER_NAME)
     sender_contact: str = ""  # телефон/Instagram для подписи аудита (SENDER_CONTACT)
+    mode: str = "auto"        # способ чтения: auto | http | browser (см. fetcher.FETCH_MODES)
 
     @property
     def domain(self) -> str:
@@ -74,6 +75,9 @@ def load_config() -> Config:
                    help="Ваш контакт (телефон/Instagram) — подпись в аудите")
     p.add_argument("--firm", default=None,
                    help="Режим одной карточки: ID филиала 2GIS (для отладки)")
+    p.add_argument("--mode", default=os.getenv("FETCH_MODE") or "auto",
+                   choices=("auto", "http", "browser"),
+                   help="Способ чтения: auto (HTTP, браузер в резерве), http, browser")
     args = p.parse_args()
 
     env_headless = os.getenv("HEADLESS", "true").lower() not in ("false", "0", "no")
@@ -88,6 +92,7 @@ def load_config() -> Config:
         output_dir=args.output_dir,
         sender_name=args.sender_name.strip(),
         sender_contact=args.sender_contact.strip(),
+        mode=args.mode,
     )
     # пробросим firm отдельно (не часть основного конфига)
     cfg.firm = args.firm  # type: ignore[attr-defined]
