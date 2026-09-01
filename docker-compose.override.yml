@@ -1,0 +1,17 @@
+# Домашний сервер (LAN): публикуем порт панели, Caddy не запускаем.
+services:
+  app:
+    ports:
+      - "8765:8765"
+    # Надёжный DNS в обход systemd-resolved (цепочка 127.0.0.11->127.0.0.53 флапала).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # У сервера нет IPv6-маршрута наружу; гасим IPv6 в контейнере,
+    # чтобы httpx всегда ходил по рабочему IPv4 (иначе "All connection attempts failed").
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+  # Caddy нужен только для прод-домена с TLS. На LAN не запускаем:
+  # профиль выключает его из обычного `docker compose up -d`.
+  caddy:
+    profiles: ["prod"]
