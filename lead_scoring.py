@@ -59,6 +59,7 @@ class Company:
     # --- счётчики по окну отзывов (metrics.WINDOW), считает metrics ---
     loaded_reviews: Optional[int] = None        # сколько отзывов в окне
     unanswered_count: Optional[int] = None      # из них без ответа
+    unanswered_fresh: Optional[int] = None      # без ответа среди свежих (30 дней)
     negative_count: Optional[int] = None        # из них негативных (<=3)
     negative_unanswered: Optional[int] = None   # негативных без ответа
     fresh_count: Optional[int] = None           # отзывов за 30 дней
@@ -66,7 +67,8 @@ class Company:
     owner_responds: Optional[bool] = None       # владелец отвечает на отзывы
     negative_without_response: Optional[bool] = None  # негатив без ответа в топ-5
     last_review_date: Optional[str] = None      # ISO-дата новейшего отзыва
-    worst_reviews: list = field(default_factory=list)  # [{rating,date,text,answered}]
+    # цитаты для разбора: негатив БЕЗ ОТВЕТА, свежие сверху [{rating,date,text}]
+    negative_quotes: list = field(default_factory=list)
 
     # когда собраны данные (ISO, UTC) — печатается в разборе как «данные собраны»
     collected_at: Optional[str] = None
@@ -109,7 +111,9 @@ class Company:
             "Владелец отвечает": self._fmt_bool(self.owner_responds),
             "Негатив без ответа (топ-5)": self._fmt_bool(self.negative_without_response),
             f"Отзывов без ответа (окно {metrics.WINDOW})": n(self.unanswered_count),
-            f"Негатива без ответа (окно {metrics.WINDOW})": n(self.negative_unanswered),
+            f"Из них негативных (окно {metrics.WINDOW})": n(self.negative_unanswered),
+            f"Из них за {metrics.FRESH_DAYS} дней (окно {metrics.WINDOW})":
+                n(self.unanswered_fresh),
             "Дата последнего отзыва": self.last_review_date or NA,
             "Данные собраны": self.collected_at or NA,
             "Телефон": self.phone or NA,
@@ -123,7 +127,8 @@ CSV_HEADERS = [
     "Оценок всего", "Отзывов (текстовых)", "Область данных", "Филиалов",
     "Свежие отзывы (мес)", "Владелец отвечает", "Негатив без ответа (топ-5)",
     f"Отзывов без ответа (окно {metrics.WINDOW})",
-    f"Негатива без ответа (окно {metrics.WINDOW})",
+    f"Из них негативных (окно {metrics.WINDOW})",
+    f"Из них за {metrics.FRESH_DAYS} дней (окно {metrics.WINDOW})",
     "Дата последнего отзыва", "Данные собраны",
     "Телефон", "Сайт/соцсети", "Ссылка 2GIS",
 ]

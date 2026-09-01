@@ -21,6 +21,7 @@
 
 Самотесты (без сети): python metrics.py
 """
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -30,8 +31,14 @@ from typing import Optional
 NEGATIVE_MAX = 3       # оценка <= 3 — негатив
 FRESH_DAYS = 30        # «свежий» отзыв — за последние 30 дней
 TOP_N = 5              # «топ-5» новейших — окно для флага «негатив без ответа»
-WINDOW = 50            # окно выборки для ВСЕХ счётчиков (одна страница API)
+
+# Окно выборки для ВСЕХ счётчиков. В конфиге (.env REVIEW_WINDOW), потому что
+# от него зависит смысл каждого числа в документе — и оно печатается рядом с
+# числом, чтобы «19 без ответа» нельзя было прочитать как «19 из всех отзывов».
+WINDOW = max(1, int(os.getenv("REVIEW_WINDOW") or 50))
 WINDOW_LABEL = f"последние {WINDOW} отзывов"
+
+MAX_QUOTES = 3         # сколько цитат негатива показывать в разборе
 
 NA = "н/д"
 
@@ -65,12 +72,16 @@ class ReviewStats:
     unanswered: int = 0             # из них без ответа
     negative: int = 0               # из них негативных (<=3)
     negative_unanswered: int = 0    # негативных без ответа
+    unanswered_fresh: int = 0       # без ответа среди свежих (за FRESH_DAYS)
     fresh: int = 0                  # за последние FRESH_DAYS
     has_fresh: Optional[bool] = None        # есть ли отзыв за FRESH_DAYS
     owner_responds: Optional[bool] = None   # есть ли хоть один ответ владельца
     negative_in_top: Optional[bool] = None  # негатив без ответа в топ-TOP_N
     last_date: Optional[str] = None         # ISO-дата новейшего отзыва
-    worst: list = field(default_factory=list)  # до 3 худших (для цитат)
+    # Цитаты для разбора: ТОЛЬКО негатив БЕЗ ОТВЕТА, свежие сверху. Отвеченным
+    # отзывам здесь не место: документ призывает «ответить на весь негатив»,
+    # и показывать рядом отзыв с ответом владельца — противоречие.
+    negative_quotes: list = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -97,25 +108,25 @@ def review_stats(reviews: list, now: datetime = None) -> ReviewStats:
                                  if is_negative(r.get("rating")) and is_unanswered(r))
     st.fresh = sum(1 for r in window
                    if (now - review_created(r)) <= timedelta(days=FRESH_DAYS))
+    st.unanswered_fresh = sum(
+        1 for r in window
+        if is_unanswered(r) and (now - review_created(r)) <= timedelta(days=FRESH_DAYS))
     st.has_fresh = (now - review_created(window[0])) <= timedelta(days=FRESH_DAYS)
     st.owner_responds = any(not is_unanswered(r) for r in window)
     st.negative_in_top = any(is_negative(r.get("rating")) and is_unanswered(r)
                              for r in window[:TOP_N])
     st.last_date = review_created(window[0]).date().isoformat()
 
-    # худшие отзывы для цитат: сначала низкая оценка, при равной — свежее
-    worst = sorted(window, key=lambda r: ((r.get("rating") or 5),
-                                          -review_created(r).timestamp()))
-    for r in worst:
-        if not is_negative(r.get("rating")):
-            break
+    # Цитаты: негатив БЕЗ ОТВЕТА, свежие сверху, не больше MAX_QUOTES.
+    # Отвеченные негативные отзывы отсеиваются здесь, а не в шаблоне.
+    unanswered_negative = [r for r in window
+                           if is_negative(r.get("rating")) and is_unanswered(r)]
+    unanswered_negative.sort(key=review_created, reverse=True)
+    for r in unanswered_negative[:MAX_QUOTES]:
         text = re.sub(r"\s+", " ", (r.get("text") or "")).strip()
-        st.worst.append({"rating": r.get("rating"),
-                         "date": review_created(r).date().isoformat(),
-                         "text": (text[:220] + "…") if len(text) > 220 else text,
-                         "answered": not is_unanswered(r)})
-        if len(st.worst) >= 3:
-            break
+        st.negative_quotes.append({"rating": r.get("rating"),
+                                   "date": review_created(r).date().isoformat(),
+                                   "text": (text[:220] + "…") if len(text) > 220 else text})
     return st
 
 
@@ -126,9 +137,10 @@ def review_stats(reviews: list, now: datetime = None) -> ReviewStats:
 NUMBER_FIELDS = ("rating", "rating_confirmed", "ratings_count", "reviews_count",
                  "branch_scope", "branches_count", "org_rating", "org_reviews_count",
                  "org_ratings_count", "loaded_reviews", "unanswered_count",
-                 "negative_count", "negative_unanswered", "fresh_count",
-                 "has_fresh_reviews", "owner_responds", "negative_without_response",
-                 "last_review_date", "collected_at", "priority", "priority_reason")
+                 "unanswered_fresh", "negative_count", "negative_unanswered",
+                 "fresh_count", "has_fresh_reviews", "owner_responds",
+                 "negative_without_response", "last_review_date", "collected_at",
+                 "priority", "priority_reason")
 
 
 def company_numbers(c) -> dict:
@@ -148,6 +160,29 @@ def fmt_rating(r) -> str:
 
 def fmt_int(v) -> str:
     return NA if v is None else str(v)
+
+
+def unanswered_note(c) -> str:
+    """Подпись к числу «без ответа»: из какого окна и что внутри него.
+
+    Одно число (unanswered_count) — одна подпись. Второе число (негатив) и
+    третье (свежие) называются своими словами, а не прячутся под той же
+    подписью: «19 без ответа из последних 50 отзывов (всего 204),
+    из них 14 негативных и 5 за последние 30 дней».
+    """
+    n = company_numbers(c)
+    if n["unanswered_count"] is None:
+        return ""
+    parts = [f"из {WINDOW_LABEL.replace('последние', 'последних')}"]
+    if n["reviews_count"] is not None:
+        parts.append(f"всего у компании {n['reviews_count']}")
+    tail = []
+    if n["negative_unanswered"]:
+        tail.append(f"{n['negative_unanswered']} негативных")
+    if n["unanswered_fresh"]:
+        tail.append(f"{n['unanswered_fresh']} за последние {FRESH_DAYS} дней")
+    note = " · ".join(parts)
+    return note + (f" · из них {' и '.join(tail)}" if tail else "")
 
 
 def scope_note(c) -> str:
@@ -195,8 +230,29 @@ if __name__ == "__main__":
     checks.append(("счётчики: владелец отвечает", st.owner_responds is True))
     checks.append(("счётчики: негатив в топ-5", st.negative_in_top is True))
     checks.append(("счётчики: дата последнего", st.last_date == "2026-08-31"))
-    checks.append(("счётчики: худшие по возрастанию оценки",
-                   [w["rating"] for w in st.worst] == [1, 1, 2]))
+    checks.append(("счётчики: без ответа среди свежих", st.unanswered_fresh == 3))
+
+    # --- цитаты: только негатив БЕЗ ОТВЕТА, свежие сверху ---
+    quoted = review_stats([rv(1, 2, {"text": "ответили"}), rv(3, 1), rv(10, 2),
+                           rv(20, 5), rv(30, 1, {"text": "ответили"})], now=NOW)
+    checks.append(("цитаты: отвеченный негатив не попадает",
+                   len(quoted.negative_quotes) == 2))
+    checks.append(("цитаты: свежие сверху",
+                   [q["date"] for q in quoted.negative_quotes]
+                   == ["2026-08-29", "2026-08-22"]))
+    checks.append(("цитаты: нет флага answered — сюда попадают только без ответа",
+                   all("answered" not in q for q in quoted.negative_quotes)))
+    checks.append(("цитаты: не больше MAX_QUOTES",
+                   len(review_stats([rv(i, 1) for i in range(1, 9)],
+                                    now=NOW).negative_quotes) == MAX_QUOTES))
+    checks.append(("цитаты: весь негатив отвечен -> цитат нет",
+                   review_stats([rv(1, 1, {"text": "ответ"}),
+                                 rv(2, 2, {"text": "ответ"})],
+                                now=NOW).negative_quotes == []))
+    checks.append(("цитаты: негатива нет вовсе -> цитат нет",
+                   review_stats([rv(1, 5), rv(2, 4)], now=NOW).negative_quotes == []))
+    checks.append(("цитаты: меньше трёх — показываем сколько есть",
+                   len(review_stats([rv(1, 1)], now=NOW).negative_quotes) == 1))
 
     old = review_stats([rv(100, 5, {"text": "ok"})], now=NOW)
     checks.append(("счётчики: старый отзыв — не свежий",
@@ -219,6 +275,28 @@ if __name__ == "__main__":
     checks.append(("формат: рейтинг по-русски", fmt_rating(4.9) == "4,9"
                    and fmt_rating(5.0) == "5,0" and fmt_rating(None) == NA))
     checks.append(("формат: число", fmt_int(0) == "0" and fmt_int(None) == NA))
+
+    # --- подпись к «без ответа»: числа названы своими именами ---
+    class _C:
+        unanswered_count = 19
+        unanswered_fresh = 5
+        negative_unanswered = 14
+        reviews_count = 204
+
+        def __getattr__(self, name):
+            return None
+
+    note = unanswered_note(_C())
+    checks.append(("подпись: указано окно", f"последних {WINDOW}" in note))
+    checks.append(("подпись: всего отзывов у компании", "всего у компании 204" in note))
+    checks.append(("подпись: негатив назван отдельно", "14 негативных" in note))
+    checks.append(("подпись: свежие названы отдельно",
+                   f"5 за последние {FRESH_DAYS} дней" in note))
+    checks.append(("подпись: само число 19 в подпись не подмешано",
+                   "19" not in note))
+
+    checks.append(("окно: берётся из конфига (REVIEW_WINDOW)",
+                   WINDOW == max(1, int(os.getenv("REVIEW_WINDOW") or 50))))
 
     ok = 0
     for label, passed in checks:

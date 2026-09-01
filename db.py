@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS lead_snapshots(
   org_rating          REAL,
   loaded_reviews      INTEGER,
   unanswered_count    INTEGER,
+  unanswered_fresh    INTEGER,
   negative_count      INTEGER,
   negative_unanswered INTEGER,
   fresh_count         INTEGER,
@@ -145,6 +146,10 @@ def _migrate(conn):
     if "consecutive_errors" not in cols:
         conn.execute("ALTER TABLE companies ADD COLUMN "
                      "consecutive_errors INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    snap_cols = {r["name"] for r in conn.execute("PRAGMA table_info(lead_snapshots)")}
+    if snap_cols and "unanswered_fresh" not in snap_cols:
+        conn.execute("ALTER TABLE lead_snapshots ADD COLUMN unanswered_fresh INTEGER")
         conn.commit()
     if "cabinet_nonce" not in cols:
         # nonce — для отзыва ссылки кабинета; enabled — включён ли кабинет
@@ -418,8 +423,8 @@ def mark_auto(conn, company_id: int, kind: str):
 
 SNAPSHOT_FIELDS = ("rating", "rating_confirmed", "ratings_count", "reviews_count",
                    "branch_scope", "branches_count", "org_rating", "loaded_reviews",
-                   "unanswered_count", "negative_count", "negative_unanswered",
-                   "fresh_count", "priority", "priority_reason")
+                   "unanswered_count", "unanswered_fresh", "negative_count",
+                   "negative_unanswered", "fresh_count", "priority", "priority_reason")
 
 
 def add_lead_snapshot(conn, c, city_slug: str = "", category: str = "") -> int:
@@ -434,7 +439,7 @@ def add_lead_snapshot(conn, c, city_slug: str = "", category: str = "") -> int:
     cols = ("firm_id,city_slug,category,name,url,collected_at," + ",".join(SNAPSHOT_FIELDS)
             + ",data_json")
     holders = ",".join("?" * (6 + len(SNAPSHOT_FIELDS) + 1))
-    payload = json.dumps({"worst_reviews": getattr(c, "worst_reviews", []),
+    payload = json.dumps({"negative_quotes": getattr(c, "negative_quotes", []),
                           "last_review_date": getattr(c, "last_review_date", None),
                           "has_fresh_reviews": getattr(c, "has_fresh_reviews", None),
                           "owner_responds": getattr(c, "owner_responds", None),

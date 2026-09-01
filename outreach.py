@@ -109,15 +109,21 @@ def pain_bullets(c: Company, competitor: Optional[Company]) -> list:
         out.append(f"рейтинг {fmt_rating(c.rating)} — до «зелёной зоны» 4,5+ не хватает "
                    f"немного, а именно она даёт поток клиентов с карт")
 
-    # 2. негатив без ответа / отзывы без ответа
-    if c.negative_unanswered:
-        n = c.negative_unanswered
-        out.append(f"{n} {plural(n, 'негативный отзыв висит', 'негативных отзыва висят', 'негативных отзывов висят')} "
-                   f"без ответа — это видит каждый, кто открывает карточку")
-    elif c.unanswered_count and c.loaded_reviews:
+    # 2. отзывы без ответа. Число здесь — то же самое поле, что в шапке
+    # (unanswered_count); негатив и свежесть называются своими словами, а не
+    # подставляются под ту же подпись. Раньше шапка показывала одно число,
+    # а текст — другое, и оба назывались «без ответа».
+    if c.unanswered_count:
         n = c.unanswered_count
-        out.append(f"{n} из последних {c.loaded_reviews} отзывов "
-                   f"{plural(n, 'остался', 'остались', 'остались')} без ответа")
+        detail = []
+        if c.negative_unanswered:
+            detail.append(f"{c.negative_unanswered} из них негативные")
+        if c.unanswered_fresh:
+            detail.append(f"{c.unanswered_fresh} — за последний месяц")
+        tail = (", " + ", ".join(detail)) if detail else ""
+        out.append(f"{n} {plural(n, 'отзыв остался', 'отзыва остались', 'отзывов остались')} "
+                   f"без ответа из последних {c.loaded_reviews or metrics.WINDOW}"
+                   f"{tail} — это видит каждый, кто открывает карточку")
 
     # 3. карточка «спит» или отзывов мало
     if c.has_fresh_reviews is False:
@@ -215,6 +221,53 @@ def render_dynamics_block(dyn) -> str:
             f'<ul class="pains">{"".join(rows)}</ul></div>')
 
 
+STEP_ANSWER = (
+    "<b>Ответить на весь негатив.</b> Спокойный ответ владельца виден каждому будущему "
+    "клиенту и снимает до половины ущерба от плохого отзыва. Мы готовим черновики "
+    "ответов в вашем стиле — остаётся нажать «отправить».")
+STEP_FLOW = (
+    "<b>Запустить поток отзывов от довольных клиентов.</b> Ссылка/QR на карточку + "
+    "короткое сообщение клиенту после визита. Рейтинг растёт за 1–2 месяца, недовольных "
+    "сначала выслушиваем приватно — негатив не доходит до карты.")
+STEP_MONITOR = (
+    "<b>Включить мониторинг.</b> О новом негативе вы узнаёте в тот же день, а не через "
+    "месяц, когда его прочитали сотни людей.")
+
+
+def build_steps(c: Company) -> list:
+    """Шаги для разбора. Шаг «ответить на весь негатив» появляется, только если
+    негатив без ответа реально есть: иначе документ противоречит сам себе."""
+    steps = []
+    if getattr(c, "negative_quotes", None):
+        steps.append(STEP_ANSWER)
+    steps += [STEP_FLOW, STEP_MONITOR]
+    return steps
+
+
+def render_quotes(c: Company) -> str:
+    """Блок цитат: негатив БЕЗ ОТВЕТА, свежие сверху (их отобрал слой данных).
+
+    Пусто -> блока нет совсем. Метки «есть ответ владельца» здесь быть не может:
+    отвеченные отзывы сюда не попадают по построению.
+    """
+    quotes = getattr(c, "negative_quotes", None) or []
+    if not quotes:
+        return ""
+    e = html.escape
+    items = []
+    for r in quotes:
+        rating = int(r.get("rating") or 0)
+        stars = "★" * rating + "☆" * (5 - rating)
+        text = e(r.get("text") or "(без текста)")
+        items.append(f'<blockquote>{text}<div class="meta">{stars} · '
+                     f'{e(r.get("date") or "")} · без ответа</div></blockquote>')
+    n = len(quotes)
+    title = (f"Что видят клиенты: негатив без ответа "
+             f"({n} {plural(n, 'отзыв', 'отзыва', 'отзывов')} "
+             f"из последних {metrics.WINDOW})")
+    return f"<h2>{e(title)}</h2>" + "\n".join(items)
+
+
 def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
     """Разбор карточки. ВСЕ числа приходят готовыми (metrics.company_numbers) —
     в шаблоне ничего не вычисляется, иначе разбор снова разойдётся с таблицей.
@@ -237,7 +290,7 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
  <div class="metric"><div class="v">{e(metrics.fmt_int(n["reviews_count"]))}</div>
    <div class="l">текстовых отзывов</div></div>
  <div class="metric"><div class="v {'bad' if unanswered else 'ok'}">{e(metrics.fmt_int(unanswered))}</div>
-   <div class="l">без ответа<br><span class="tiny">{e(metrics.WINDOW_LABEL)}</span></div></div>
+   <div class="l">без ответа<br><span class="tiny">{e(metrics.unanswered_note(c))}</span></div></div>
  <div class="metric"><div class="v {'ok' if n["fresh_count"] else 'bad'}">{e(metrics.fmt_int(n["fresh_count"]))}</div>
    <div class="l">новых за {metrics.FRESH_DAYS} дней</div></div>
 </div>"""
@@ -245,16 +298,10 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
     pains = "\n".join(f"<li>{e(b[0].upper() + b[1:])}.</li>"
                       for b in pain_bullets(c, competitor))
 
-    worst = ""
-    if c.worst_reviews:
-        quotes = []
-        for r in c.worst_reviews:
-            stars = "★" * int(r.get("rating") or 0) + "☆" * (5 - int(r.get("rating") or 0))
-            answered = "есть ответ владельца" if r.get("answered") else "без ответа"
-            text = e(r.get("text") or "(без текста)")
-            quotes.append(f'<blockquote>{text}<div class="meta">{stars} · '
-                          f'{e(r.get("date") or "")} · {answered}</div></blockquote>')
-        worst = "<h2>Что видят клиенты: свежий негатив</h2>" + "\n".join(quotes)
+    worst = render_quotes(c)
+    steps_html = ("<h2>Что можно сделать уже на этой неделе</h2>\n<ol class=\"steps\">"
+                  + "".join(f"<li>{step}</li>" for step in build_steps(c))
+                  + "</ol>")
 
     vs = ""
     if competitor is not None and competitor.rating is not None:
@@ -286,17 +333,7 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
 {worst}
 {render_dynamics_block(dynamics)}
 {vs}
-<h2>3 шага, которые можно сделать уже на этой неделе</h2>
-<ol class="steps">
- <li><b>Ответить на весь негатив.</b> Спокойный ответ владельца виден каждому будущему
-     клиенту и снимает до половины ущерба от плохого отзыва. Мы готовим черновики
-     ответов в вашем стиле — остаётся нажать «отправить».</li>
- <li><b>Запустить поток отзывов от довольных клиентов.</b> Ссылка/QR на карточку +
-     короткое сообщение клиенту после визита. Рейтинг растёт за 1–2 месяца, недовольных
-     сначала выслушиваем приватно — негатив не доходит до карты.</li>
- <li><b>Включить мониторинг.</b> О новом негативе вы узнаёте в тот же день, а не через
-     месяц, когда его прочитали сотни людей.</li>
-</ol>
+{steps_html}
 <div class="footer">{footer}</div>
 </body></html>"""
 
@@ -460,9 +497,10 @@ if __name__ == "__main__":
                    website="https://instagram.com/aruna_dent", url="https://2gis.kz/x",
                    loaded_reviews=50, unanswered_count=14, negative_unanswered=3,
                    negative_count=5, fresh_count=0, last_review_date="2026-05-01",
+                   unanswered_fresh=2,
                    collected_at="2026-09-01T07:28:16+00:00",
-                   worst_reviews=[{"rating": 1, "date": "2026-05-01",
-                                   "text": "Ужасно <б>", "answered": False}])
+                   negative_quotes=[{"rating": 1, "date": "2026-05-01",
+                                     "text": "Ужасно <б>"}])
     lead.compute_priority()
     top = Company(firm_id="2", name="Dent Lux", rating=4.8, reviews_count=300)
 
@@ -470,16 +508,21 @@ if __name__ == "__main__":
 
     msg = build_message(lead, top, cfg)
     checks.append(("конкурент в сообщении", "Dent Lux" in msg and "4,8" in msg))
-    checks.append(("негатив без ответа в сообщении", "3 негативных отзыва висят" in msg))
+    checks.append(("сообщение: число без ответа — то же поле, что в шапке",
+                   "14 отзывов остались без ответа" in msg))
+    checks.append(("сообщение: негатив назван своими словами",
+                   "3 из них негативные" in msg))
+    checks.append(("сообщение: свежие названы отдельно",
+                   "2 — за последний месяц" in msg))
     checks.append(("имя отправителя", "Эмиль" in msg))
     checks.append(("не больше 3 пунктов", msg.count("• ") <= MAX_BULLETS))
     checks.append(("склонение", plural(1, "а", "б", "в") == "а"
                    and plural(3, "а", "б", "в") == "б"
                    and plural(11, "а", "б", "в") == "в"
                    and plural(21, "а", "б", "в") == "а"))
-    lead1 = Company(negative_unanswered=1, loaded_reviews=50)
+    lead1 = Company(unanswered_count=1, negative_unanswered=1, loaded_reviews=50)
     checks.append(("склонение n=1 в сообщении",
-                   "1 негативный отзыв висит" in build_message(lead1, None, cfg)))
+                   "1 отзыв остался без ответа" in build_message(lead1, None, cfg)))
 
     cfg_noname = _Cfg(); cfg_noname.sender_name = ""
     checks.append(("заглушка имени", "[Имя]" in build_message(lead, top, cfg_noname)))
@@ -497,7 +540,55 @@ if __name__ == "__main__":
     checks.append(("аудит: в подвале дата СБОРА данных",
                    "данные собраны" in audit.lower() and "01.09.2026" in audit))
     checks.append(("аудит: подписано окно счётчиков",
-                   metrics.WINDOW_LABEL in audit))
+                   f"последних {metrics.WINDOW}" in audit))
+    checks.append(("аудит: подпись «без ответа» называет негатив и свежих отдельно",
+                   "3 негативных" in audit and "2 за последние 30 дней" in audit))
+
+    # --- БАГ 1: цитаты только без ответа ---
+    answered_only = Company(name="Всё отвечено", rating=4.0, reviews_count=100,
+                            loaded_reviews=50, unanswered_count=0,
+                            negative_unanswered=0, negative_quotes=[],
+                            collected_at="2026-09-01T07:00:00+00:00")
+    html_ans = render_audit_html(answered_only, cfg)
+    checks.append(("цитаты: нет негатива без ответа -> блока нет",
+                   "негатив без ответа" not in html_ans.lower()))
+    checks.append(("шаги: без негатива без ответа шаг «ответить» убран",
+                   "Ответить на весь негатив" not in html_ans))
+    checks.append(("шаги: остальные шаги на месте",
+                   "Запустить поток отзывов" in html_ans
+                   and "Включить мониторинг" in html_ans))
+
+    checks.append(("цитаты: есть негатив без ответа -> шаг «ответить» присутствует",
+                   "Ответить на весь негатив" in audit))
+    checks.append(("цитаты: метки «есть ответ владельца» в блоке нет",
+                   "есть ответ владельца" not in audit))
+    checks.append(("цитаты: каждая помечена «без ответа»",
+                   audit.count("· без ответа</div>") == 1))
+
+    many = Company(name="Много", rating=4.0, reviews_count=100, loaded_reviews=50,
+                   unanswered_count=9, negative_unanswered=2,
+                   collected_at="2026-09-01T07:00:00+00:00",
+                   negative_quotes=[{"rating": 1, "date": "2026-08-30", "text": "раз"},
+                                    {"rating": 2, "date": "2026-08-20", "text": "два"}])
+    html_many = render_audit_html(many, cfg)
+    checks.append(("цитаты: в заголовке — сколько их и из какого окна",
+                   "2 отзыва" in html_many and f"из последних {metrics.WINDOW}" in html_many))
+
+    # --- БАГ 2: одно число в шапке и в тексте ---
+    head = re.search(r'<div class="v[^"]*">(\d+)</div>\s*<div class="l">без ответа',
+                     audit)
+    checks.append(("шапка: число без ответа найдено", head is not None))
+    checks.append(("шапка == текст: одно и то же число без ответа",
+                   head is not None and head.group(1) == "14"
+                   and f"{head.group(1)} отзывов остались без ответа" in audit))
+    checks.append(("текст: negative_unanswered не выдаётся за «без ответа»",
+                   "3 отзыва остались без ответа" not in audit))
+
+    # шаги строятся отдельной функцией — её можно проверить в лоб
+    checks.append(("build_steps: без цитат — два шага",
+                   len(build_steps(answered_only)) == 2))
+    checks.append(("build_steps: с цитатами — три шага",
+                   len(build_steps(lead)) == 3))
     checks.append(("аудит: оценки и отзывы разделены",
                    "на основе 310 оценок" in audit and "текстовых отзывов" in audit))
     checks.append(("аудит: сказано, что данные по одному филиалу",

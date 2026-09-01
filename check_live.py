@@ -8,7 +8,10 @@
      строит разбор (leadgen.build_audit);
   3. вытаскивает числа ИЗ ОТРЕНДЕРЕННОГО HTML разбора и сверяет с таблицей —
      любое расхождение валит проверку с понятным сообщением;
-  4. повторяет разбор ещё раз и требует полного совпадения (детерминизм:
+  4. проверяет согласованность ВНУТРИ самого разбора: число «без ответа» в
+     шапке обязано совпасть с числом в тексте, а в блоке цитат не может быть
+     отзыва с ответом владельца;
+  5. повторяет разбор ещё раз и требует полного совпадения (детерминизм:
      те же числа и тот же конкурент).
 
 Запуск:
@@ -66,6 +69,72 @@ def audit_numbers(html: str) -> dict:
     return out
 
 
+# «14 отзывов остались без ответа», «19 без ответа» — числа, поданные читателю
+# как «без ответа». Все они обязаны быть одним и тем же числом.
+UNANSWERED_IN_TEXT_RE = re.compile(
+    r"(\d+)\s+отзыв\w*\s+остал\w*\s+без ответа")
+# метка ответа владельца в блоке цитат — её там быть не должно
+ANSWERED_MARK = "есть ответ владельца"
+# блок цитат = от своего заголовка до следующего заголовка/блока/конца документа
+QUOTES_BLOCK_RE = re.compile(
+    r"<h2>Что видят клиенты.*?"
+    r"(?=<h2>|<ol class=\"steps\"|<div class=\"vs\"|<div class=\"footer\"|\Z)", re.S)
+
+
+def check_internal(numbers: dict, html: str) -> list:
+    """Согласованность внутри одного документа -> список проблем.
+
+    Ловит то, чего не видит сверка с таблицей: два разных числа под одной
+    подписью и отвеченные отзывы в блоке цитат негатива.
+    """
+    problems = []
+    head = audit_numbers(html)
+    head_value = next((v for k, v in head.items() if k.startswith("без ответа")), None)
+    in_text = UNANSWERED_IN_TEXT_RE.findall(html)
+
+    if head_value is None:
+        problems.append("в шапке разбора нет метрики «без ответа»")
+    elif not in_text:
+        problems.append(f"в шапке «без ответа» = {head_value}, "
+                        f"а в тексте это число не названо вовсе")
+    else:
+        разные = {v for v in in_text if v != head_value}
+        if разные:
+            problems.append(
+                f"«без ответа»: в шапке {head_value}, в тексте "
+                f"{', '.join(sorted(разные))} — одно число, поданное как два")
+
+    expected = numbers.get("unanswered_count")
+    if expected is not None and head_value is not None and head_value != str(expected):
+        problems.append(f"«без ответа»: слой данных {expected}, шапка {head_value}")
+
+    block = QUOTES_BLOCK_RE.search(html)
+    if block and ANSWERED_MARK in block.group(0):
+        problems.append("в блоке цитат есть отзыв с ответом владельца "
+                        "(«есть ответ владельца») — сюда попадает только негатив "
+                        "без ответа")
+    if block and "Ответить на весь негатив" not in html:
+        problems.append("блок цитат негатива есть, а шага «ответить на весь "
+                        "негатив» в документе нет")
+    if not block and "Ответить на весь негатив" in html:
+        problems.append("шаг «ответить на весь негатив» есть, а негатива без "
+                        "ответа в документе нет — документ противоречит себе")
+    return problems
+
+
+def quotes_of(html: str) -> list:
+    """Цитаты из блока негатива: [(дата, помечено ли «без ответа»)]."""
+    block = QUOTES_BLOCK_RE.search(html)
+    if not block:
+        return []
+    out = []
+    for meta in re.findall(r'<div class="meta">(.*?)</div>', block.group(0), re.S):
+        clean = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", meta)).strip()
+        date = re.search(r"\d{4}-\d{2}-\d{2}", clean)
+        out.append((date.group(0) if date else "?", "без ответа" in clean))
+    return out
+
+
 def compare(numbers: dict, html: str) -> list:
     """Числа таблицы против чисел разбора -> список расхождений (пустой = ок)."""
     printed = audit_numbers(html)
@@ -118,6 +187,23 @@ async def run(city: str, category: str, count: int) -> int:
                 print(f"    [FAIL] {p}")
         else:
             print("    [OK ] числа таблицы и разбора совпали")
+
+        internal = check_internal(numbers, html)
+        if internal:
+            failures += [f"{c.name}: {p}" for p in internal]
+            for p in internal:
+                print(f"    [FAIL] {p}")
+        else:
+            print(f"    [OK ] внутри разбора согласовано: без ответа "
+                  f"{metrics.fmt_int(numbers['unanswered_count'])} и в шапке, и в тексте")
+
+        quotes = quotes_of(html)
+        print(f"    цитаты негатива без ответа: {len(quotes)}")
+        for date, unanswered in quotes:
+            print(f"      · {date} — unanswered={unanswered}")
+        if any(not u for _, u in quotes):
+            failures.append(f"{c.name}: в цитатах есть отвеченный отзыв")
+            print("    [FAIL] в цитатах есть отвеченный отзыв")
 
         # детерминизм: второй разбор подряд обязан быть таким же
         html2, _, _ = await leadgen.build_audit(c.firm_id, cfg)
@@ -175,6 +261,37 @@ def selftest() -> int:
     checks.append(("нет метрики в разборе -> поймано",
                    any("нет метрики" in p
                        for p in compare(numbers, '<div class="v">5,0</div>'))))
+
+    # --- согласованность внутри документа ---
+    doc_ok = (html_ok + "<ul class=\"pains\"><li>10 отзывов остались без ответа "
+              "из последних 50.</li></ul>"
+              "<h2>Что видят клиенты: негатив без ответа (1 отзыв)</h2>"
+              "<blockquote>плохо<div class=\"meta\">★☆☆☆☆ · 2026-08-30 · без ответа"
+              "</div></blockquote>"
+              "<ol class=\"steps\"><li>Ответить на весь негатив.</li></ol>")
+    checks.append(("внутри документа: одно число -> ок",
+                   check_internal(numbers, doc_ok) == []))
+
+    doc_two = doc_ok.replace("10 отзывов остались без ответа",
+                             "14 отзывов остались без ответа")
+    problems = check_internal(numbers, doc_two)
+    checks.append(("внутри документа: два числа под одной подписью -> поймано",
+                   any("поданное как два" in p for p in problems)))
+
+    doc_answered = doc_ok.replace("· без ответа", "· есть ответ владельца")
+    checks.append(("внутри документа: отвеченный отзыв в цитатах -> поймано",
+                   any("ответом владельца" in p
+                       for p in check_internal(numbers, doc_answered))))
+
+    doc_no_quotes = (html_ok + "<ul class=\"pains\"><li>10 отзывов остались без "
+                     "ответа из последних 50.</li></ul>"
+                     "<ol class=\"steps\"><li>Ответить на весь негатив.</li></ol>")
+    checks.append(("внутри документа: шаг без блока цитат -> поймано",
+                   any("противоречит себе" in p
+                       for p in check_internal(numbers, doc_no_quotes))))
+
+    checks.append(("цитаты: разбор блока даёт даты и флаг",
+                   quotes_of(doc_ok) == [("2026-08-30", True)]))
 
     parsed = audit_numbers(html_ok)
     checks.append(("разбор HTML: подписи очищены от тегов",

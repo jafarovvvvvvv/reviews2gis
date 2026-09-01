@@ -256,7 +256,7 @@ def company_from_snapshot(row) -> Company:
         setattr(c, f, val)
     c.branch_scope = row["branch_scope"] or metrics.SCOPE_BRANCH
     c.collected_at = row["collected_at"]
-    c.worst_reviews = extra.get("worst_reviews") or []
+    c.negative_quotes = extra.get("negative_quotes") or []
     c.last_review_date = extra.get("last_review_date")
     c.has_fresh_reviews = extra.get("has_fresh_reviews")
     c.owner_responds = extra.get("owner_responds")

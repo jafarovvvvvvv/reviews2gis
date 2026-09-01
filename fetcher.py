@@ -280,6 +280,7 @@ def apply_reviews(c: Company, data: dict | None, now: datetime | None = None):
     st = metrics.review_stats(data.get("reviews") or [], now)
     c.loaded_reviews = st.loaded
     c.unanswered_count = st.unanswered
+    c.unanswered_fresh = st.unanswered_fresh
     c.negative_count = st.negative
     c.negative_unanswered = st.negative_unanswered
     c.fresh_count = st.fresh
@@ -287,7 +288,7 @@ def apply_reviews(c: Company, data: dict | None, now: datetime | None = None):
     c.owner_responds = st.owner_responds
     c.negative_without_response = st.negative_in_top
     c.last_review_date = st.last_date
-    c.worst_reviews = st.worst
+    c.negative_quotes = st.negative_quotes
 
 
 def apply_card_fields(c: Company, fields: dict):
@@ -654,8 +655,10 @@ if __name__ == "__main__":
     checks.append(("reviews: без ответа посчитаны", c.unanswered_count == 2))
     checks.append(("reviews: негатив без ответа", c.negative_unanswered == 2))
     checks.append(("reviews: свежих за 30 дней", c.fresh_count == 2))
-    checks.append(("reviews: худшие отсортированы",
-                   [w["rating"] for w in c.worst_reviews] == [1, 2]))
+    checks.append(("reviews: цитаты — только негатив без ответа",
+                   [q["rating"] for q in c.negative_quotes] == [1, 2]))
+    checks.append(("reviews: в цитатах нет отвеченных",
+                   all(q["date"] != "2026-07-22" for q in c.negative_quotes)))
 
     c2 = Company()
     apply_reviews(c2, {"meta": {}, "reviews": []}, now=NOW)
