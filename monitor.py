@@ -279,6 +279,7 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
 
         # снимок метрик для графиков динамики (по загруженному окну отзывов)
         if c.rating is not None:
+            # доля ответов владельца по тому же окну, что и остальные счётчики
             answered_pct = (round(100 * sum(1 for r in reviews if r.get("answered"))
                                   / len(reviews)) if reviews else None)
             db.add_rating_snapshot(conn, company_id, c.rating, c.reviews_count,

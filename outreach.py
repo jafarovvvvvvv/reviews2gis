@@ -23,7 +23,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import os
+
+import metrics
 from lead_scoring import Company, NA, sort_key
+
+# Блок сравнения с конкурентом в разборе. Выключен по умолчанию: он подставлял
+# разных конкурентов от прогона к прогону. Одно определение на проект —
+# leadgen берёт флаг отсюда же.
+AUDIT_COMPETITOR = (os.getenv("AUDIT_COMPETITOR") or "0").strip().lower() in (
+    "1", "true", "yes")
 
 # Минимальный разрыв рейтинга, при котором упоминаем конкурента
 COMPETITOR_GAP = 0.2
@@ -35,8 +44,8 @@ MAX_BULLETS = 3  # пунктов боли в сообщении
 # ---------- утилиты ----------
 
 def fmt_rating(r: Optional[float]) -> str:
-    """4.7 -> «4,7» (русская запись)."""
-    return NA if r is None else f"{r:.1f}".replace(".", ",")
+    """4.7 -> «4,7». Тонкая обёртка над единым слоем — формат один на проект."""
+    return metrics.fmt_rating(r)
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -161,22 +170,76 @@ blockquote .meta{color:#888;font-size:.85em}
 .vs{background:#f4f6fa;border-radius:10px;padding:14px;margin:16px 0}
 .steps li{margin:8px 0}
 .footer{margin-top:28px;padding-top:12px;border-top:1px solid #ddd;color:#666;font-size:.9em}
+.tiny{font-size:.82em;color:#888}
+.vs .up{color:#c0392b}.vs .down{color:#27ae60}
 @media print{body{margin:0}.noprint{display:none}}
 """
 
 
-def render_audit_html(c: Company, competitor: Optional[Company], cfg) -> str:
-    e = html.escape
-    name = c.name if c.name != NA else "Компания"
-    today = datetime.now().strftime("%d.%m.%Y")
+def fmt_collected(iso) -> str:
+    """ISO-момент сбора -> «01.09.2026, 07:28». Пусто -> «дата неизвестна»."""
+    if not iso:
+        return "дата неизвестна"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return str(iso)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%d.%m.%Y, %H:%M")
 
-    unanswered = c.unanswered_count
-    metrics = f"""
+
+def render_dynamics_block(dyn) -> str:
+    """Блок «что изменилось» по двум снимкам. Нет истории -> пустая строка.
+
+    Заглушек и прочерков быть не должно: если сравнивать не с чем, блока в
+    разборе просто нет.
+    """
+    if not dyn or not dyn.get("changes"):
+        return ""
+    e = html.escape
+    rows = []
+    for ch in dyn["changes"]:
+        was, now = ch["was"], ch["now"]
+        if was is None or now is None or was == now:
+            arrow = ""
+        elif now > was:
+            arrow = ' <span class="up">&#9650;</span>'
+        else:
+            arrow = ' <span class="down">&#9660;</span>'
+        fmt = metrics.fmt_rating if ch["label"] == "рейтинг" else metrics.fmt_int
+        rows.append(f"<li>{e(ch['label'])}: <b>{e(fmt(was))}</b> &rarr; "
+                    f"<b>{e(fmt(now))}</b>{arrow}</li>")
+    return (f'<div class="vs"><b>Что изменилось с прошлого замера '
+            f'({e(fmt_collected(dyn["since"]))}).</b>'
+            f'<ul class="pains">{"".join(rows)}</ul></div>')
+
+
+def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
+    """Разбор карточки. ВСЕ числа приходят готовыми (metrics.company_numbers) —
+    в шаблоне ничего не вычисляется, иначе разбор снова разойдётся с таблицей.
+
+    competitor: блок сравнения рисуется, только если конкурент передан явно
+    (решение принимает leadgen по флагу SHOW_COMPETITOR).
+    """
+    e = html.escape
+    n = metrics.company_numbers(c)   # единственный источник чисел
+    name = c.name if c.name != NA else "Компания"
+
+    rating_cls = "bad" if n["rating"] is not None and n["rating"] < 4.5 else "ok"
+    unanswered = n["unanswered_count"]
+    ratings_line = (f'на основе {metrics.fmt_int(n["ratings_count"])} оценок'
+                    if n["ratings_count"] is not None else "оценка 2ГИС")
+    metrics_html = f"""
 <div class="metrics">
- <div class="metric"><div class="v {'bad' if c.rating is not None and c.rating < 4.5 else 'ok'}">{e(fmt_rating(c.rating))}</div><div class="l">рейтинг 2ГИС</div></div>
- <div class="metric"><div class="v">{c.reviews_count if c.reviews_count is not None else e(NA)}</div><div class="l">всего отзывов</div></div>
- <div class="metric"><div class="v {'bad' if unanswered else 'ok'}">{unanswered if unanswered is not None else e(NA)}</div><div class="l">без ответа (из последних {c.loaded_reviews or '—'})</div></div>
- <div class="metric"><div class="v {'ok' if c.fresh_count else 'bad'}">{c.fresh_count if c.fresh_count is not None else e(NA)}</div><div class="l">новых за 30 дней</div></div>
+ <div class="metric"><div class="v {rating_cls}">{e(metrics.fmt_rating(n["rating"]))}</div>
+   <div class="l">рейтинг 2ГИС<br><span class="tiny">{e(ratings_line)}</span></div></div>
+ <div class="metric"><div class="v">{e(metrics.fmt_int(n["reviews_count"]))}</div>
+   <div class="l">текстовых отзывов</div></div>
+ <div class="metric"><div class="v {'bad' if unanswered else 'ok'}">{e(metrics.fmt_int(unanswered))}</div>
+   <div class="l">без ответа<br><span class="tiny">{e(metrics.WINDOW_LABEL)}</span></div></div>
+ <div class="metric"><div class="v {'ok' if n["fresh_count"] else 'bad'}">{e(metrics.fmt_int(n["fresh_count"]))}</div>
+   <div class="l">новых за {metrics.FRESH_DAYS} дней</div></div>
 </div>"""
 
     pains = "\n".join(f"<li>{e(b[0].upper() + b[1:])}.</li>"
@@ -195,27 +258,33 @@ def render_audit_html(c: Company, competitor: Optional[Company], cfg) -> str:
 
     vs = ""
     if competitor is not None and competitor.rating is not None:
+        cn = metrics.company_numbers(competitor)
         vs = (f'<div class="vs"><b>Сравнение с конкурентом рядом.</b> '
-              f'«{e(competitor.name)}» — рейтинг {e(fmt_rating(competitor.rating))} '
-              f'при {competitor.reviews_count or "?"} отзывах. '
+              f'«{e(competitor.name)}» — рейтинг {e(metrics.fmt_rating(cn["rating"]))} '
+              f'при {e(metrics.fmt_int(cn["reviews_count"]))} отзывах. '
               f'Когда человек выбирает по карте между вами и ними, '
               f'рейтинг — первое, что он сравнивает.</div>')
 
     contact = e(cfg.sender_contact or cfg.sender_name or "")
+    collected = fmt_collected(n["collected_at"])
+    scope = metrics.scope_note(c)
     footer = (f'Разбор подготовил {e(cfg.sender_name) or "[Имя]"}'
               + (f" · {contact}" if cfg.sender_contact else "")
-              + f" · {today}. Данные — открытая карточка 2ГИС.")
+              + f'. Данные собраны {e(collected)} — открытая карточка 2ГИС, '
+              + f'{e(scope)}.')
 
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <title>Разбор карточки 2ГИС — {e(name)}</title>
 <style>{_AUDIT_CSS}</style></head><body>
 <h1>Разбор карточки 2ГИС — {e(name)}</h1>
-<div class="sub">{e(c.category)} · {e(cfg.city)} · <a href="{e(c.url)}">карточка в 2ГИС</a></div>
-{metrics}
+<div class="sub">{e(c.category)} · {e(cfg.city)} · <a href="{e(c.url)}">карточка в 2ГИС</a>
+ · <span class="tiny">данные собраны {e(collected)}</span></div>
+{metrics_html}
 <h2>Что бросается в глаза</h2>
 <ul class="pains">{pains}</ul>
 {worst}
+{render_dynamics_block(dynamics)}
 {vs}
 <h2>3 шага, которые можно сделать уже на этой неделе</h2>
 <ol class="steps">
@@ -346,8 +415,11 @@ def write_outreach_pack(companies: list, cfg) -> Path:
 
     rows = build_rows(companies, cfg)
     for row in rows:
+        # конкурент в файле разбора — только при включённом флаге (как и в панели)
+        competitor = row["competitor"] if AUDIT_COMPETITOR else None
         (pack / row["audit_file"]).write_text(
-            render_audit_html(row["c"], row["competitor"], cfg), encoding="utf-8")
+            render_audit_html(row["c"], cfg, competitor=competitor),
+            encoding="utf-8")
 
     (pack / "index.html").write_text(render_dashboard_html(rows, cfg), encoding="utf-8")
 
@@ -382,11 +454,13 @@ if __name__ == "__main__":
 
     cfg = _Cfg()
     lead = Company(firm_id="1", name="Стоматология Аруна", rating=3.9,
-                   reviews_count=120, has_fresh_reviews=False, owner_responds=False,
+                   ratings_count=310, reviews_count=120, branches_count=2,
+                   has_fresh_reviews=False, owner_responds=False,
                    negative_without_response=True, phone="+7 (727) 123-45-67",
                    website="https://instagram.com/aruna_dent", url="https://2gis.kz/x",
                    loaded_reviews=50, unanswered_count=14, negative_unanswered=3,
-                   fresh_count=0, last_review_date="2026-05-01",
+                   negative_count=5, fresh_count=0, last_review_date="2026-05-01",
+                   collected_at="2026-09-01T07:28:16+00:00",
                    worst_reviews=[{"rating": 1, "date": "2026-05-01",
                                    "text": "Ужасно <б>", "answered": False}])
     lead.compute_priority()
@@ -415,9 +489,47 @@ if __name__ == "__main__":
     checks.append(("wa.me из 8-кода", phone_digits("8 701 555-44-33") == "77015554433"))
     checks.append(("wa.me нет телефона", wa_link(NA) is None))
 
-    audit = render_audit_html(lead, top, cfg)
+    audit = render_audit_html(lead, cfg, competitor=top)
     checks.append(("аудит: имя и конкурент", "Аруна" in audit and "Dent Lux" in audit))
     checks.append(("аудит: HTML экранирован", "<б>" not in audit and "&lt;б&gt;" in audit))
+
+    # --- дата сбора, а не дата генерации файла ---
+    checks.append(("аудит: в подвале дата СБОРА данных",
+                   "данные собраны" in audit.lower() and "01.09.2026" in audit))
+    checks.append(("аудит: подписано окно счётчиков",
+                   metrics.WINDOW_LABEL in audit))
+    checks.append(("аудит: оценки и отзывы разделены",
+                   "на основе 310 оценок" in audit and "текстовых отзывов" in audit))
+    checks.append(("аудит: сказано, что данные по одному филиалу",
+                   "филиалу из 2" in audit))
+    checks.append(("аудит: рейтинг не пересчитан, показан как есть",
+                   ">3,9<" in audit.replace(" ", "").replace("\n", "")
+                   or "3,9" in audit))
+
+    # --- конкурент только по явной передаче ---
+    no_vs = render_audit_html(lead, cfg)
+    checks.append(("аудит: без конкурента блока сравнения нет",
+                   "Сравнение с конкурентом" not in no_vs))
+    checks.append(("аудит: с конкурентом блок есть",
+                   "Сравнение с конкурентом" in audit))
+
+    # --- динамика ---
+    dyn = {"since": "2026-07-27T22:54:00+00:00", "until": "2026-09-01T07:28:16+00:00",
+           "changes": [{"label": "рейтинг", "was": 4.8, "now": 5.0, "delta": 0.2},
+                       {"label": "отзывов без ответа", "was": 9, "now": 10, "delta": 1}]}
+    with_dyn = render_audit_html(lead, cfg, dynamics=dyn)
+    checks.append(("динамика: блок отрисован с датой прошлого замера",
+                   "Что изменилось" in with_dyn
+                   and fmt_collected(dyn["since"]) in with_dyn))
+    checks.append(("динамика: было -> стало",
+                   "4,8" in with_dyn and "5,0" in with_dyn))
+    checks.append(("динамика: нет истории -> блока нет",
+                   "Что изменилось" not in render_audit_html(lead, cfg, dynamics=None)))
+    checks.append(("динамика: пустой список изменений -> блока нет",
+                   render_dynamics_block({"since": "x", "changes": []}) == ""))
+
+    checks.append(("дата сбора: пусто -> честная подпись",
+                   fmt_collected(None) == "дата неизвестна"))
 
     dash = render_dashboard_html(
         [{"c": lead, "message": msg, "wa": wa, "audit_file": "audit_1.html"}], cfg)

@@ -25,6 +25,7 @@ import httpx
 import ai_reply
 import db
 import fetcher
+import metrics
 
 BATCH_SIZE = 25          # отзывов на один запрос классификации
 TEXT_LIMIT = 350         # обрезка текста отзыва в промпте
@@ -213,7 +214,7 @@ def aggregate(reviews: list, marked: list, now=None) -> dict:
     # реакция владельца
     total = len(reviews)
     answered = sum(1 for r in reviews if r.get("answered"))
-    negative = [r for r in reviews if (r.get("rating") or 5) <= 3]
+    negative = [r for r in reviews if metrics.is_negative(r.get("rating"))]
     neg_answered = sum(1 for r in negative if r.get("answered"))
     dates = sorted(d for d in ((r.get("date_created") or "")[:10] for r in reviews) if d)
 

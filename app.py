@@ -38,6 +38,7 @@ import bot
 import db
 import insights
 import leadgen
+import metrics
 import monitor
 import outreach
 import tg
@@ -1224,9 +1225,14 @@ async def lead_run_page(rid: str, request: Request):
     for i, row in enumerate(run.rows):
         c = row["c"]
         links = [f'<a href="{e(c.url)}" target="_blank">2ГИС</a>']
+        # «разбор» — живой: проверит свежесть данных, при необходимости
+        # перечитает карточку и добавит динамику к прошлому замеру.
+        # «файл» — тот же разбор из пакета на диске (для оффлайн-рассылки).
+        links.append(f'<a href="/leads/{run.id}/audit/{e(c.firm_id)}" '
+                     f'target="_blank">разбор</a>')
         if run.pack:
             links.append(f'<a href="{_pack_url(run.pack, row["audit_file"])}" '
-                         f'target="_blank">аудит</a>')
+                         f'target="_blank">файл</a>')
         if row["wa"]:
             links.append(f'<a href="{e(row["wa"])}" target="_blank">WhatsApp ➤</a>')
         ig = outreach.instagram_link(c.website)
@@ -1239,13 +1245,22 @@ async def lead_run_page(rid: str, request: Request):
             action = (f'<form method="post" action="/leads/{run.id}/monitor">'
                       f'<input type="hidden" name="firm_id" value="{e(c.firm_id)}">'
                       f'<button class="small">В мониторинг</button></form>')
-        rating = "—" if c.rating is None else f"{c.rating:.1f}".replace(".", ",")
+        # ВСЕ числа — из общего слоя (metrics), никакого счёта на месте:
+        # иначе таблица снова разойдётся с разбором по той же компании
+        n = metrics.company_numbers(c)
+        branches = n["branches_count"]
+        scope_hint = (f' · {branches} '
+                      f'{outreach.plural(branches, "филиал", "филиала", "филиалов")}'
+                      if branches and branches > 1 else "")
         trs.append(f"""<tr>
- <td>{e(c.priority)}</td>
+ <td>{e(c.priority)}<div class="meta">{e(c.priority_reason)}</div></td>
  <td><b>{e(c.name)}</b><div class="meta">{e(c.phone)}</div></td>
- <td class="mono">{rating} / {c.reviews_count if c.reviews_count is not None else '—'}
-  <div class="meta">без ответа: {c.unanswered_count
-                                 if c.unanswered_count is not None else '—'}</div></td>
+ <td class="mono">{e(metrics.fmt_rating(n["rating"]))}
+  <div class="meta">{e(metrics.fmt_int(n["ratings_count"]))} оценок ·
+   {e(metrics.fmt_int(n["reviews_count"]))} отзывов{e(scope_hint)}</div></td>
+ <td class="mono">{e(metrics.fmt_int(n["unanswered_count"]))}
+  <div class="meta">негатива: {e(metrics.fmt_int(n["negative_unanswered"]))} ·
+   {e(metrics.WINDOW_LABEL)}</div></td>
  <td class="links">{' '.join(links)}</td>
  <td><details class="msg"><summary>сообщение</summary>
   <pre id="m{i}">{e(row["message"])}</pre>
@@ -1256,7 +1271,8 @@ async def lead_run_page(rid: str, request: Request):
     counts = run.counts()
     summary = "".join(f'<div><b>{n}</b><span>{e(p)}</span></div>'
                       for p, n in counts.items())
-    table = (f'<table><tr><th>Приоритет</th><th>Компания</th><th>Рейтинг / отзывы</th>'
+    table = (f'<table><tr><th>Приоритет и причина</th><th>Компания</th>'
+             f'<th>Рейтинг 2ГИС</th><th>Без ответа</th>'
              f'<th>Ссылки</th><th>Открывашка</th><th>Мониторинг</th></tr>'
              f'{"".join(trs)}</table>' if trs else "")
     err_note = (f'<div class="flash err">{e(run.error)}</div>' if run.error else "")
@@ -1267,10 +1283,17 @@ async def lead_run_page(rid: str, request: Request):
                   f'<span class="meta">папка output/{e(run.pack)}</span></div>'
                   if run.pack else "")
 
+    collected = ""
+    if run.rows:
+        stamps = [r["c"].collected_at for r in run.rows if r["c"].collected_at]
+        if stamps:
+            collected = (f' · данные собраны '
+                         f'{e(outreach.fmt_collected(max(stamps)))}')
     body = f"""
 <h1>{e(run.title)}</h1>
 <div class="sysbar">{_run_status(run)}
- <span class="muted">{e(run.stage)}{f' · способ: {e(run.way)}' if run.way else ''}</span></div>
+ <span class="muted">{e(run.stage)}{f' · способ: {e(run.way)}' if run.way else ''}
+ {collected}</span></div>
 {err_note}
 <div class="card">
  <div class="kv">{summary or '<div><b>—</b><span>лидов пока нет</span></div>'}</div>
@@ -1291,6 +1314,34 @@ function copyMsg(id, btn){{
 }}
 </script>"""
     return page(run.title, body, request, refresh=run.busy)
+
+
+@app.get("/leads/{rid}/audit/{firm_id}", response_class=HTMLResponse)
+async def lead_audit(rid: str, firm_id: str):
+    """Живой разбор лида: гарантированно свежие данные + динамика.
+
+    Данные старше AUDIT_MAX_AGE_HOURS перечитываются с 2ГИС; если это не
+    удалось — отдаём понятную ошибку, а не разбор со старыми числами.
+    """
+    e = html.escape
+    run = leadgen.get_run(rid)
+    if run is None:
+        return redirect("/leads", err="Прогон не найден")
+    if not any(r["c"].firm_id == firm_id for r in run.rows):
+        return redirect(f"/leads/{run.id}", err="Лид не найден в этом прогоне")
+    conn = db.connect()
+    try:
+        mode = db.get_setting(conn, "fetch_mode", "auto")
+    finally:
+        conn.close()
+    try:
+        html_out, _, _ = await leadgen.build_audit(firm_id, run.cfg, mode)
+    except leadgen.StaleDataError as ex:
+        return HTMLResponse(
+            f"<h1>Разбор не построен</h1><p>{e(str(ex))}</p>"
+            f"<p><a href='/leads/{run.id}'>← к результатам прогона</a></p>",
+            status_code=503)
+    return HTMLResponse(html_out)
 
 
 @app.post("/leads/{rid}/monitor")

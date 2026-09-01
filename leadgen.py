@@ -21,17 +21,26 @@ RUNS_KEEP последних; сами результаты — CSV и паке�
 """
 import asyncio
 import csv
+import os
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import db
+import metrics
 from config import city_to_slug
 from fetcher import BlockedError, FetchError, fetch_ways, fetcher_class
 from lead_scoring import (CSV_HEADERS, Company, PRIORITY_HIGH, PRIORITY_LOW,
                           PRIORITY_MEDIUM, sort_key)
-from outreach import build_rows, write_outreach_pack
+from outreach import (AUDIT_COMPETITOR as _AUDIT_COMPETITOR, build_rows,
+                      render_audit_html, write_outreach_pack)
+
+
+def outreach_competitor_flag() -> bool:
+    """Флаг блока конкурента (задан в outreach.py, читается из .env)."""
+    return _AUDIT_COMPETITOR
 
 MAX_COUNT = 120   # потолок за прогон: ~1 с на карточку + пауза, дальше долго
 DEF_COUNT = 30
@@ -39,6 +48,15 @@ DEF_COUNT = 30
 # Пауза между карточками, сек. Браузеру нужна человекоподобность, HTTP хватает
 # короткой — он и так делает один запрос вместо загрузки всей страницы.
 PAUSE = {"http": (0.3, 0.9), "browser": (1.5, 4.0)}
+
+# Разбор (аудит) не должен показывать данные месячной давности: если снимок
+# старше этого срока — компания перечитывается с 2ГИС до рендера.
+AUDIT_MAX_AGE_HOURS = int(os.getenv("AUDIT_MAX_AGE_HOURS") or 24)
+
+# Блок сравнения с конкурентом выключен по умолчанию (AUDIT_COMPETITOR=1
+# включает): он не раз подставлял в разбор разных конкурентов от прогона к
+# прогону. Флаг определён в outreach — там же, где рендерится разбор.
+SHOW_COMPETITOR = outreach_competitor_flag()
 
 # статусы прогона
 ST_RUNNING = "running"
@@ -187,8 +205,174 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
     companies.sort(key=sort_key)
     report = report or (lambda *a, **kw: None)
     report("готовлю пакет для рассылки…", len(companies), len(companies))
+    # снимки пишем до рендера: разбор и динамика читают их из БД
+    save_snapshots(companies, cfg)
     return {"companies": companies, "rows": build_rows(companies, cfg), "way": way,
             "csv": write_csv(companies, cfg), "pack": write_outreach_pack(companies, cfg)}
+
+
+# ==================== снимки, свежесть, динамика ==========================
+
+class StaleDataError(Exception):
+    """Свежих данных нет и получить не удалось — разбор рендерить нельзя."""
+
+
+def save_snapshots(companies: list, cfg) -> int:
+    """Сохранить снимки прогона (история для динамики и выбора конкурента)."""
+    conn = db.connect()
+    try:
+        for c in companies:
+            db.add_lead_snapshot(conn, c, cfg.city_slug, cfg.category)
+    finally:
+        conn.close()
+    return len(companies)
+
+
+def snapshot_age_hours(row) -> float:
+    """Возраст снимка в часах. Нечитаемая дата -> «бесконечно старый»."""
+    try:
+        ts = datetime.fromisoformat(row["collected_at"])
+    except (TypeError, ValueError, KeyError):
+        return float("inf")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+
+
+def company_from_snapshot(row) -> Company:
+    """Строка снимка -> Company (числа те же, без похода в сеть)."""
+    import json
+    extra = {}
+    try:
+        extra = json.loads(row["data_json"] or "{}")
+    except (ValueError, TypeError):
+        pass
+    c = Company(firm_id=row["firm_id"], name=row["name"] or metrics.NA,
+                category=row["category"] or metrics.NA, url=row["url"] or metrics.NA)
+    for f in db.SNAPSHOT_FIELDS:
+        val = row[f]
+        if f == "rating_confirmed" and val is not None:
+            val = bool(val)
+        setattr(c, f, val)
+    c.branch_scope = row["branch_scope"] or metrics.SCOPE_BRANCH
+    c.collected_at = row["collected_at"]
+    c.worst_reviews = extra.get("worst_reviews") or []
+    c.last_review_date = extra.get("last_review_date")
+    c.has_fresh_reviews = extra.get("has_fresh_reviews")
+    c.owner_responds = extra.get("owner_responds")
+    c.negative_without_response = extra.get("negative_without_response")
+    return c
+
+
+async def fresh_company(firm_id: str, cfg, mode: str = "auto",
+                        max_age_hours: int = None, force: bool = False):
+    """Компания со СВЕЖИМИ данными: (Company, id снимка).
+
+    Разбор обязан показывать актуальные числа. Поэтому:
+      • есть снимок моложе max_age_hours -> берём его;
+      • иначе перечитываем карточку с 2ГИС и пишем новый снимок;
+      • перечитать не удалось -> StaleDataError. Молча отдать старое нельзя:
+        именно так в разбор и попали данные месячной давности.
+    """
+    max_age = AUDIT_MAX_AGE_HOURS if max_age_hours is None else max_age_hours
+    conn = db.connect()
+    try:
+        last = db.last_lead_snapshot(conn, firm_id)
+    finally:
+        conn.close()
+
+    if last is not None and not force:
+        age = snapshot_age_hours(last)
+        if age <= max_age:
+            _log(f"  [lead] снимок свежий ({age:.1f} ч <= {max_age} ч) — беру его")
+            return company_from_snapshot(last), last["id"]
+        _log(f"  [lead] снимку {age:.1f} ч (порог {max_age} ч) — перечитываю карточку")
+
+    try:
+        c, way = await fetch_one(cfg, firm_id, mode)
+    except Exception as e:
+        raise StaleDataError(
+            f"не удалось получить свежие данные по компании {firm_id}: {e}. "
+            f"Разбор не построен — показывать устаревшие числа нельзя.") from e
+    if c.name == metrics.NA and c.rating is None:
+        raise StaleDataError(
+            f"карточка {firm_id} прочиталась пустой — разбор не построен.")
+
+    conn = db.connect()
+    try:
+        sid = db.add_lead_snapshot(conn, c, cfg.city_slug, cfg.category)
+    finally:
+        conn.close()
+    _log(f"  [lead] карточка перечитана способом «{way}», снимок #{sid}")
+    return c, sid
+
+
+def dynamics(firm_id: str, snapshot_id: int) -> dict:
+    """Сравнение с предыдущим снимком: {было -> стало}. None, если истории нет.
+
+    Блок динамики в разборе рисуется только при непустом результате — заглушки
+    и прочерки не показываем.
+    """
+    conn = db.connect()
+    try:
+        prev = db.prev_lead_snapshot(conn, firm_id, snapshot_id)
+        cur = conn.execute("SELECT * FROM lead_snapshots WHERE id=?",
+                           (snapshot_id,)).fetchone()
+    finally:
+        conn.close()
+    if prev is None or cur is None:
+        return None
+    fields = (("rating", "рейтинг"), ("unanswered_count", "отзывов без ответа"),
+              ("negative_unanswered", "негатива без ответа"),
+              ("reviews_count", "текстовых отзывов"))
+    changes = []
+    for key, label in fields:
+        was, now = prev[key], cur[key]
+        if was is None and now is None:
+            continue
+        changes.append({"label": label, "was": was, "now": now,
+                        "delta": (None if was is None or now is None
+                                  else round(now - was, 2))})
+    if not changes:
+        return None
+    return {"since": prev["collected_at"], "until": cur["collected_at"],
+            "changes": changes}
+
+
+def pick_competitor(cfg, exclude_firm_id: str):
+    """Конкурент для сравнения — детерминированно и из общего слоя данных.
+
+    Топ-1 по рейтингу среди последних снимков той же категории того же города,
+    сама компания исключается. При равном рейтинге — больше оценок, затем
+    меньший firm_id: два прогона подряд дают один и тот же выбор.
+    """
+    conn = db.connect()
+    try:
+        pool = db.latest_snapshots_in(conn, cfg.city_slug, cfg.category)
+    finally:
+        conn.close()
+    cands = [r for r in pool
+             if r["firm_id"] != exclude_firm_id and r["rating"] is not None]
+    if not cands:
+        return None
+    best = sorted(cands, key=lambda r: (-r["rating"], -(r["ratings_count"] or 0),
+                                        r["firm_id"]))[0]
+    return company_from_snapshot(best)
+
+
+async def build_audit(firm_id: str, cfg, mode: str = "auto",
+                      max_age_hours: int = None, with_competitor: bool = None) -> tuple:
+    """Разбор компании: (HTML, Company, id снимка).
+
+    Данные гарантированно свежие (см. fresh_company) — иначе StaleDataError и
+    никакого HTML. Динамика добавляется, если есть предыдущий снимок.
+    """
+    c, sid = await fresh_company(firm_id, cfg, mode, max_age_hours)
+    show = SHOW_COMPETITOR if with_competitor is None else with_competitor
+    competitor = pick_competitor(cfg, firm_id) if show else None
+    html_out = render_audit_html(c, cfg, competitor=competitor,
+                                 dynamics=dynamics(firm_id, sid))
+    return html_out, c, sid
 
 
 def priority_counts(companies: list) -> dict:
@@ -479,6 +663,139 @@ if __name__ == "__main__":
         checks.append(("каскад: блок не лечится сменой способа", blocked_ok))
     finally:
         globals()["_one_way"] = real_one_way
+
+    # ============ свежесть данных, динамика, конкурент ============
+    # всё на временной БД и без сети: парсер подменяется фейком
+    with tempfile.TemporaryDirectory() as tmpdb:
+        real_db_path = db.DB_PATH
+        db.DB_PATH = Path(tmpdb) / "t.db"
+        real_fetch_one = fetch_one
+        fetched = []
+
+        def _mk(firm_id, name, rating, unans, neg_unans, ratings=1000, revs=700):
+            c = Company(firm_id=firm_id, name=name, category="стоматология",
+                        url=f"https://2gis.kz/kostanay/firm/{firm_id}",
+                        rating=rating, ratings_count=ratings, reviews_count=revs,
+                        unanswered_count=unans, negative_unanswered=neg_unans,
+                        negative_count=neg_unans, loaded_reviews=50, fresh_count=4,
+                        has_fresh_reviews=True, owner_responds=True,
+                        negative_without_response=False)
+            c.compute_priority()
+            return c
+
+        async def _fake_fetch_one(cfg, firm_id, mode="auto"):
+            fetched.append(firm_id)
+            return _mk(firm_id, "Свежая клиника", 5.0, 10, 9), "http"
+
+        cfg_k = LeadCfg(city="Костанай", category="стоматология", output_dir=tmpdb)
+        globals()["fetch_one"] = _fake_fetch_one
+        try:
+            # 1. снимка нет -> идём в сеть
+            c1, sid1 = asyncio.run(fresh_company("111", cfg_k))
+            checks.append(("свежесть: без снимка читаем карточку",
+                           fetched == ["111"] and c1.rating == 5.0))
+            checks.append(("свежесть: снимок записан", sid1 > 0))
+
+            # 2. снимок свежий -> сети быть не должно
+            fetched.clear()
+            c2, sid2 = asyncio.run(fresh_company("111", cfg_k))
+            checks.append(("свежесть: свежий снимок берётся без сети",
+                           fetched == [] and sid2 == sid1 and c2.rating == 5.0))
+            checks.append(("свежесть: числа снимка не потеряны",
+                           c2.ratings_count == 1000 and c2.reviews_count == 700
+                           and c2.unanswered_count == 10))
+
+            # 3. состарим снимок -> обязано перечитать
+            conn = db.connect()
+            old_ts = (datetime.now(timezone.utc) - timedelta(hours=40)).isoformat()
+            conn.execute("UPDATE lead_snapshots SET collected_at=? WHERE id=?",
+                         (old_ts, sid1))
+            conn.commit()
+            conn.close()
+            fetched.clear()
+            c3, sid3 = asyncio.run(fresh_company("111", cfg_k))
+            checks.append(("свежесть: устаревший снимок -> перечитали",
+                           fetched == ["111"] and sid3 != sid1))
+
+            # 4. динамика: было -> стало
+            dyn = dynamics("111", sid3)
+            checks.append(("динамика: есть предыдущий снимок",
+                           dyn is not None and dyn["since"] == old_ts))
+            rating_change = [ch for ch in dyn["changes"] if ch["label"] == "рейтинг"]
+            checks.append(("динамика: рейтинг было->стало",
+                           rating_change and rating_change[0]["was"] == 5.0
+                           and rating_change[0]["now"] == 5.0))
+
+            # 5. динамики нет, если снимок первый
+            fetched.clear()
+            _, sid_new = asyncio.run(fresh_company("222", cfg_k))
+            checks.append(("динамика: истории нет -> None",
+                           dynamics("222", sid_new) is None))
+
+            # 6. падение парсера -> разбор не рендерится
+            async def _boom(cfg, firm_id, mode="auto"):
+                raise FetchError("2ГИС не ответил")
+
+            globals()["fetch_one"] = _boom
+            conn = db.connect()
+            conn.execute("UPDATE lead_snapshots SET collected_at=?", (old_ts,))
+            conn.commit()
+            conn.close()
+            try:
+                asyncio.run(build_audit("111", cfg_k))
+                stale_ok = False
+            except StaleDataError as ex:
+                stale_ok = "не удалось получить свежие данные" in str(ex)
+            checks.append(("свежесть: парсинг упал -> StaleDataError, разбора нет",
+                           stale_ok))
+
+            # 7. конкурент выбирается детерминированно
+            globals()["fetch_one"] = _fake_fetch_one
+            conn = db.connect()
+            for fid, nm, rt, rc in (("aaa", "Топ-1", 4.9, 500),
+                                    ("bbb", "Топ-2", 4.9, 900),
+                                    ("ccc", "Слабый", 4.1, 100)):
+                comp = _mk(fid, nm, rt, 1, 1, ratings=rc, revs=rc)
+                db.add_lead_snapshot(conn, comp, "kostanay", "стоматология")
+            conn.close()
+            first = pick_competitor(cfg_k, "111")
+            second = pick_competitor(cfg_k, "111")
+            checks.append(("конкурент: выбор детерминирован",
+                           first is not None and second is not None
+                           and first.firm_id == second.firm_id))
+            checks.append(("конкурент: сама компания исключена",
+                           pick_competitor(cfg_k, "bbb").firm_id != "bbb"))
+            checks.append(("конкурент: рейтинг берётся из снимка (общий слой)",
+                           first.rating is not None and first.rating >= 4.9))
+
+            # тай-брейк при равном рейтинге — на отдельной категории,
+            # чтобы в пуле были только две сравниваемые компании
+            conn = db.connect()
+            for fid, nm, rc in (("bar1", "Бар-1", 500), ("bar2", "Бар-2", 900)):
+                db.add_lead_snapshot(conn, _mk(fid, nm, 4.9, 1, 1, ratings=rc, revs=rc),
+                                     "kostanay", "барбершоп")
+            conn.close()
+            cfg_b = LeadCfg(city="Костанай", category="барбершоп", output_dir=tmpdb)
+            checks.append(("конкурент: при равном рейтинге — больше оценок",
+                           pick_competitor(cfg_b, "zzz").firm_id == "bar2"))
+            checks.append(("конкурент: повторный вызов даёт тот же выбор",
+                           pick_competitor(cfg_b, "zzz").firm_id
+                           == pick_competitor(cfg_b, "zzz").firm_id))
+
+            # 8. блок конкурента по умолчанию выключен
+            checks.append(("конкурент: по умолчанию выключен", SHOW_COMPETITOR is False))
+            html_off, _, _ = asyncio.run(build_audit("111", cfg_k, max_age_hours=99999))
+            checks.append(("разбор: без флага блока сравнения нет",
+                           "Сравнение с конкурентом" not in html_off))
+            html_on, _, _ = asyncio.run(
+                build_audit("111", cfg_k, max_age_hours=99999, with_competitor=True))
+            checks.append(("разбор: с флагом блок появляется",
+                           "Сравнение с конкурентом" in html_on))
+            checks.append(("разбор: в подвале дата сбора",
+                           "данные собраны" in html_off.lower()))
+        finally:
+            globals()["fetch_one"] = real_fetch_one
+            db.DB_PATH = real_db_path
 
     ok = 0
     for label, passed in checks:

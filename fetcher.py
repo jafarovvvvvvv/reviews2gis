@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import metrics
 from lead_scoring import Company, NA
 
 # Ключ reviews-API, зашитый в бандл 2GIS. Стартовый — дальше подхватываем
@@ -37,9 +38,9 @@ from lead_scoring import Company, NA
 DEFAULT_REVIEW_KEY = "6e7e1929-4ea9-4a5d-8c05-d601860389bd"
 DEFAULT_API_BASE = "https://public-api.reviews.2gis.com/3.0/"
 
-FRESH_DAYS = 30          # «свежий» отзыв — за последние 30 дней
-NEGATIVE_RATING_MAX = 3  # оценка <=3 считается негативной
-TOP_N = 5                # «топ-5» отзывов (новейших) для проверки негатива без ответа
+# Определения «негатив»/«без ответа»/окно и все подсчёты по отзывам — в
+# metrics.py (единый слой). Здесь их больше нет: раньше те же правила были
+# продублированы в tg.py и insights.py и разъезжались.
 
 # Таймауты: карточка отдаётся за ~0.6 с, 20 с с запасом хватает всем.
 # (У браузера стояло 60 с — и он всё равно не успевал.)
@@ -130,10 +131,24 @@ def _meta(html: str, prop: str) -> str | None:
 def parse_card_html(html: str) -> dict:
     """HTML карточки -> поля. Ничего не бросает: чего нет, то None.
 
-    Возвращает {name, category, rating, reviews_count, phone, website,
-                key, api_base}.
+    Рейтинг и счётчики берутся из инлайн-JSON карточки — это ровно те числа,
+    что видит человек на странице 2ГИС:
+
+        "reviews":{"general_rating":5,              -> rating (филиал)
+                   "general_review_count":778,       -> reviews_count (тексты)
+                   "general_review_count_with_stars":1174,  -> ratings_count
+                   "org_rating":4.9,                 -> рейтинг всей сети
+                   "org_review_count":967,
+                   "org_review_count_with_stars":1452}
+
+    Различать их обязательно: 2ГИС считает рейтинг по ОЦЕНКАМ (1174), а не по
+    текстовым отзывам (778), и у сети из нескольких филиалов рейтинг другой
+    (4.9 против 5.0 у филиала). Раньше всё это сваливалось в два поля и
+    расходилось между таблицей и разбором.
     """
     out = {"name": None, "category": None, "rating": None, "reviews_count": None,
+           "ratings_count": None, "org_rating": None, "org_reviews_count": None,
+           "org_ratings_count": None, "branches_count": None,
            "phone": None, "website": None, "key": None, "api_base": None}
 
     title = _meta(html, "og:title")
@@ -152,6 +167,28 @@ def parse_card_html(html: str) -> dict:
         mc = re.search(r"(\d+)\s+отзыв", desc)
         if mc:
             out["reviews_count"] = int(mc.group(1))
+
+    # Инлайн-JSON карточки — авторитетнее og:*: только он различает оценки и
+    # текстовые отзывы и даёт цифры всей сети. Перезаписывает og-значения.
+    def _num(pat, cast):
+        m = re.search(pat, html)
+        return cast(m.group(1)) if m else None
+
+    for key, pat, cast in (
+            ("rating", r'"general_rating":\s*([\d.]+)', float),
+            ("reviews_count", r'"general_review_count":\s*(\d+)', int),
+            ("ratings_count", r'"general_review_count_with_stars":\s*(\d+)', int),
+            ("org_rating", r'"org_rating":\s*([\d.]+)', float),
+            ("org_reviews_count", r'"org_review_count":\s*(\d+)', int),
+            ("org_ratings_count", r'"org_review_count_with_stars":\s*(\d+)', int)):
+        val = _num(pat, cast)
+        if val is not None:
+            out[key] = val
+
+    # «2 филиала» рядом со ссылкой /branches/<id> — сколько всего точек у сети
+    mb = re.search(r'/branches/\d+[^>]*>\s*(\d+)\s+филиал', html)
+    if mb:
+        out["branches_count"] = int(mb.group(1))
 
     mk = re.search(r'"reviewApiKey":"([0-9a-f-]{36})"', html)
     if mk:
@@ -214,73 +251,64 @@ def extract_firm_ids(html: str) -> list:
     return list(dict.fromkeys(FIRM_ID_RE.findall(html or "")))
 
 
-def _created(r: dict) -> datetime:
-    try:
-        return datetime.fromisoformat(r["date_created"])
-    except Exception:
-        return datetime.min.replace(tzinfo=timezone.utc)
-
-
 def apply_reviews(c: Company, data: dict | None, now: datetime | None = None):
-    """Ответ reviews-API -> поля Company (рейтинг, свежесть, негатив, цитаты).
+    """Ответ reviews-API -> поля Company.
 
-    data=None — отзывы не получены: рейтинг/кол-во из og:* остаются как есть,
-    review-флаги — None (н/д).
+    Рейтинг НИКОГДА не вычисляется по отзывам: он приходит от 2ГИС (карточка
+    или meta.branch_rating). Средний балл по нашей выборке — не тот рейтинг,
+    что показывает 2ГИС: тот считается по подтверждённым оценкам, которых
+    больше, чем текстовых отзывов.
+
+    Все счётчики считает metrics.review_stats — один код на всех потребителей.
+    data=None — отзывы не получены: рейтинг/счётчики карточки остаются, флаги
+    по отзывам — None (нет данных).
     """
     if data is None:
         return
-    now = now or datetime.now(timezone.utc)
 
     meta = data.get("meta") or {}
-    if meta.get("branch_rating") is not None:
+    # Карточка авторитетнее API: там ровно те числа, что видит человек.
+    # Из API берём только то, чего карточка не дала.
+    if c.rating is None and meta.get("branch_rating") is not None:
         c.rating = meta["branch_rating"]
-    if meta.get("branch_reviews_count") is not None:
+    if c.reviews_count is None and meta.get("branch_reviews_count") is not None:
         c.reviews_count = meta["branch_reviews_count"]
+    if meta.get("branch_rating_is_confirmed") is not None:
+        # «рейтинг на основе подтверждённых оценок» — так 2ГИС метит карточку
+        c.rating_confirmed = bool(meta["branch_rating_is_confirmed"])
 
-    reviews = data.get("reviews") or []
-    if not reviews:
-        c.has_fresh_reviews = False
-        c.owner_responds = None
-        c.negative_without_response = None
-        c.loaded_reviews = 0
-        c.unanswered_count = 0
-        c.negative_unanswered = 0
-        c.fresh_count = 0
-        return
+    st = metrics.review_stats(data.get("reviews") or [], now)
+    c.loaded_reviews = st.loaded
+    c.unanswered_count = st.unanswered
+    c.negative_count = st.negative
+    c.negative_unanswered = st.negative_unanswered
+    c.fresh_count = st.fresh
+    c.has_fresh_reviews = st.has_fresh
+    c.owner_responds = st.owner_responds
+    c.negative_without_response = st.negative_in_top
+    c.last_review_date = st.last_date
+    c.worst_reviews = st.worst
 
-    # сортируем сами — не зависим от серверной сортировки
-    reviews.sort(key=_created, reverse=True)
 
-    c.has_fresh_reviews = (now - _created(reviews[0])) <= timedelta(days=FRESH_DAYS)
-    c.owner_responds = any(r.get("official_answer") for r in reviews)
-    c.negative_without_response = any(
-        (r.get("rating") or 5) <= NEGATIVE_RATING_MAX and not r.get("official_answer")
-        for r in reviews[:TOP_N])
+def apply_card_fields(c: Company, fields: dict):
+    """Разобранные поля карточки -> Company. Общий код для HTTP и браузера.
 
-    c.loaded_reviews = len(reviews)
-    c.unanswered_count = sum(1 for r in reviews if not r.get("official_answer"))
-    c.negative_unanswered = sum(
-        1 for r in reviews
-        if (r.get("rating") or 5) <= NEGATIVE_RATING_MAX and not r.get("official_answer"))
-    c.fresh_count = sum(1 for r in reviews
-                        if (now - _created(r)) <= timedelta(days=FRESH_DAYS))
-    c.last_review_date = _created(reviews[0]).date().isoformat()
-
-    # худшие отзывы (цитаты для аудита): самые низкие оценки, при равенстве — новее
-    worst = sorted(reviews, key=lambda r: ((r.get("rating") or 5), -_created(r).timestamp()))
-    c.worst_reviews = []
-    for r in worst:
-        if (r.get("rating") or 5) > NEGATIVE_RATING_MAX:
-            break
-        text = re.sub(r"\s+", " ", (r.get("text") or "")).strip()
-        c.worst_reviews.append({
-            "rating": r.get("rating"),
-            "date": _created(r).date().isoformat(),
-            "text": (text[:220] + "…") if len(text) > 220 else text,
-            "answered": bool(r.get("official_answer")),
-        })
-        if len(c.worst_reviews) >= 3:
-            break
+    Числа кладутся по назначению: оценки отдельно от текстовых отзывов,
+    сеть отдельно от филиала. Ничего не вычисляется.
+    """
+    if fields.get("name"):
+        c.name = fields["name"]
+    if fields.get("category"):
+        c.category = fields["category"]
+    for attr in ("rating", "ratings_count", "reviews_count",
+                 "org_rating", "org_reviews_count", "org_ratings_count",
+                 "branches_count"):
+        if fields.get(attr) is not None:
+            setattr(c, attr, fields[attr])
+    if fields.get("phone"):
+        c.phone = fields["phone"]
+    if fields.get("website"):
+        c.website = fields["website"]
 
 
 def looks_blocked(body: str, status: int = 200) -> bool:
@@ -436,16 +464,7 @@ class HttpFetcher:
             html = await self._fetch_card_html(c.url)
             fields = parse_card_html(html)
             remember_key(fields["key"], fields["api_base"])
-            if fields["name"]:
-                c.name = fields["name"]
-            if fields["category"]:
-                c.category = fields["category"]
-            if fields["rating"] is not None:
-                c.rating = fields["rating"]
-            if fields["reviews_count"] is not None:
-                c.reviews_count = fields["reviews_count"]
-            c.phone = fields["phone"] or NA
-            c.website = fields["website"] or NA
+            apply_card_fields(c, fields)
         except BlockedError:
             raise
         except Exception as e:
@@ -460,6 +479,9 @@ class HttpFetcher:
             raise FetchError(card_err or "ни карточка, ни отзывы не прочитались")
 
         apply_reviews(c, data)
+        # момент сбора: разбор печатает его как «данные собраны …», а слой
+        # свежести по нему решает, не пора ли перечитать карточку
+        c.collected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         c.compute_priority()
         return c
 
@@ -563,6 +585,40 @@ if __name__ == "__main__":
     checks.append(("html: инстаграм", "instagram.com/demokrat_almaty" in (f["website"] or "")))
     checks.append(("html: трекер отброшен", "facebook.com/tr" not in (f["website"] or "")))
 
+    CARD_JSON = (
+        '<meta property="og:title" content="DoctorDos, стоматология — 2ГИС">'
+        '<meta property="og:description" content="Оценка 5, 42 фото, 778 отзывов.">'
+        '<script>{"reviews":{"general_rating":5,"general_review_count":778,'
+        '"general_review_count_with_stars":1174,"is_reviewable":false,'
+        '"org_rating":4.9,"org_review_count":967,"org_review_count_with_stars":1452}}'
+        '</script>'
+        '<span><a href="/kostanaj/branches/70000001037223551" class="_x">2 филиала</a></span>'
+    )
+    j = parse_card_html(CARD_JSON)
+    checks.append(("карточка: рейтинг филиала из JSON", j["rating"] == 5.0))
+    checks.append(("карточка: оценки отдельно от отзывов",
+                   j["ratings_count"] == 1174 and j["reviews_count"] == 778))
+    checks.append(("карточка: числа сети отдельно",
+                   j["org_rating"] == 4.9 and j["org_reviews_count"] == 967
+                   and j["org_ratings_count"] == 1452))
+    checks.append(("карточка: количество филиалов", j["branches_count"] == 2))
+    checks.append(("карточка: счётчик отзывов не спутан с оценками",
+                   j["reviews_count"] != j["ratings_count"]))
+
+    cj = Company()
+    apply_card_fields(cj, j)
+    checks.append(("поля карточки -> Company",
+                   cj.rating == 5.0 and cj.ratings_count == 1174
+                   and cj.reviews_count == 778 and cj.branches_count == 2))
+
+    # ЗАПРЕТ САМОСТОЯТЕЛЬНОГО РЕЙТИНГА: средний балл по отзывам не должен
+    # попасть ни в rating, ни в org_rating (у DoctorDos это 4.34 против 5.0)
+    low = [{"id": i, "rating": 4, "date_created": "2026-08-30T10:00:00+00:00",
+            "text": "ок", "official_answer": None} for i in range(10)]
+    apply_reviews(cj, {"meta": {}, "reviews": low})
+    checks.append(("рейтинг не пересчитан по отзывам (среднее 4.0 не подставилось)",
+                   cj.rating == 5.0 and cj.org_rating == 4.9))
+
     empty = parse_card_html("<html><body>ничего</body></html>")
     checks.append(("html: пустой не падает",
                    empty["name"] is None and empty["rating"] is None))
@@ -610,6 +666,20 @@ if __name__ == "__main__":
     apply_reviews(c3, None, now=NOW)
     checks.append(("reviews: None не затирает", c3.rating == 4.0
                    and c3.has_fresh_reviews is None))
+
+    c_api = Company()
+    apply_reviews(c_api, {"meta": {"branch_rating": 4.2, "branch_reviews_count": 120,
+                                   "branch_rating_is_confirmed": True},
+                          "reviews": [rv(2, 5)]}, now=NOW)
+    checks.append(("API: рейтинг взят, когда карточка молчит",
+                   c_api.rating == 4.2 and c_api.reviews_count == 120))
+    checks.append(("API: флаг подтверждённых оценок", c_api.rating_confirmed is True))
+
+    c_card = Company(rating=5.0, reviews_count=778, ratings_count=1174)
+    apply_reviews(c_card, {"meta": {"branch_rating": 4.2, "branch_reviews_count": 120},
+                           "reviews": [rv(2, 5)]}, now=NOW)
+    checks.append(("API не затирает числа карточки",
+                   c_card.rating == 5.0 and c_card.reviews_count == 778))
 
     c4 = Company()
     apply_reviews(c4, {"reviews": [rv(1, 5), rv(300, 4)]}, now=NOW)
