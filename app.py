@@ -25,7 +25,6 @@ import sys
 import time
 import urllib.parse
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -387,10 +386,9 @@ def render_dynamics_card(history, reviews) -> str:
     """Карточка «Динамика»: графики рейтинга/числа отзывов, распределение, % ответов.
     Общая для страницы компании и кабинета клиента."""
     def short_date(iso):
-        try:
-            return datetime.fromisoformat(iso).strftime("%d.%m")
-        except (ValueError, TypeError):
-            return ""
+        # часовой пояс проекта: точка, снятая под вечер по Астане, не должна
+        # переехать на день раньше только потому, что в UTC это ещё вчера
+        return metrics.fmt_local(iso, fmt="%d.%m", empty="")
     rating_pts = [(short_date(h["ts"]), h["rating"]) for h in history]
     count_pts = [(short_date(h["ts"]), h["reviews_count"]) for h in history]
     rating_chart = svg_line_chart(rating_pts, color="#1E7A46", force_min=3.0,
@@ -453,12 +451,10 @@ def redirect(url: str, msg: str = "", err: str = "") -> RedirectResponse:
 
 
 def fmt_dt(iso: str) -> str:
-    if not iso:
-        return "—"
-    try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%d.%m %H:%M")
-    except ValueError:
-        return iso
+    # metrics.fmt_local — часовой пояс проекта (UTC+5, Астана), а не системное
+    # время сервера. Раньше .astimezone() без аргументов брала его у сервера
+    # (Docker-контейнер живёт в UTC) — панель показывала время по Гринвичу.
+    return metrics.fmt_local(iso, fmt="%d.%m %H:%M", empty="—")
 
 
 def tg_status_line(conn) -> str:

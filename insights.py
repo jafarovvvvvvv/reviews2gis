@@ -332,7 +332,7 @@ ol li{margin:8px 0}
 def render_report_html(company_name: str, industry: str, agg: dict, summary: dict,
                        dynamics: list, reviews_used: int, brand: str = "") -> str:
     e = html.escape
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = metrics.now_local().strftime("%d.%m.%Y")  # Астана (UTC+5), не сервер (UTC)
 
     theme_rows = []
     for theme, v in list(agg["themes"].items())[:TOP_THEMES]:
