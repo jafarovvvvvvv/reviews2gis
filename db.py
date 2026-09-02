@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS lead_snapshots(
   unanswered_fresh    INTEGER,
   negative_count      INTEGER,
   negative_unanswered INTEGER,
+  response_rate       REAL,                   -- доля отзывов в окне с ответом; None = окно пустое
   fresh_count         INTEGER,
   priority            TEXT NOT NULL DEFAULT '',
   priority_reason     TEXT NOT NULL DEFAULT '',
@@ -150,6 +151,9 @@ def _migrate(conn):
     snap_cols = {r["name"] for r in conn.execute("PRAGMA table_info(lead_snapshots)")}
     if snap_cols and "unanswered_fresh" not in snap_cols:
         conn.execute("ALTER TABLE lead_snapshots ADD COLUMN unanswered_fresh INTEGER")
+        conn.commit()
+    if snap_cols and "response_rate" not in snap_cols:
+        conn.execute("ALTER TABLE lead_snapshots ADD COLUMN response_rate REAL")
         conn.commit()
     if "cabinet_nonce" not in cols:
         # nonce — для отзыва ссылки кабинета; enabled — включён ли кабинет
@@ -424,7 +428,8 @@ def mark_auto(conn, company_id: int, kind: str):
 SNAPSHOT_FIELDS = ("rating", "rating_confirmed", "ratings_count", "reviews_count",
                    "branch_scope", "branches_count", "org_rating", "loaded_reviews",
                    "unanswered_count", "unanswered_fresh", "negative_count",
-                   "negative_unanswered", "fresh_count", "priority", "priority_reason")
+                   "negative_unanswered", "response_rate", "fresh_count",
+                   "priority", "priority_reason")
 
 
 def add_lead_snapshot(conn, c, city_slug: str = "", category: str = "") -> int:
@@ -660,8 +665,8 @@ if __name__ == "__main__":
         snap_c = Company(firm_id="777", name="Тест-клиника", rating=5.0,
                          ratings_count=1174, reviews_count=778, branches_count=2,
                          unanswered_count=10, negative_unanswered=9, negative_count=9,
-                         fresh_count=4, has_fresh_reviews=True, owner_responds=True,
-                         collected_at="2026-09-01T07:00:00+00:00")
+                         response_rate=0.82, fresh_count=4, has_fresh_reviews=True,
+                         owner_responds=True, collected_at="2026-09-01T07:00:00+00:00")
         snap_c.compute_priority()
         sid1 = add_lead_snapshot(conn, snap_c, "kostanay", "стоматология")
         checks.append(("снимок: сохранён", sid1 > 0))
@@ -671,6 +676,8 @@ if __name__ == "__main__":
                        and last["reviews_count"] == 778))
         checks.append(("снимок: оценки и отзывы не перепутаны",
                        last["ratings_count"] != last["reviews_count"]))
+        checks.append(("снимок: response_rate сохранён и не спутан с unanswered_count",
+                       last["response_rate"] == 0.82 and last["unanswered_count"] == 10))
         checks.append(("снимок: дата сбора сохранена",
                        last["collected_at"] == "2026-09-01T07:00:00+00:00"))
         checks.append(("снимок: причина приоритета сохранена",

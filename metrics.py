@@ -6,10 +6,12 @@
 «негатив» и «без ответа» были продублированы в fetcher.py, tg.py, insights.py
 и monitor.py, а окна выборки различались. Теперь определение одно:
 
-    negative   = оценка <= NEGATIVE_MAX (3)
-    unanswered = нет official_answer
-    окно       = WINDOW (50 новейших отзывов) — ОДНО на все счётчики,
-                 подписывается в тексте разбора словами WINDOW_LABEL
+    negative      = оценка <= NEGATIVE_MAX (3)
+    unanswered    = нет official_answer
+    response_rate = доля отзывов В ОКНЕ с official_answer (обратное unanswered);
+                    отзывов в окне нет -> None, а не 0 — это разные факты
+    окно          = WINDOW (50 новейших отзывов) — ОДНО на все счётчики,
+                    подписывается в тексте разбора словами WINDOW_LABEL
 
 Рейтинг здесь НЕ вычисляется: 2ГИС считает его по подтверждённым ОЦЕНКАМ
 (general_review_count_with_stars, у DoctorDos их 1174), а не по текстовым
@@ -86,6 +88,7 @@ class ReviewStats:
     negative: int = 0               # из них негативных (<=3)
     negative_unanswered: int = 0    # негативных без ответа
     unanswered_fresh: int = 0       # без ответа среди свежих (за FRESH_DAYS)
+    response_rate: Optional[float] = None   # доля с ответом в окне; окно пустое -> None
     fresh: int = 0                  # за последние FRESH_DAYS
     has_fresh: Optional[bool] = None        # есть ли отзыв за FRESH_DAYS
     owner_responds: Optional[bool] = None   # есть ли хоть один ответ владельца
@@ -119,6 +122,9 @@ def review_stats(reviews: list, now: datetime = None) -> ReviewStats:
     st.negative = sum(1 for r in window if is_negative(r.get("rating")))
     st.negative_unanswered = sum(1 for r in window
                                  if is_negative(r.get("rating")) and is_unanswered(r))
+    # окно непустое (мы уже вышли из `if not reviews` выше) -> loaded >= 1,
+    # деление безопасно; пустое окно оставляет response_rate дефолтным None
+    st.response_rate = (st.loaded - st.unanswered) / st.loaded
     st.fresh = sum(1 for r in window
                    if (now - review_created(r)) <= timedelta(days=FRESH_DAYS))
     st.unanswered_fresh = sum(
@@ -151,7 +157,7 @@ NUMBER_FIELDS = ("rating", "rating_confirmed", "ratings_count", "reviews_count",
                  "branch_scope", "branches_count", "org_rating", "org_reviews_count",
                  "org_ratings_count", "loaded_reviews", "unanswered_count",
                  "unanswered_fresh", "negative_count", "negative_unanswered",
-                 "fresh_count", "has_fresh_reviews", "owner_responds",
+                 "response_rate", "fresh_count", "has_fresh_reviews", "owner_responds",
                  "negative_without_response", "last_review_date", "collected_at",
                  "priority", "priority_reason")
 
@@ -173,6 +179,12 @@ def fmt_rating(r) -> str:
 
 def fmt_int(v) -> str:
     return NA if v is None else str(v)
+
+
+def fmt_pct(v) -> str:
+    """0.625 -> «63%»; None -> «н/д». Форматирование, не вычисление —
+    response_rate сам по себе считается один раз в review_stats."""
+    return NA if v is None else f"{round(v * 100)}%"
 
 
 def unanswered_note(c) -> str:
@@ -252,6 +264,7 @@ if __name__ == "__main__":
     checks.append(("счётчики: негатив в топ-5", st.negative_in_top is True))
     checks.append(("счётчики: дата последнего", st.last_date == "2026-08-31"))
     checks.append(("счётчики: без ответа среди свежих", st.unanswered_fresh == 3))
+    checks.append(("счётчики: response_rate = доля с ответом", st.response_rate == 0.2))
 
     # --- цитаты: только негатив БЕЗ ОТВЕТА, свежие сверху ---
     quoted = review_stats([rv(1, 2, {"text": "ответили"}), rv(3, 1), rv(10, 2),
@@ -285,6 +298,8 @@ if __name__ == "__main__":
     checks.append(("счётчики: пусто — свежих нет, счётчики нули",
                    empty.has_fresh is False and empty.loaded == 0
                    and empty.unanswered == 0))
+    checks.append(("response_rate: пустое окно -> None, а не 0",
+                   empty.response_rate is None))
 
     big = review_stats([rv(i % 30, 5) for i in range(120)], now=NOW)
     checks.append((f"окно: не больше {WINDOW} отзывов", big.loaded == WINDOW))
@@ -292,10 +307,19 @@ if __name__ == "__main__":
     mixed = review_stats([rv(1, 1) for _ in range(60)], now=NOW)
     checks.append(("окно: счётчики тоже обрезаны окном",
                    mixed.unanswered == WINDOW and mixed.negative == WINDOW))
+    checks.append(("response_rate: все без ответа -> 0.0, не None",
+                   mixed.response_rate == 0.0))
+
+    all_answered = review_stats([rv(i, 5, {"text": "ok"}) for i in range(1, 6)], now=NOW)
+    checks.append(("response_rate: все отвечены -> 1.0",
+                   all_answered.response_rate == 1.0))
 
     checks.append(("формат: рейтинг по-русски", fmt_rating(4.9) == "4,9"
                    and fmt_rating(5.0) == "5,0" and fmt_rating(None) == NA))
     checks.append(("формат: число", fmt_int(0) == "0" and fmt_int(None) == NA))
+    checks.append(("формат: доля в процентах", fmt_pct(0.2) == "20%"
+                   and fmt_pct(0.627) == "63%" and fmt_pct(0.0) == "0%"
+                   and fmt_pct(None) == NA))
 
     # --- подпись к «без ответа»: числа названы своими именами ---
     class _C:
@@ -341,6 +365,15 @@ if __name__ == "__main__":
 
     checks.append(("окно: берётся из конфига (REVIEW_WINDOW)",
                    WINDOW == max(1, int(os.getenv("REVIEW_WINDOW") or 50))))
+
+    class _C2:
+        response_rate = 0.63
+
+        def __getattr__(self, name):
+            return None
+
+    checks.append(("company_numbers: response_rate проходит через единый слой",
+                   company_numbers(_C2())["response_rate"] == 0.63))
 
     ok = 0
     for label, passed in checks:
