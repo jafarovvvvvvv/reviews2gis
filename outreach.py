@@ -179,16 +179,10 @@ blockquote .meta{color:#888;font-size:.85em}
 
 
 def fmt_collected(iso) -> str:
-    """ISO-момент сбора -> «01.09.2026, 07:28». Пусто -> «дата неизвестна»."""
-    if not iso:
-        return "дата неизвестна"
-    try:
-        dt = datetime.fromisoformat(iso)
-    except (TypeError, ValueError):
-        return str(iso)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt.strftime("%d.%m.%Y, %H:%M")
+    """ISO-момент сбора -> «02.09.2026, 09:28» по Астане (UTC+5), не по Гринвичу.
+
+    Пусто -> «дата неизвестна»."""
+    return metrics.fmt_local(iso, empty="дата неизвестна")
 
 
 def render_dynamics_block(dyn) -> str:
@@ -371,7 +365,7 @@ function copyMsg(id, btn){
 def render_dashboard_html(rows: list, cfg) -> str:
     """rows: список dict(c, message, wa, audit_file)."""
     e = html.escape
-    today = datetime.now().strftime("%d.%m.%Y %H:%M")
+    today = metrics.now_local().strftime("%d.%m.%Y %H:%M")
     warn = ("" if cfg.sender_name else
             '<div class="warn">⚠️ SENDER_NAME в .env не заполнен — в сообщениях стоит '
             'заглушка [Имя]. Заполните и перезапустите, либо правьте при отправке.</div>')

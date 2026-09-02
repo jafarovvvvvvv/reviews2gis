@@ -42,6 +42,42 @@ WINDOW_LABEL = f"последние {WINDOW} отзывов"
 
 MAX_QUOTES = 3         # сколько цитат негатива показывать в разборе
 
+# Часовой пояс, в котором показываются все даты/время пользователю. Казахстан
+# с 2024 года живёт по единому UTC+5 без перевода стрелок — фиксированный
+# оффсет, а не имя из tzdata: сервер крутится в Docker-контейнере с системным
+# временем UTC (Etc/UTC), и IANA-имя ("Asia/Almaty") зависело бы от того,
+# поставлен ли на сервере пакет tzdata. Раньше .astimezone() без аргументов
+# и голый datetime.now() брали системное время сервера — Гринвич, а не Астану.
+LOCAL_TZ = timezone(timedelta(hours=5))
+
+
+def to_local(dt: datetime) -> datetime:
+    """Datetime -> часовой пояс проекта (UTC+5). Наивную (без tzinfo) считаем
+    UTC — так на сервере хранятся все свои метки времени (db.now_iso() и т.п.),
+    поэтому это не допущение, а факт про формат хранения."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ)
+
+
+def fmt_local(iso, fmt: str = "%d.%m.%Y, %H:%M", empty: str = "н/д") -> str:
+    """ISO-строка (любая зона или наивная) -> текст в часовом поясе проекта.
+    Не считает ничего числового — то же форматирование, что fmt_rating и т.п.
+    """
+    if not iso:
+        return empty
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return str(iso)
+    return to_local(dt).strftime(fmt)
+
+
+def now_local() -> datetime:
+    """Текущий момент в часовом поясе проекта — для «собрано …», «подготовлено …»."""
+    return datetime.now(timezone.utc).astimezone(LOCAL_TZ)
+
+
 NA = "н/д"
 
 # область данных: филиал или вся сеть
@@ -134,7 +170,10 @@ def review_stats(reviews: list, now: datetime = None) -> ReviewStats:
     st.owner_responds = any(not is_unanswered(r) for r in window)
     st.negative_in_top = any(is_negative(r.get("rating")) and is_unanswered(r)
                              for r in window[:TOP_N])
-    st.last_date = review_created(window[0]).date().isoformat()
+    # 2ГИС ставит отзывам метку +07:00 (свой часовой пояс, не пользовательский) —
+    # календарная дата берётся уже после перевода в Астану, иначе отзыв поздним
+    # вечером мог показать вчерашнее число
+    st.last_date = to_local(review_created(window[0])).date().isoformat()
 
     # Цитаты: негатив БЕЗ ОТВЕТА, свежие сверху, не больше MAX_QUOTES.
     # Отвеченные негативные отзывы отсеиваются здесь, а не в шаблоне.
@@ -144,7 +183,7 @@ def review_stats(reviews: list, now: datetime = None) -> ReviewStats:
     for r in unanswered_negative[:MAX_QUOTES]:
         text = re.sub(r"\s+", " ", (r.get("text") or "")).strip()
         st.negative_quotes.append({"rating": r.get("rating"),
-                                   "date": review_created(r).date().isoformat(),
+                                   "date": to_local(review_created(r)).date().isoformat(),
                                    "text": (text[:220] + "…") if len(text) > 220 else text})
     return st
 
@@ -263,6 +302,23 @@ if __name__ == "__main__":
     checks.append(("счётчики: владелец отвечает", st.owner_responds is True))
     checks.append(("счётчики: негатив в топ-5", st.negative_in_top is True))
     checks.append(("счётчики: дата последнего", st.last_date == "2026-08-31"))
+
+    # 2ГИС ставит отзывам метку +07:00 (свой пояс), а не +05:00 (Астана):
+    # отзыв поздним вечером по Астане не должен показаться следующим днём
+    late_almaty = review_stats(
+        [{"id": "late", "rating": 1,
+          "date_created": "2026-08-31T23:30:00+05:00",  # 23:30 в Астане, 01:30 +07:00
+          "text": "поздний", "official_answer": None}], now=NOW)
+    checks.append(("счётчики: дата последнего — по Астане, не по метке 2ГИС",
+                   late_almaty.last_date == "2026-08-31"))
+    late_2gis_offset = review_stats(
+        [{"id": "late2", "rating": 1,
+          "date_created": "2026-09-01T01:30:00+07:00",  # тот же момент, метка 2ГИС
+          "text": "поздний", "official_answer": None}], now=NOW)
+    checks.append(("счётчики: дата не съезжает из-за пояса 2ГИС (+07:00)",
+                   late_2gis_offset.last_date == "2026-08-31"))
+    checks.append(("цитаты: дата тоже переведена в Астану",
+                   late_2gis_offset.negative_quotes[0]["date"] == "2026-08-31"))
     checks.append(("счётчики: без ответа среди свежих", st.unanswered_fresh == 3))
     checks.append(("счётчики: response_rate = доля с ответом", st.response_rate == 0.2))
 
@@ -374,6 +430,28 @@ if __name__ == "__main__":
 
     checks.append(("company_numbers: response_rate проходит через единый слой",
                    company_numbers(_C2())["response_rate"] == 0.63))
+
+    # --- часовой пояс: UTC+5, а не системное время сервера (Гринвич) ---
+    checks.append(("часовой пояс: смещение UTC+5",
+                   LOCAL_TZ.utcoffset(None) == timedelta(hours=5)))
+    aware = datetime(2026, 9, 1, 20, 0, 0, tzinfo=timezone.utc)  # 01:00 02.09 в Астане
+    checks.append(("to_local: aware UTC -> Астана",
+                   to_local(aware) == datetime(2026, 9, 2, 1, 0, tzinfo=LOCAL_TZ)))
+    naive = datetime(2026, 9, 1, 20, 0, 0)  # naive-время в проекте — всегда UTC
+    checks.append(("to_local: наивное время считается UTC, не системным",
+                   to_local(naive) == to_local(aware)))
+    checks.append(("to_local: переход через полночь виден",
+                   to_local(aware).day == 2))  # 20:00 UTC 01.09 -> 01:00 UTC+5 02.09
+    checks.append(("fmt_local: дата и время в Астане",
+                   fmt_local("2026-09-01T20:00:00+00:00") == "02.09.2026, 01:00"))
+    checks.append(("fmt_local: свой формат", fmt_local(
+        "2026-09-01T20:00:00+00:00", fmt="%d.%m") == "02.09"))
+    checks.append(("fmt_local: пусто -> NA по умолчанию", fmt_local(None) == NA))
+    checks.append(("fmt_local: свой текст для пустого",
+                   fmt_local(None, empty="дата неизвестна") == "дата неизвестна"))
+    checks.append(("fmt_local: мусор не роняет", fmt_local("не дата") == "не дата"))
+    checks.append(("now_local: в часовом поясе проекта",
+                   now_local().utcoffset() == timedelta(hours=5)))
 
     ok = 0
     for label, passed in checks:
