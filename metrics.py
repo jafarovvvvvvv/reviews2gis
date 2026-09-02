@@ -47,6 +47,19 @@ SCOPE_BRANCH = "филиал"
 SCOPE_ORG = "все филиалы"
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Русское склонение: plural(3, 'отзыв', 'отзыва', 'отзывов') -> 'отзыва'.
+
+    Живёт здесь, а не в outreach.py: любая подпись, где печатается число
+    (включая unanswered_note ниже), должна брать склонение из того же места,
+    что и сами числа."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
 def is_negative(rating) -> bool:
     """Негатив = оценка <= NEGATIVE_MAX. None (нет оценки) негативом не считаем."""
     return rating is not None and rating <= NEGATIVE_MAX
@@ -163,26 +176,34 @@ def fmt_int(v) -> str:
 
 
 def unanswered_note(c) -> str:
-    """Подпись к числу «без ответа»: из какого окна и что внутри него.
+    """Подпись к числу «без ответа»: та же цифра, что и в шапке, плюс что в ней.
 
-    Одно число (unanswered_count) — одна подпись. Второе число (негатив) и
-    третье (свежие) называются своими словами, а не прячутся под той же
-    подписью: «19 без ответа из последних 50 отзывов (всего 204),
-    из них 14 негативных и 5 за последние 30 дней».
+    Число (unanswered_count) названо явно в начале фразы, а не подразумевается
+    по соседству с другим числом — раньше подпись читалась как
+    «…всего у компании 204, из них 14 негативных», и было неясно, «из них»
+    относится к 19 (без ответа) или к 204 (всего у компании), потому что «из
+    них» стояло сразу после 204. Теперь у каждого числа — своя фраза:
+
+        «19 без ответа из последних 50 отзывов, 14 из них — негативные,
+        5 — за последние 30 дней. Всего у компании 204 отзыва.»
     """
     n = company_numbers(c)
-    if n["unanswered_count"] is None:
+    unanswered = n["unanswered_count"]
+    if unanswered is None:
         return ""
-    parts = [f"из {WINDOW_LABEL.replace('последние', 'последних')}"]
-    if n["reviews_count"] is not None:
-        parts.append(f"всего у компании {n['reviews_count']}")
+    note = f"{unanswered} без ответа из {WINDOW_LABEL.replace('последние', 'последних')}"
     tail = []
     if n["negative_unanswered"]:
-        tail.append(f"{n['negative_unanswered']} негативных")
+        tail.append(f"{n['negative_unanswered']} из них — негативные")
     if n["unanswered_fresh"]:
-        tail.append(f"{n['unanswered_fresh']} за последние {FRESH_DAYS} дней")
-    note = " · ".join(parts)
-    return note + (f" · из них {' и '.join(tail)}" if tail else "")
+        tail.append(f"{n['unanswered_fresh']} — за последние {FRESH_DAYS} дней")
+    if tail:
+        note += ", " + ", ".join(tail)
+    note += "."
+    if n["reviews_count"] is not None:
+        rc = n["reviews_count"]
+        note += f" Всего у компании {rc} {plural(rc, 'отзыв', 'отзыва', 'отзывов')}."
+    return note
 
 
 def scope_note(c) -> str:
@@ -287,13 +308,36 @@ if __name__ == "__main__":
             return None
 
     note = unanswered_note(_C())
+    checks.append(("подпись: число без ответа названо явно в начале",
+                   note.startswith("19 без ответа")))
     checks.append(("подпись: указано окно", f"последних {WINDOW}" in note))
-    checks.append(("подпись: всего отзывов у компании", "всего у компании 204" in note))
-    checks.append(("подпись: негатив назван отдельно", "14 негативных" in note))
+    checks.append(("подпись: негатив назван отдельно", "14 из них — негативные" in note))
     checks.append(("подпись: свежие названы отдельно",
-                   f"5 за последние {FRESH_DAYS} дней" in note))
-    checks.append(("подпись: само число 19 в подпись не подмешано",
-                   "19" not in note))
+                   f"5 — за последние {FRESH_DAYS} дней" in note))
+    checks.append(("подпись: всего отзывов — отдельным предложением, со склонением",
+                   "Всего у компании 204 отзыва." in note))
+    # «из них» должно стоять сразу после 19 (без ответа), а не после 204
+    # (всего у компании) — иначе непонятно, к какому числу оно относится
+    checks.append(("подпись: «из них» не путается с «всего у компании»",
+                   note.index("из них") < note.index("Всего у компании")))
+
+    class _C0:
+        unanswered_count = 0
+        unanswered_fresh = 0
+        negative_unanswered = 0
+        reviews_count = 30
+
+        def __getattr__(self, name):
+            return None
+
+    checks.append(("подпись: без негатива/свежих — короткая, без пустого хвоста",
+                   unanswered_note(_C0()) == "0 без ответа из последних "
+                   f"{WINDOW} отзывов. Всего у компании 30 отзывов."))
+
+    checks.append(("склонение: 1/3/11/21", plural(1, "а", "б", "в") == "а"
+                   and plural(3, "а", "б", "в") == "б"
+                   and plural(11, "а", "б", "в") == "в"
+                   and plural(21, "а", "б", "в") == "а"))
 
     checks.append(("окно: берётся из конфига (REVIEW_WINDOW)",
                    WINDOW == max(1, int(os.getenv("REVIEW_WINDOW") or 50))))
