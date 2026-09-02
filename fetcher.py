@@ -283,6 +283,7 @@ def apply_reviews(c: Company, data: dict | None, now: datetime | None = None):
     c.unanswered_fresh = st.unanswered_fresh
     c.negative_count = st.negative
     c.negative_unanswered = st.negative_unanswered
+    c.response_rate = st.response_rate
     c.fresh_count = st.fresh
     c.has_fresh_reviews = st.has_fresh
     c.owner_responds = st.owner_responds
@@ -653,6 +654,8 @@ if __name__ == "__main__":
     checks.append(("reviews: владелец отвечает", c.owner_responds is True))
     checks.append(("reviews: негатив без ответа в топ-5", c.negative_without_response is True))
     checks.append(("reviews: без ответа посчитаны", c.unanswered_count == 2))
+    checks.append(("reviews: response_rate — доля с ответом в окне",
+                   abs(c.response_rate - 1 / 3) < 1e-9))
     checks.append(("reviews: негатив без ответа", c.negative_unanswered == 2))
     checks.append(("reviews: свежих за 30 дней", c.fresh_count == 2))
     checks.append(("reviews: цитаты — только негатив без ответа",
@@ -664,6 +667,8 @@ if __name__ == "__main__":
     apply_reviews(c2, {"meta": {}, "reviews": []}, now=NOW)
     checks.append(("reviews: пусто -> нет свежих", c2.has_fresh_reviews is False
                    and c2.loaded_reviews == 0))
+    checks.append(("reviews: пусто -> response_rate None, а не 0",
+                   c2.response_rate is None))
     c3 = Company()
     c3.rating = 4.0
     apply_reviews(c3, None, now=NOW)

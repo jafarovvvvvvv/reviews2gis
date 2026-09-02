@@ -575,18 +575,21 @@ if __name__ == "__main__":
                    and get_run("чепуха") is None))
 
     # --- полный прогон без сети: способ подменён фейком ---
-    def _fake_company(fid, name, rating, rc, fresh, owner):
+    def _fake_company(fid, name, rating, rc, fresh, unanswered=0):
         c = Company(firm_id=fid, name=name, category="стоматология", rating=rating,
-                    reviews_count=rc, has_fresh_reviews=fresh, owner_responds=owner,
+                    reviews_count=rc, has_fresh_reviews=fresh, unanswered_count=unanswered,
+                    negative_unanswered=min(unanswered, 2),
                     phone="+7 (727) 111-22-33", url=f"https://2gis.kz/almaty/firm/{fid}",
-                    loaded_reviews=50, unanswered_count=7, negative_unanswered=2,
-                    fresh_count=3 if fresh else 0)
+                    loaded_reviews=50, fresh_count=3 if fresh else 0)
         c.compute_priority()
         return c
 
-    FAKE = [_fake_company("111111", "Спящая клиника", 4.1, 80, True, False),
-            _fake_company("222222", "Топ Дент", 4.8, 300, True, True),
-            _fake_company("333333", "Малыш", 4.9, 5, False, True)]
+    # Спящая клиника: рейтинг в проблемной зоне -> Высокий (независимо от unanswered).
+    # Топ Дент: рейтинг здоровый, без ответа нет -> Средний.
+    # Малыш: отзывов < 30 -> Низкий.
+    FAKE = [_fake_company("111111", "Спящая клиника", 4.1, 80, True, unanswered=7),
+            _fake_company("222222", "Топ Дент", 4.8, 300, True, unanswered=0),
+            _fake_company("333333", "Малыш", 4.9, 5, False, unanswered=7)]
 
     async def _fake_one_way(way, cfg, report):
         report("ищу компании", 0, len(FAKE))
