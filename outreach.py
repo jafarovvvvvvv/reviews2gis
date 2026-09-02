@@ -49,12 +49,8 @@ def fmt_rating(r: Optional[float]) -> str:
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
-    """Русское склонение: plural(3, 'отзыв', 'отзыва', 'отзывов') -> 'отзыва'."""
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return few
-    return many
+    """Русское склонение. Тонкая обёртка над единым слоем — как fmt_rating выше."""
+    return metrics.plural(n, one, few, many)
 
 
 def phone_digits(phone: str) -> Optional[str]:
@@ -541,8 +537,11 @@ if __name__ == "__main__":
                    "данные собраны" in audit.lower() and "01.09.2026" in audit))
     checks.append(("аудит: подписано окно счётчиков",
                    f"последних {metrics.WINDOW}" in audit))
-    checks.append(("аудит: подпись «без ответа» называет негатив и свежих отдельно",
-                   "3 негативных" in audit and "2 за последние 30 дней" in audit))
+    checks.append(("аудит: подпись «без ответа» — число сразу в начале, без двусмысленности",
+                   "14 без ответа из последних" in audit
+                   and "3 из них — негативные" in audit
+                   and "2 — за последние 30 дней" in audit
+                   and "Всего у компании 120 отзывов." in audit))
 
     # --- БАГ 1: цитаты только без ответа ---
     answered_only = Company(name="Всё отвечено", rating=4.0, reviews_count=100,
