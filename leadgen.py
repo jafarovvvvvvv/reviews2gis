@@ -37,7 +37,8 @@ from fetcher import BlockedError, FetchError, fetch_ways, fetcher_class
 from lead_scoring import (CSV_HEADERS, Company, PRIORITY_HIGH, PRIORITY_LOW,
                           PRIORITY_MEDIUM, sort_key)
 from outreach import (AUDIT_COMPETITOR as _AUDIT_COMPETITOR, build_rows,
-                      render_audit_html, write_outreach_pack)
+                      instagram_link, phone_digits, render_audit_html,
+                      write_outreach_pack)
 
 
 def outreach_competitor_flag() -> bool:
@@ -219,21 +220,48 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
             "csv": write_csv(companies, cfg), "pack": write_outreach_pack(companies, cfg)}
 
 
+def _crm_payload(c, cfg) -> dict:
+    """Company -> тело для POST /leads/push в CRM (контракт — CRM_INTEGRATION.md).
+
+    Отдаём ВСЁ, что знаем о компании, а не только пять чисел: контакты для
+    связи (wa.me/Instagram выводим теми же функциями, что и пакет рассылки),
+    развёрнутые счётчики и цитаты негатива — из них CRM собирает заметку и
+    бриф для ИИ, иначе менеджеру пришлось бы лезть обратно в 2ГИС.
+    """
+    wa_digits = phone_digits(c.phone)
+    return {
+        "firm_id": c.firm_id, "name": c.name, "city": cfg.city,
+        "category": c.category, "url": c.url, "phone": c.phone,
+        "website": None if c.website == metrics.NA else c.website,
+        "instagram": instagram_link(c.website),
+        "whatsapp": f"+{wa_digits}" if wa_digits else None,
+        "rating": c.rating, "ratings_count": c.ratings_count,
+        "reviews_count": c.reviews_count, "unanswered_count": c.unanswered_count,
+        "fresh_count": c.fresh_count, "priority": c.priority,
+        "priority_reason": c.priority_reason,
+        # развёрнутые числа и улики — для заметки лида и брифа ИИ
+        "negative_unanswered": c.negative_unanswered,
+        "unanswered_fresh": c.unanswered_fresh,
+        "response_rate": c.response_rate,
+        "review_window": metrics.WINDOW,
+        "last_review_date": c.last_review_date,
+        "owner_responds": c.owner_responds,
+        "branch_scope": c.branch_scope,
+        "branches_count": c.branches_count,
+        "negative_quotes": c.negative_quotes or [],
+        "collected_at": c.collected_at,
+    }
+
+
 async def push_to_crm(companies: list, cfg) -> None:
     """Отдать найденных лидов в CRM Bedel (см. CRM_INTEGRATION.md), если мост
     настроен. Best-effort: сбой не должен ронять прогон — лиды и так остались
     в CSV/пакете рассылки, CRM просто не увидит их автоматически в этот раз."""
     if not CRM_PUSH_URL or not companies:
         return
-    payload = [{
-        "firm_id": c.firm_id, "name": c.name, "city": cfg.city,
-        "category": c.category, "url": c.url, "phone": c.phone,
-        "rating": c.rating, "ratings_count": c.ratings_count,
-        "reviews_count": c.reviews_count, "unanswered_count": c.unanswered_count,
-        "fresh_count": c.fresh_count, "priority": c.priority,
-        "priority_reason": c.priority_reason,
-    } for c in companies]
     try:
+        # сборка payload тоже под try: ошибка в ней не должна ронять прогон
+        payload = [_crm_payload(c, cfg) for c in companies]
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(CRM_PUSH_URL, json=payload,
                                   headers={"X-Bridge-Key": BRIDGE_API_KEY})

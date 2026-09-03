@@ -72,11 +72,25 @@ Payload — по одному объекту на компанию:
 | Поле payload | Источник (`Company`/`cfg`) |
 |---|---|
 | `firm_id` | `Company.firm_id` |
-| `name`, `category`, `url`, `phone` | `Company.name/category/url/phone` |
+| `name`, `category`, `url`, `phone` | одноимённые поля `Company` |
 | `city` | `cfg.city` (на `Company` этого поля нет — прогон один на весь город) |
+| `website` | `Company.website` («сайт/соцсети» из карточки) |
+| `instagram` | `outreach.instagram_link(website)` — та же функция, что и в пакете рассылки |
+| `whatsapp` | `outreach.phone_digits(phone)` -> `+7XXXXXXXXXX` |
 | `rating`, `ratings_count`, `reviews_count` | те же поля `Company` |
 | `unanswered_count`, `fresh_count` | те же поля `Company` |
+| `negative_unanswered`, `unanswered_fresh`, `response_rate` | развёрнутые счётчики из `metrics` |
+| `review_window` | `metrics.WINDOW` — из скольких отзывов считались счётчики |
+| `last_review_date`, `owner_responds` | те же поля `Company` |
+| `branch_scope`, `branches_count` | по чему собраны данные (филиал/сеть) |
+| `negative_quotes` | до 3 цитат негатива **без ответа** (`{rating, date, text}`) |
+| `collected_at` | когда данные сняты с 2ГИС |
 | `priority`, `priority_reason` | `Company.priority/priority_reason` (справочно — CRM пересчитывает приоритет своей формулой, см. ниже) |
+
+Пять чисел мало: менеджеру в CRM нужны и контакты для связи, и улики
+(цитаты негатива), иначе он лезет обратно в 2ГИС руками. На стороне CRM
+контакты попадают в поля лида, а развёрнутые данные — в заметку
+(`logic.format_gis_notes`) и в бриф для ИИ.
 
 **Дедуп на стороне CRM — по `card_id`** (это и есть `firm_id`, стабильный и
 уникальный):
@@ -85,10 +99,12 @@ Payload — по одному объекту на компанию:
   доверяет строке `priority` из payload, у неё своя формула (сейчас совпадает
   с `lead_scoring.decide_priority`, но это два независимых места, могут
   разойтись — см. предупреждение выше);
-- лид уже есть → обновляются только метрики-колонки + добавляется новый
-  `Snapshot`; `status`/`contact_*`/`phone`/`instagram`/`whatsapp`/`notes`/
-  `next_touch_date` **не трогаются** — это ручная работа менеджера в CRM,
-  автопуш её не перезаписывает.
+- лид уже есть → обновляются метрики-колонки + добавляется новый `Snapshot`;
+  `instagram`/`whatsapp`/`phone` **дозаполняются, только если пустые**
+  (парсер знает лишь то, что указано в карточке 2ГИС, а менеджер мог
+  поправить руками); `status`/`contact_name`/`notes`/`next_touch_date`
+  не трогаются вовсе — это ручная работа менеджера, автопуш её не
+  перезаписывает.
 
 Пуш — **best-effort**: сбой (CRM недоступна, сеть) ловится в
 `leadgen.push_to_crm`, пишется `[warn]` в лог и **не роняет и не блокирует**
