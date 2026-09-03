@@ -546,13 +546,10 @@ async def api_firm(firm_id: str, request: Request, city: str = "Алматы"):
             company = await f.parse_firm(firm_id)
     except Exception as e:
         return PlainTextResponse(f"parse failed: {e}", status_code=502)
-    return {
-        "rating": company.rating,
-        "ratings_count": company.ratings_count,
-        "reviews_count": company.reviews_count,
-        "unanswered_count": company.unanswered_count,
-        "fresh_count": company.fresh_count,
-    }
+    # Тот же набор полей, что уходит в пуш после прогона лидогенерации —
+    # чтобы CRM получала одинаковые данные независимо от направления моста
+    # (иначе «Обновить из 2ГИС» знало бы о компании меньше, чем автопуш).
+    return leadgen.company_payload(company, city)
 
 
 @app.get("/lp", response_class=HTMLResponse)

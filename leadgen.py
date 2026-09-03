@@ -221,16 +221,25 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
 
 
 def _crm_payload(c, cfg) -> dict:
-    """Company -> тело для POST /leads/push в CRM (контракт — CRM_INTEGRATION.md).
+    """Company + конфиг прогона -> тело для POST /leads/push в CRM."""
+    return company_payload(c, cfg.city)
 
-    Отдаём ВСЁ, что знаем о компании, а не только пять чисел: контакты для
-    связи (wa.me/Instagram выводим теми же функциями, что и пакет рассылки),
-    развёрнутые счётчики и цитаты негатива — из них CRM собирает заметку и
-    бриф для ИИ, иначе менеджеру пришлось бы лезть обратно в 2ГИС.
+
+def company_payload(c, city: str) -> dict:
+    """Company -> полный набор данных о компании для CRM (контракт —
+    CRM_INTEGRATION.md). Один формат на оба направления моста: и пуш после
+    прогона (`push_to_crm`), и ответ `GET /api/firm/{id}` в app.py — иначе
+    CRM получала бы разные наборы полей в зависимости от того, кто первый
+    спросил.
+
+    Отдаём ВСЁ, что знаем: контакты для связи (wa.me/Instagram выводим теми
+    же функциями, что и пакет рассылки), развёрнутые счётчики и цитаты
+    негатива — из них CRM собирает заметку и бриф для ИИ, иначе менеджеру
+    пришлось бы лезть обратно в 2ГИС.
     """
     wa_digits = phone_digits(c.phone)
     return {
-        "firm_id": c.firm_id, "name": c.name, "city": cfg.city,
+        "firm_id": c.firm_id, "name": c.name, "city": city,
         "category": c.category, "url": c.url, "phone": c.phone,
         "website": None if c.website == metrics.NA else c.website,
         "instagram": instagram_link(c.website),
