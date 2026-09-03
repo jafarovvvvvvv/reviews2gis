@@ -134,9 +134,11 @@ def fmt_review_alert(company_name: str, company_url: str, rv: dict,
         f'<a href="{e(company_url)}">Карточка в 2ГИС</a> — ответить можно в кабинете.',
     ]
     if ai_replies:
-        lines.append("\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
-        for i, reply in enumerate(ai_replies, 1):
-            lines.append(f"Вариант {i}:\n<pre>{e(reply)}</pre>")
+        lines.append("\n✍ <b>Готовый ответ</b> (тапните по тексту — скопируется):"
+                     if len(ai_replies) == 1 else
+                     "\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
+        for reply in ai_replies:
+            lines.append(f"<pre>{e(reply)}</pre>")
     elif neg:
         lines.append(f"\n✍ Черновик ответа:\n<i>{e(NEGATIVE_DRAFT)}</i>")
     return "\n".join(lines)
@@ -165,9 +167,11 @@ def fmt_unanswered_review(company_name: str, company_url: str, rv: dict,
         f'<a href="{e(company_url)}">Карточка в 2ГИС</a> — ответить можно в кабинете.',
     ]
     if ai_replies:
-        lines.append("\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
-        for i, reply in enumerate(ai_replies, 1):
-            lines.append(f"Вариант {i}:\n<pre>{e(reply)}</pre>")
+        lines.append("\n✍ <b>Готовый ответ</b> (тапните по тексту — скопируется):"
+                     if len(ai_replies) == 1 else
+                     "\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
+        for reply in ai_replies:
+            lines.append(f"<pre>{e(reply)}</pre>")
     elif neg:
         lines.append(f"\n✍ Черновик ответа:\n<i>{e(NEGATIVE_DRAFT)}</i>")
     return "\n".join(lines)
@@ -242,8 +246,8 @@ if __name__ == "__main__":
 
     ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"},
                           ai_replies=["Ответ <раз>", "Ответ два"])
-    checks.append(("ai: оба варианта в pre",
-                   ai.count("<pre>") == 2 and "Вариант 2" in ai))
+    checks.append(("ai: оба варианта в pre, без ярлыков «Вариант N»",
+                   ai.count("<pre>") == 2 and "Вариант" not in ai))
     checks.append(("ai: экранирование", "&lt;раз&gt;" in ai))
     checks.append(("ai: статичный шаблон не дублируется", "Черновик ответа" not in ai))
     no_ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"}, ai_replies=[])
