@@ -158,6 +158,27 @@ async def notify_chats(conn, text: str, company_id=None, reply_markup=None) -> l
     return errors
 
 
+# Тестовый получатель для «отправить неотвеченные владельцу» (кнопка на
+# странице компании, app.py). Пока у компании нет отдельного поля «чат
+# владельца» — рассылка всегда идёт сюда, Эмилю, а не реальным клиентам.
+# Заменить/убрать этот хардкод, когда появится привязка чата-получателя
+# к конкретному владельцу (а не общий список admin+subscriptions).
+TEST_OWNER_CHAT_ID = "398016661"
+
+
+async def notify_owner_test(conn, text: str, reply_markup=None) -> list:
+    """Как notify_chats, но получатель — фиксированный TEST_OWNER_CHAT_ID,
+    а не чаты компании (см. предупреждение выше)."""
+    token = db.get_setting(conn, "bot_token")
+    if not token:
+        return ["Telegram не настроен (нет токена) — уведомление не отправлено"]
+    try:
+        await tg.send_message(token, TEST_OWNER_CHAT_ID, text, reply_markup=reply_markup)
+    except tg.TgError as e:
+        return [f"чат {TEST_OWNER_CHAT_ID}: {e}"]
+    return []
+
+
 async def notify_document(conn, filename: str, content: bytes, caption: str,
                           company_id=None) -> list:
     """Разослать файл (отчёт) тем же получателям, что и notify_chats."""

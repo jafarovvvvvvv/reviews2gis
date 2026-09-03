@@ -776,6 +776,9 @@ async def dashboard(request: Request):
             busy = busy or c["status"] in (db.ST_ADDING, db.ST_CHECKING)
             new7 = db.new_reviews_count(conn, c["id"])
             new_chip = (f'<span class="chip new">+{new7} за 7 дн</span>' if new7 else "")
+            unanswered = db.unanswered_count(conn, c["id"])
+            unanswered_chip = (f'<span class="chip err">{unanswered} без ответа</span>'
+                               if unanswered else "")
             count = "—" if c["reviews_count"] is None else c["reviews_count"]
             err_note = (f'<div class="meta" style="color:var(--red)">⚠ {e(c["error"][:120])}</div>'
                         if c["status"] == db.ST_ERROR and c["error"] else "")
@@ -785,7 +788,7 @@ async def dashboard(request: Request):
   <a class="name" href="/company/{c['id']}">{e(c['name'])}</a>
   <div class="meta">{e(c['city_slug'])} · {e(c['category'] or '2ГИС')} ·
     <span class="mono">{count} отз.</span></div>
-  <div class="chips">{ST_BADGE.get(c['status'], e(c['status']))}{new_chip}</div>
+  <div class="chips">{ST_BADGE.get(c['status'], e(c['status']))}{new_chip}{unanswered_chip}</div>
   <div class="meta">проверено: <span class="mono">{fmt_dt(c['last_checked'])}</span></div>
   {err_note}
   <div style="margin-top:10px">
@@ -907,6 +910,56 @@ async def companies_test(cid: int):
     return redirect(f"/company/{cid}", msg="Тестовое уведомление отправлено в Telegram")
 
 
+async def _send_unanswered_task(cid: int):
+    """Фон: все неотвеченные отзывы компании + AI-варианты ответа, каждый
+    отдельным сообщением. Получатель фиксированный (monitor.TEST_OWNER_CHAT_ID)
+    — тестовый режим кнопки на /company/{cid}, не реальные чаты компании."""
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, cid)
+        if c is None:
+            return
+        reviews = db.unanswered_reviews(conn, cid)
+        if not reviews:
+            return
+        for err in await monitor.notify_owner_test(
+                conn, tg.fmt_unanswered_batch_header(c["name"], c["url"], len(reviews))):
+            print(f"[unanswered] {err}", flush=True)
+        for rv in reviews:
+            ai = []
+            try:
+                ai = await ai_reply.generate_for_company(conn, c, dict(rv))
+            except ai_reply.AiReplyError as ex:
+                print(f"[ai] неотвеченные (отзыв {rv['id']}): {ex}", flush=True)
+            text = tg.fmt_unanswered_review(c["name"], c["url"], dict(rv), ai_replies=ai)
+            for err in await monitor.notify_owner_test(conn, text):
+                print(f"[unanswered] {err}", flush=True)
+    finally:
+        conn.close()
+
+
+@app.post("/companies/{cid}/send-unanswered")
+async def companies_send_unanswered(cid: int):
+    """Собрать все неотвеченные отзывы компании + предлагаемые ответы и
+    отправить владельцу. Тест: получатель сейчас — фиксированный chat_id
+    Эмиля (monitor.TEST_OWNER_CHAT_ID), не чаты компании — см. предупреждение
+    в _send_unanswered_task."""
+    conn = db.connect()
+    try:
+        c = db.get_company(conn, cid)
+        if c is None:
+            return redirect("/", err="Компания не найдена")
+        n = db.unanswered_count(conn, cid)
+    finally:
+        conn.close()
+    if not n:
+        return redirect(f"/company/{cid}", err="Нет неотвеченных отзывов")
+    spawn(_send_unanswered_task(cid))
+    return redirect(f"/company/{cid}",
+                    msg=f"Отправка {n} неотвеченных отзывов запущена — тест: уйдёт "
+                        f"только Эмилю в Telegram, не владельцу компании")
+
+
 @app.get("/company/{cid}", response_class=HTMLResponse)
 async def company_page(cid: int, request: Request):
     e = html.escape
@@ -920,6 +973,7 @@ async def company_page(cid: int, request: Request):
         subs = db.subscribed_chat_ids(conn, cid)
         reports = db.list_reports(conn, cid)
         history = db.rating_history(conn, cid)
+        unanswered = db.unanswered_count(conn, cid)
     finally:
         conn.close()
 
@@ -981,10 +1035,15 @@ async def company_page(cid: int, request: Request):
  <div class="kv">
   <div><b>{rating}</b><span>рейтинг</span></div>
   <div><b>{count}</b><span>отзывов</span></div>
+  <div><b>{unanswered}</b><span>без ответа</span></div>
   <div><b>{fmt_dt(c['last_checked'])}</b><span>последняя проверка</span></div>
  </div>
  <form class="inline" method="post" action="/companies/{cid}/check"><button class="primary">Проверить сейчас</button></form>
  <form class="inline" method="post" action="/companies/{cid}/test"><button>Тест в Telegram</button></form>
+ {(f'<form class="inline" method="post" action="/companies/{cid}/send-unanswered">'
+   f'<button title="Тест: уйдёт только Эмилю в Telegram, не владельцу компании">'
+   f'Отправить неотвеченные владельцу ({unanswered}) — тест</button></form>')
+  if unanswered else ''}
  <form class="inline" method="post" action="/companies/{cid}/delete"
        onsubmit="return confirm('Удалить компанию и все её отзывы?')">
    <button class="danger">Удалить</button></form>

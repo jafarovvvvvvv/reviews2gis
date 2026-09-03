@@ -300,6 +300,21 @@ def latest_review(conn, company_id: int):
     return rows[0] if rows else None
 
 
+def unanswered_reviews(conn, company_id: int, limit: int = 50):
+    """Отзывы без ответа владельца, свежие сверху. Лимит — как у company_page,
+    чтобы кнопка «отправить владельцу» не разослала сотни сообщений разом."""
+    return conn.execute(
+        "SELECT * FROM reviews WHERE company_id=? AND answered=0 "
+        "ORDER BY date_created DESC LIMIT ?", (company_id, limit)).fetchall()
+
+
+def unanswered_count(conn, company_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM reviews WHERE company_id=? AND answered=0",
+        (company_id,)).fetchone()
+    return row["n"]
+
+
 def get_review(conn, review_row_id: int):
     return conn.execute("SELECT * FROM reviews WHERE id=?",
                         (review_row_id,)).fetchone()
@@ -592,6 +607,9 @@ if __name__ == "__main__":
         checks.append(("recent сортировка",
                        recent_reviews(conn, cid)[0]["review_id"] == "r2"))
         checks.append(("счётчик новых за 7д", new_reviews_count(conn, cid) == 1))
+        checks.append(("без ответа: счётчик", unanswered_count(conn, cid) == 1))
+        checks.append(("без ответа: выборка",
+                       [r["review_id"] for r in unanswered_reviews(conn, cid)] == ["r2"]))
 
         update_company_info(conn, cid, name="Тест", rating=4.5, reviews_count=None)
         row = get_company(conn, cid)

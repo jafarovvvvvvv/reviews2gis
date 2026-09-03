@@ -142,6 +142,47 @@ def fmt_review_alert(company_name: str, company_url: str, rv: dict,
     return "\n".join(lines)
 
 
+def fmt_unanswered_review(company_name: str, company_url: str, rv: dict,
+                          ai_replies: list = None) -> str:
+    """Карточка неотвеченного отзыва для «догоняющей» рассылки владельцу
+    (кнопка «отправить неотвеченные» на странице компании) — в отличие от
+    fmt_review_alert это не «новый отзыв», а разбор скопившегося долга,
+    заголовок и повод другие, тело то же (звёзды/дата/автор/текст/варианты).
+    """
+    e = html.escape
+    rating = rv.get("rating")
+    neg = is_negative(rating)
+    head = "📋 <b>Без ответа</b>" + (" · негатив" if neg else "")
+    date = (rv.get("date_created") or "")[:10]
+    author = rv.get("author") or "аноним"
+    text = (rv.get("text") or "").strip() or "(без текста)"
+    if len(text) > 500:
+        text = text[:500] + "…"
+    lines = [
+        f"{head} — {e(company_name)}",
+        f"{stars(rating)} · {e(date)} · {e(author)}",
+        f"«{e(text)}»",
+        f'<a href="{e(company_url)}">Карточка в 2ГИС</a> — ответить можно в кабинете.',
+    ]
+    if ai_replies:
+        lines.append("\n✍ <b>Готовые ответы</b> (тапните по тексту — скопируется):")
+        for i, reply in enumerate(ai_replies, 1):
+            lines.append(f"Вариант {i}:\n<pre>{e(reply)}</pre>")
+    elif neg:
+        lines.append(f"\n✍ Черновик ответа:\n<i>{e(NEGATIVE_DRAFT)}</i>")
+    return "\n".join(lines)
+
+
+def fmt_unanswered_batch_header(company_name: str, company_url: str, count: int) -> str:
+    """Заголовок перед серией fmt_unanswered_review — объясняет, что дальше."""
+    e = html.escape
+    word = metrics.plural(count, "отзыв", "отзыва", "отзывов")
+    return (f"📋 <b>Неотвеченные отзывы — {e(company_name)}</b>\n"
+            f"{count} {word} без ответа. Дальше — по одному сообщению на отзыв, "
+            f"с готовым вариантом ответа, где получилось его подготовить.\n"
+            f'<a href="{e(company_url)}">Карточка в 2ГИС</a>')
+
+
 def fmt_check_error(company_name: str, error: str) -> str:
     return (f"⚠️ Не удалось проверить отзывы «{html.escape(company_name)}»: "
             f"{html.escape(error)}")
@@ -207,6 +248,21 @@ if __name__ == "__main__":
     checks.append(("ai: статичный шаблон не дублируется", "Черновик ответа" not in ai))
     no_ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"}, ai_replies=[])
     checks.append(("ai: пустой список -> старый шаблон", "Черновик ответа" in no_ai))
+
+    ur = fmt_unanswered_review("Y", "u", {"rating": 1, "date_created": "2026-06-01",
+                                          "author": "Иван", "text": "плохо"})
+    checks.append(("неотвеченный: заголовок «Без ответа», не «Новый»",
+                   "Без ответа" in ur and "Новый отзыв" not in ur))
+    checks.append(("неотвеченный: негатив -> черновик", "Черновик ответа" in ur))
+    ur_ai = fmt_unanswered_review("Y", "u", {"rating": 5, "text": "супер"},
+                                  ai_replies=["Спасибо!"])
+    checks.append(("неотвеченный: с AI-вариантом, без черновика",
+                   "<pre>Спасибо!</pre>" in ur_ai and "Черновик ответа" not in ur_ai))
+
+    hdr = fmt_unanswered_batch_header("Клиника", "https://2gis.kz/x", 3)
+    checks.append(("шапка пачки: число и склонение", "3 отзыва без ответа" in hdr))
+    hdr1 = fmt_unanswered_batch_header("Клиника", "u", 1)
+    checks.append(("шапка пачки: единственное число", "1 отзыв без ответа" in hdr1))
 
     dg = fmt_weekly_digest("Клиника", 4.6, 0.2, 5, 2)
     checks.append(("дайджест: рост и негатив", "📈" in dg and "4,6" in dg
