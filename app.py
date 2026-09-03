@@ -270,17 +270,29 @@ pre{white-space:pre-wrap;background:#F4F7F4;border-radius:10px;padding:12px;
 .chart .ct{font-family:'JetBrains Mono',monospace;font-size:11px;fill:#5C7064}
 .chartlabel{font-family:'JetBrains Mono',monospace;font-size:.7em;letter-spacing:.1em;
    text-transform:uppercase;color:#5C7064;margin-bottom:2px}
-.distrib{display:flex;flex-direction:column;gap:5px;margin-top:4px}
+.distrib{display:flex;flex-direction:column;gap:7px;margin-top:6px}
 .distrow{display:flex;align-items:center;gap:10px}
 .distrow .dl{width:26px;font-size:.85em;color:#5C7064}
-.distrow .dbar{flex:1;background:#EEF2EE;border-radius:6px;height:14px;overflow:hidden}
-.distrow .dbar i{display:block;height:100%;border-radius:6px}
-.distrow .dbar i.g{background:#1E7A46}.distrow .dbar i.a{background:#B97E14}
-.distrow .dbar i.r{background:#D8472B}
+.distrow.peak .dl{font-weight:700;color:var(--ink)}
+.distrow .dbar{flex:1;background:#EEF2EE;border-radius:10px;height:19px;overflow:hidden}
+.distrow .dbar i{display:block;height:100%;border-radius:10px;transition:width .4s}
+.distrow .dbar i.g{background:linear-gradient(90deg,#8FD1A6,#1E7A46)}
+.distrow .dbar i.a{background:linear-gradient(90deg,#F0C877,#B97E14)}
+.distrow .dbar i.r{background:linear-gradient(90deg,#F0A18E,#D8472B)}
 .distrow .dn{width:30px;text-align:right;font-size:.85em;color:#5C7064}
-.kv{display:flex;gap:30px;flex-wrap:wrap;margin:10px 0 14px}
-.kv b{font-size:1.5em;font-family:'JetBrains Mono',Consolas,monospace;font-weight:600}
-.kv span{display:block;color:var(--muted);font-size:.82em}
+.distrow .dn.peak{width:auto;min-width:28px;text-align:center;border-radius:99px;
+   padding:2px 10px;font-weight:700;font-size:.8em;color:#fff;
+   font-family:'JetBrains Mono',Consolas,monospace}
+.distrow .dn.peak.g{background:var(--green)}
+.distrow .dn.peak.a{background:var(--amber)}
+.distrow .dn.peak.r{background:var(--red)}
+.kv{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+.kv>div{background:var(--paper);border:1px solid var(--line);border-radius:12px;
+   padding:10px 16px;min-width:104px}
+.kv b{font-size:1.4em;font-family:'JetBrains Mono',Consolas,monospace;font-weight:700;
+   display:block;color:var(--ink)}
+.kv span{display:block;color:var(--muted);font-size:.72em;text-transform:uppercase;
+   letter-spacing:.06em;margin-top:2px}
 form.inline{display:inline}
 .sysbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
 ol.help li{margin:6px 0}
@@ -336,7 +348,9 @@ def svg_line_chart(points, color="#1E7A46", w=560, h=160, pad=34,
                    force_min=None, force_max=None, fmt=str) -> str:
     """Линейный график из [(подпись, число)]. Пусто, если точек <2.
 
-    Подписи значений — у левого края (ось Y), даты — отдельной строкой внизу,
+    Заливка — мягкий градиент под линией, а пиковая точка отмечена кольцом и
+    плавающей плашкой со значением (как «+17,8%» над столбцом в референсе).
+    Подписи диапазона — у левого края (ось Y), даты — отдельной строкой внизу,
     чтобы не накладывались."""
     pts = [(lbl, v) for lbl, v in points if v is not None]
     if len(pts) < 2:
@@ -348,19 +362,39 @@ def svg_line_chart(points, color="#1E7A46", w=560, h=160, pad=34,
     if vmax <= vmin:
         vmax = vmin + 1
     n = len(pts)
-    top, floor = 18, h - 34            # вертикальные границы зоны графика
+    top, floor = 34, h - 34            # top даёт место под плашку пика
     fx = lambda i: pad + (w - pad - 14) * i / (n - 1)
     fy = lambda v: top + (floor - top) * (1 - (v - vmin) / (vmax - vmin))
     poly = " ".join(f"{fx(i):.1f},{fy(v):.1f}" for i, (_, v) in enumerate(pts))
     area = f"{fx(0):.1f},{floor:.1f} " + poly + f" {fx(n - 1):.1f},{floor:.1f}"
-    dots = "".join(f'<circle cx="{fx(i):.1f}" cy="{fy(v):.1f}" r="3" '
-                   f'fill="{color}"/>' for i, (_, v) in enumerate(pts))
+    peak_i = max(range(n), key=lambda i: pts[i][1])
     e = html.escape
+    gid = f"lg{secrets.token_hex(3)}"
+    dots = "".join(
+        (f'<circle cx="{fx(i):.1f}" cy="{fy(v):.1f}" r="5" fill="#fff" '
+         f'stroke="{color}" stroke-width="2.5"/>' if i == peak_i else
+         f'<circle cx="{fx(i):.1f}" cy="{fy(v):.1f}" r="2.5" fill="{color}" '
+         f'opacity="0.55"/>')
+        for i, (_, v) in enumerate(pts))
+    badge_text = e(fmt(pts[peak_i][1]))
+    badge_w = max(30, 17 + len(badge_text) * 7.2)
+    badge_x = min(max(fx(peak_i) - badge_w / 2, 2), w - badge_w - 2)
+    badge_y = fy(pts[peak_i][1]) - 30
+    badge = f'''<g transform="translate({badge_x:.1f},{badge_y:.1f})">
+   <rect width="{badge_w:.1f}" height="21" rx="10.5" fill="{color}"/>
+   <text x="{badge_w / 2:.1f}" y="14.5" text-anchor="middle"
+     style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;
+     fill:#fff">{badge_text}</text>
+ </g>'''
     return f'''<svg viewBox="0 0 {w} {h}" width="100%" role="img" class="chart">
- <polygon points="{area}" fill="{color}" opacity="0.09"/>
- <polyline points="{poly}" fill="none" stroke="{color}" stroke-width="2.5"
-   stroke-linejoin="round" stroke-linecap="round"/>{dots}
- <text x="2" y="{top + 4}" class="ct">{e(fmt(vmax))}</text>
+ <defs><linearGradient id="{gid}" x1="0" y1="0" x2="0" y2="1">
+   <stop offset="0%" stop-color="{color}" stop-opacity="0.3"/>
+   <stop offset="100%" stop-color="{color}" stop-opacity="0"/>
+ </linearGradient></defs>
+ <polygon points="{area}" fill="url(#{gid})"/>
+ <polyline points="{poly}" fill="none" stroke="{color}" stroke-width="3"
+   stroke-linejoin="round" stroke-linecap="round"/>{dots}{badge}
+ <text x="2" y="{top - 12}" class="ct">{e(fmt(vmax))}</text>
  <text x="2" y="{floor}" class="ct">{e(fmt(vmin))}</text>
  <text x="{pad}" y="{h - 8}" class="ct">{e(pts[0][0])}</text>
  <text x="{w - 14}" y="{h - 8}" class="ct" text-anchor="end">{e(pts[-1][0])}</text>
@@ -368,7 +402,10 @@ def svg_line_chart(points, color="#1E7A46", w=560, h=160, pad=34,
 
 
 def rating_distribution(reviews) -> str:
-    """5 горизонтальных столбиков: сколько отзывов с каждой оценкой (из окна)."""
+    """5 горизонтальных столбиков: сколько отзывов с каждой оценкой (из окна).
+
+    Столбик с наибольшим числом отзывов выделен плашкой-числом (как пиковый
+    столбец с бейджем в референсе), остальные — приглушённым counter'ом."""
     counts = {s: 0 for s in range(1, 6)}
     for r in reviews:
         rt = r["rating"]
@@ -377,15 +414,20 @@ def rating_distribution(reviews) -> str:
     total = sum(counts.values())
     if not total:
         return '<p class="muted">Отзывы ещё не загружены.</p>'
+    peak = max(counts, key=lambda s: counts[s])
     rows = []
     for s in range(5, 0, -1):
         n = counts[s]
         pct = round(100 * n / total)
         cls = "g" if s >= 5 else ("a" if s == 4 else "r")
+        is_peak = s == peak and n > 0
+        num = (f'<span class="dn peak {cls}">{n}</span>' if is_peak
+               else f'<span class="dn mono">{n}</span>')
         rows.append(
-            f'<div class="distrow"><span class="dl">{s}★</span>'
+            f'<div class="distrow{" peak" if is_peak else ""}">'
+            f'<span class="dl">{s}★</span>'
             f'<span class="dbar"><i class="{cls}" style="width:{pct}%"></i></span>'
-            f'<span class="dn mono">{n}</span></div>')
+            f'{num}</div>')
     return f'<div class="distrib">{"".join(rows)}</div>'
 
 
