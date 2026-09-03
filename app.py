@@ -155,6 +155,39 @@ app = FastAPI(lifespan=lifespan)
 BRAND = "Bedel"
 TAGLINE = "вес вашей репутации"
 
+# Копирование в буфер. navigator.clipboard есть ТОЛЬКО в защищённом контексте
+# (https или localhost), а панель открывается по http://<ip>:8765 — там его
+# либо нет вовсе (Chrome), либо writeText отклоняется (Firefox). Поэтому:
+# пробуем API, при любой осечке — старый execCommand через скрытую textarea.
+# Вставляется в страницы как <script>{COPY_JS}</script>.
+COPY_JS = """
+function copyText(text){
+  const legacy = () => { const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.top='-1000px';
+    document.body.appendChild(ta); ta.select();
+    let ok=false; try { ok = document.execCommand('copy'); } catch(e) { ok=false; }
+    ta.remove(); return ok; };
+  if (navigator.clipboard && window.isSecureContext)
+    return navigator.clipboard.writeText(text).then(() => true).catch(() => legacy());
+  return Promise.resolve(legacy());
+}
+function copyMsg(id, btn){
+  const text = document.getElementById(id).innerText;
+  copyText(text).then(ok => {
+    btn.textContent = ok ? 'Скопировано ✓' : 'Выделите и Ctrl+C';
+    setTimeout(() => btn.textContent = 'Копировать', ok ? 1500 : 2500);
+  });
+}
+// Ссылка кабинета хранится путём (/c/<token>) — клиенту нужна полная.
+function copyLink(btn){
+  const path = document.getElementById('caburl').innerText.trim();
+  copyText(location.origin + path).then(ok => {
+    btn.textContent = ok ? 'Скопировано ✓' : 'Выделите и Ctrl+C';
+    setTimeout(() => btn.textContent = 'Копировать полную ссылку', ok ? 1500 : 2500);
+  });
+}
+"""
+
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
@@ -966,8 +999,8 @@ async def company_page(cid: int, request: Request):
    else '<span class="chip err">кабинет отключён</span>'}</div>
  {(f'<p><a class="btn" href="{cab_url}" target="_blank" rel="noopener">Открыть кабинет клиента →</a></p>'
    f'<pre id="caburl" style="font-size:.85em">{e(cab_url)}</pre>'
-   f'<button onclick="(function(){{{{var u=location.origin+document.getElementById(\'caburl\').innerText;'
-   f'navigator.clipboard&&navigator.clipboard.writeText(u);}}}})()">Копировать полную ссылку</button>')
+   f'<button onclick="copyLink(this)">Копировать полную ссылку</button>'
+   f'<script>{COPY_JS}</script>')
    if cab_on else '<p class="muted">Включите кабинет, чтобы получить ссылку.</p>'}
  <div style="margin-top:12px">
   <form class="inline" method="post" action="/companies/{cid}/cabinet">
@@ -1370,18 +1403,7 @@ async def lead_run_page(rid: str, request: Request):
 </div>
 {f'<div class="card">{table}</div>' if table else ''}
 <p><a href="/leads">← к поиску лидов</a></p>
-<script>
-function copyMsg(id, btn){{
-  const text = document.getElementById(id).innerText;
-  const done = () => {{ btn.textContent = 'Скопировано ✓';
-                        setTimeout(() => btn.textContent = 'Копировать', 1500); }};
-  if (navigator.clipboard && navigator.clipboard.writeText)
-    navigator.clipboard.writeText(text).then(done);
-  else {{ const ta = document.createElement('textarea');
-         ta.value = text; document.body.appendChild(ta);
-         ta.select(); document.execCommand('copy'); ta.remove(); done(); }}
-}}
-</script>"""
+<script>{COPY_JS}</script>"""
     return page(run.title, body, request, refresh=run.busy)
 
 
@@ -1514,18 +1536,7 @@ async def company_reply_page(cid: int, review_id: int, request: Request):
 {variants}
 <p><a href="/company/{cid}/reply/{review_id}">↻ Сгенерировать ещё</a> ·
  <a href="/company/{cid}">← к компании</a></p>
-<script>
-function copyMsg(id, btn){{
-  const t = document.getElementById(id).innerText;
-  const done = () => {{ btn.textContent = 'Скопировано ✓';
-                        setTimeout(() => btn.textContent = 'Копировать', 1500); }};
-  if (navigator.clipboard && navigator.clipboard.writeText)
-    navigator.clipboard.writeText(t).then(done);
-  else {{ const ta = document.createElement('textarea'); ta.value = t;
-         document.body.appendChild(ta); ta.select();
-         document.execCommand('copy'); ta.remove(); done(); }}
-}}
-</script>"""
+<script>{COPY_JS}</script>"""
     return page(f"AI-ответ — {c['name']}", body, request)
 
 

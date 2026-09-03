@@ -346,18 +346,27 @@ button:hover{background:#eef}
 .warn{background:#fff7e0;border:1px solid #f0d080;border-radius:8px;padding:10px;margin-bottom:14px}
 """
 
+# Дашборд открывают и как файл (file://), и из панели по http://<ip>:8765 —
+# ни там, ни там navigator.clipboard недоступен (нужен https или localhost),
+# а в части браузеров он есть, но writeText отклоняется. Поэтому сначала API,
+# при любой осечке — execCommand, и честная подсказка, если не вышло вообще.
 _DASH_JS = """
+function copyText(text){
+  const legacy = () => { const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.top='-1000px';
+    document.body.appendChild(ta); ta.select();
+    let ok=false; try { ok = document.execCommand('copy'); } catch(e) { ok=false; }
+    ta.remove(); return ok; };
+  if (navigator.clipboard && window.isSecureContext)
+    return navigator.clipboard.writeText(text).then(() => true).catch(() => legacy());
+  return Promise.resolve(legacy());
+}
 function copyMsg(id, btn){
   const text = document.getElementById(id).innerText;
-  const done = () => { btn.textContent = 'Скопировано ✓';
-                       setTimeout(() => btn.textContent = 'Копировать', 1500); };
-  if (navigator.clipboard && navigator.clipboard.writeText)
-    navigator.clipboard.writeText(text).then(done);
-  else { // фолбэк для file:// в старых браузерах
-    const ta = document.createElement('textarea');
-    ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy'); ta.remove(); done();
-  }
+  copyText(text).then(ok => {
+    btn.textContent = ok ? 'Скопировано ✓' : 'Выделите и Ctrl+C';
+    setTimeout(() => btn.textContent = 'Копировать', ok ? 1500 : 2500);
+  });
 }
 """
 
