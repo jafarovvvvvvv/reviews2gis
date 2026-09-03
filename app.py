@@ -34,7 +34,9 @@ from fastapi.responses import (FileResponse, HTMLResponse, PlainTextResponse,
 
 import ai_reply
 import bot
+import config
 import db
+import fetcher
 import insights
 import leadgen
 import metrics
@@ -57,6 +59,9 @@ AUTH_ON = bool(PANEL_PASSWORD)
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"} | {
     h.strip().lower() for h in (os.getenv("PANEL_HOSTS") or "").split(",") if h.strip()}
 OPEN_PATHS = {"/login", "/healthz"}  # доступны без логина
+# Мост для внешних потребителей (CRM Bedel) — своя авторизация по BRIDGE_API_KEY,
+# не сессионной cookie; см. CRM_INTEGRATION.md. Пусто = эндпоинты выключены (404).
+BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY") or ""
 _SECRET = ""  # ключ подписи сессий; ставится в lifespan
 SESSION_TTL = 14 * 24 * 3600  # сессия живёт 2 недели
 
@@ -165,8 +170,10 @@ async def guard(request: Request, call_next):
             if src_host not in ALLOWED_HOSTS:
                 return PlainTextResponse("Forbidden: cross-site POST", status_code=403)
     path = request.url.path
-    # /c/ — кабинет клиента, /lp — публичный лендинг
-    public = path in OPEN_PATHS or path.startswith("/c/") or path == "/lp"
+    # /c/ — кабинет клиента, /lp — публичный лендинг, /api/ — мост для CRM
+    # (своя авторизация по BRIDGE_API_KEY внутри роута, не сессионная cookie)
+    public = (path in OPEN_PATHS or path.startswith("/c/") or path == "/lp"
+              or path.startswith("/api/"))
     if AUTH_ON and not public:
         if not _valid_session(request.cookies.get("bedel_session", "")):
             if request.method == "GET":
@@ -477,6 +484,33 @@ def tg_status_line(conn) -> str:
 async def healthz():
     """Открытый пинг для аптайм-мониторинга (без секретов)."""
     return "ok"
+
+
+@app.get("/api/firm/{firm_id}")
+async def api_firm(firm_id: str, request: Request, city: str = "Алматы"):
+    """Метрики карточки 2ГИС для внешних потребителей (мост CRM Bedel) — см.
+    CRM_INTEGRATION.md. Тот же вызов, что использует собственный лидген/
+    мониторинг (fetcher.HttpFetcher.parse_firm). Без BRIDGE_API_KEY эндпоинт
+    выключен (404) — не открывать его по умолчанию в локальной разработке."""
+    if not BRIDGE_API_KEY:
+        return PlainTextResponse("Not found", status_code=404)
+    if request.headers.get("x-bridge-key") != BRIDGE_API_KEY:
+        return PlainTextResponse("Unauthorized", status_code=401)
+    cfg = config.Config(city=city, category="", count=1,
+                         city_slug=config.city_to_slug(city), headless=True,
+                         output_dir=".")
+    try:
+        async with fetcher.HttpFetcher(cfg) as f:
+            company = await f.parse_firm(firm_id)
+    except Exception as e:
+        return PlainTextResponse(f"parse failed: {e}", status_code=502)
+    return {
+        "rating": company.rating,
+        "ratings_count": company.ratings_count,
+        "reviews_count": company.reviews_count,
+        "unanswered_count": company.unanswered_count,
+        "fresh_count": company.fresh_count,
+    }
 
 
 @app.get("/lp", response_class=HTMLResponse)

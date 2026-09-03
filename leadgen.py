@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
+
 import db
 import metrics
 from config import city_to_slug
@@ -57,6 +59,11 @@ AUDIT_MAX_AGE_HOURS = int(os.getenv("AUDIT_MAX_AGE_HOURS") or 24)
 # включает): он не раз подставлял в разбор разных конкурентов от прогона к
 # прогону. Флаг определён в outreach — там же, где рендерится разбор.
 SHOW_COMPETITOR = outreach_competitor_flag()
+
+# Мост к CRM Bedel (см. CRM_INTEGRATION.md): пусто — фича выключена, найденные
+# лиды остаются только в CSV/пакете рассылки, как раньше.
+CRM_PUSH_URL = os.getenv("CRM_PUSH_URL") or ""
+BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY") or ""
 
 # статусы прогона
 ST_RUNNING = "running"
@@ -207,8 +214,33 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
     report("готовлю пакет для рассылки…", len(companies), len(companies))
     # снимки пишем до рендера: разбор и динамика читают их из БД
     save_snapshots(companies, cfg)
+    await push_to_crm(companies, cfg)
     return {"companies": companies, "rows": build_rows(companies, cfg), "way": way,
             "csv": write_csv(companies, cfg), "pack": write_outreach_pack(companies, cfg)}
+
+
+async def push_to_crm(companies: list, cfg) -> None:
+    """Отдать найденных лидов в CRM Bedel (см. CRM_INTEGRATION.md), если мост
+    настроен. Best-effort: сбой не должен ронять прогон — лиды и так остались
+    в CSV/пакете рассылки, CRM просто не увидит их автоматически в этот раз."""
+    if not CRM_PUSH_URL or not companies:
+        return
+    payload = [{
+        "firm_id": c.firm_id, "name": c.name, "city": cfg.city,
+        "category": c.category, "url": c.url, "phone": c.phone,
+        "rating": c.rating, "ratings_count": c.ratings_count,
+        "reviews_count": c.reviews_count, "unanswered_count": c.unanswered_count,
+        "fresh_count": c.fresh_count, "priority": c.priority,
+        "priority_reason": c.priority_reason,
+    } for c in companies]
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(CRM_PUSH_URL, json=payload,
+                                  headers={"X-Bridge-Key": BRIDGE_API_KEY})
+            r.raise_for_status()
+        _log(f"  [lead] {len(companies)} лидов отданы в CRM: {r.json()}")
+    except Exception as e:
+        _log(f"  [lead] CRM недоступна, пуш пропущен ({str(e)[:120]})")
 
 
 # ==================== снимки, свежесть, динамика ==========================
@@ -799,6 +831,20 @@ if __name__ == "__main__":
         finally:
             globals()["fetch_one"] = real_fetch_one
             db.DB_PATH = real_db_path
+
+    # --- мост CRM: без CRM_PUSH_URL — тихий no-op, сбой не роняет прогон ---
+    real_push_url = CRM_PUSH_URL
+    try:
+        globals()["CRM_PUSH_URL"] = ""
+        asyncio.run(push_to_crm([Company(firm_id="1", name="Тест")], cfg))
+        checks.append(("пуш в CRM: без URL — no-op", True))
+        globals()["CRM_PUSH_URL"] = "http://127.0.0.1:1/недоступный-порт"
+        asyncio.run(push_to_crm([Company(firm_id="1", name="Тест")], cfg))
+        checks.append(("пуш в CRM: сбой не бросает исключение", True))
+    except Exception:
+        checks.append(("пуш в CRM: сбой не бросает исключение", False))
+    finally:
+        globals()["CRM_PUSH_URL"] = real_push_url
 
     ok = 0
     for label, passed in checks:

@@ -17,10 +17,11 @@
 > правила приоритета, эндпоинты) обязательно отражай в этом README в тот же
 > коммит. Расхождение кода и доки считается багом.
 >
-> Есть внешний потребитель: **CRM Bedel** (`C:\Users\Emil\Desktop\CRM Bedel`)
-> напрямую импортирует `fetcher.py`/`config.py` за метриками карточки. Если
-> меняете `Company`, `parse_firm` или `Config` — см.
-> [CRM_INTEGRATION.md](CRM_INTEGRATION.md).
+> Есть внешний потребитель: **CRM Bedel** (`C:\Users\Emil\Desktop\CRM Bedel`) —
+> двусторонний HTTP-мост (`GET /api/firm/{id}` отдаёт метрики, `leadgen.py`
+> пушит новых лидов в `POST /leads/push` CRM после каждого прогона; `.env`:
+> `BRIDGE_API_KEY`, `CRM_PUSH_URL`). Если меняете `Company`, `parse_firm`,
+> `Config` или сами эндпоинты моста — см. [CRM_INTEGRATION.md](CRM_INTEGRATION.md).
 
 ## Структура файлов
 
