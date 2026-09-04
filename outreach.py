@@ -25,6 +25,7 @@ from typing import Optional
 
 import os
 
+import ai_reply
 import metrics
 from lead_scoring import Company, NA, sort_key
 
@@ -32,6 +33,12 @@ from lead_scoring import Company, NA, sort_key
 # разных конкурентов от прогона к прогону. Одно определение на проект —
 # leadgen берёт флаг отсюда же.
 AUDIT_COMPETITOR = (os.getenv("AUDIT_COMPETITOR") or "0").strip().lower() in (
+    "1", "true", "yes")
+
+# Черновики ответов под цитатами негатива (см. ai_reply.draft_audit_replies).
+# Выключено по умолчанию: требует рабочего OPENAI_API_KEY и делает разбор
+# медленнее (до MAX_AUDIT_DRAFTS запросов к OpenAI на карточку).
+DRAFT_REPLIES = (os.getenv("DRAFT_REPLIES") or "0").strip().lower() in (
     "1", "true", "yes")
 
 # Минимальный разрыв рейтинга, при котором упоминаем конкурента
@@ -177,6 +184,17 @@ blockquote .meta{color:#888;font-size:.85em}
 @media print{body{margin:0}.noprint{display:none}}
 """
 
+# Стили черновиков ответов — отдельно от _AUDIT_CSS и подключаются отдельным
+# <style>, только когда в разборе реально есть хоть один черновик. Иначе при
+# DRAFT_REPLIES=0 в документе появлялись бы мёртвые правила и он переставал
+# быть побайтово тем же, что и без этой фичи.
+_DRAFT_CSS = """
+.draft{background:#f2f9f4;border-left:3px solid #27ae60;margin:10px 0 0;
+       padding:8px 12px;border-radius:0 8px 8px 0}
+.draft .why{color:#666;font-size:.85em;margin-top:4px}
+.quote-note{color:#666;font-size:.9em;margin:10px 0}
+"""
+
 
 def fmt_collected(iso) -> str:
     """ISO-момент сбора -> «02.09.2026, 09:28» по Астане (UTC+5), не по Гринвичу.
@@ -234,23 +252,67 @@ def build_steps(c: Company) -> list:
     return steps
 
 
-def render_quotes(c: Company) -> str:
+async def build_quote_drafts(c: Company) -> list:
+    """Черновики ответов под первыми цитатами разбора (DRAFT_REPLIES=1).
+
+    Список из 0–MAX_AUDIT_DRAFTS элементов, выровненный по индексу с
+    c.negative_quotes (элемент может быть None — сбой по конкретной цитате).
+    DRAFT_REPLIES=0, нет цитат или не задан ключ OpenAI -> [] — вызывающий
+    рендерит разбор без блока черновиков, как раньше.
+    """
+    quotes = getattr(c, "negative_quotes", None) or []
+    if not DRAFT_REPLIES or not quotes:
+        return []
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return []
+    model = os.getenv("OPENAI_MODEL", "").strip()
+    category = c.category if c.category and c.category != NA else ""
+    return await ai_reply.draft_audit_replies(c.name, category, quotes, api_key, model)
+
+
+def render_draft(d: dict) -> str:
+    """Блок «Как бы ответили мы» под одной цитатой. d — {claim_type, reply, why}."""
+    e = html.escape
+    why = f'<div class="why"><i>{e(d["why"])}</i></div>' if d.get("why") else ""
+    return f'<div class="draft"><b>Как бы ответили мы:</b> {e(d["reply"])}{why}</div>'
+
+
+def render_quotes(c: Company, drafts: list = None) -> str:
     """Блок цитат: негатив БЕЗ ОТВЕТА, свежие сверху (их отобрал слой данных).
 
     Пусто -> блока нет совсем. Метки «есть ответ владельца» здесь быть не может:
     отвеченные отзывы сюда не попадают по построению.
+
+    drafts: результат build_quote_drafts — черновики для первых цитат.
+    Пусто/None (DRAFT_REPLIES=0 или сбой генерации целиком) -> ни одного
+    блока черновика, ни строки «остальные N» — разбор рендерится так же,
+    как до появления этой фичи.
     """
     quotes = getattr(c, "negative_quotes", None) or []
     if not quotes:
         return ""
     e = html.escape
+    drafts = drafts or []
+    has_drafts = any(drafts)
     items = []
-    for r in quotes:
+    for i, r in enumerate(quotes):
         rating = int(r.get("rating") or 0)
         stars = "★" * rating + "☆" * (5 - rating)
         text = e(r.get("text") or "(без текста)")
-        items.append(f'<blockquote>{text}<div class="meta">{stars} · '
-                     f'{e(r.get("date") or "")} · без ответа</div></blockquote>')
+        block = (f'<blockquote>{text}<div class="meta">{stars} · '
+                 f'{e(r.get("date") or "")} · без ответа</div>')
+        if i < len(drafts) and drafts[i]:
+            block += render_draft(drafts[i])
+        block += "</blockquote>"
+        items.append(block)
+        if i == 2 and has_drafts:
+            remaining = (c.negative_unanswered or 0) - 2
+            if remaining > 0:
+                items.append(
+                    f'<p class="quote-note">Остальные {remaining} '
+                    f'{plural(remaining, "отзыв", "отзыва", "отзывов")} без ответа '
+                    f'разбираем в рамках пилота.</p>')
     n = len(quotes)
     title = (f"Что видят клиенты: негатив без ответа "
              f"({n} {plural(n, 'отзыв', 'отзыва', 'отзывов')} "
@@ -258,12 +320,14 @@ def render_quotes(c: Company) -> str:
     return f"<h2>{e(title)}</h2>" + "\n".join(items)
 
 
-def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
+def render_audit_html(c: Company, cfg, competitor=None, dynamics=None,
+                      drafts: list = None) -> str:
     """Разбор карточки. ВСЕ числа приходят готовыми (metrics.company_numbers) —
     в шаблоне ничего не вычисляется, иначе разбор снова разойдётся с таблицей.
 
     competitor: блок сравнения рисуется, только если конкурент передан явно
     (решение принимает leadgen по флагу SHOW_COMPETITOR).
+    drafts: черновики ответов под цитатами — см. build_quote_drafts/render_quotes.
     """
     e = html.escape
     n = metrics.company_numbers(c)   # единственный источник чисел
@@ -288,7 +352,8 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
     pains = "\n".join(f"<li>{e(b[0].upper() + b[1:])}.</li>"
                       for b in pain_bullets(c, competitor))
 
-    worst = render_quotes(c)
+    worst = render_quotes(c, drafts)
+    draft_style = f"<style>{_DRAFT_CSS}</style>" if 'class="draft"' in worst else ""
     steps_html = ("<h2>Что можно сделать уже на этой неделе</h2>\n<ol class=\"steps\">"
                   + "".join(f"<li>{step}</li>" for step in build_steps(c))
                   + "</ol>")
@@ -313,7 +378,7 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <title>Разбор карточки 2ГИС — {e(name)}</title>
-<style>{_AUDIT_CSS}</style></head><body>
+<style>{_AUDIT_CSS}</style>{draft_style}</head><body>
 <h1>Разбор карточки 2ГИС — {e(name)}</h1>
 <div class="sub">{e(c.category)} · {e(cfg.city)} · <a href="{e(c.url)}">карточка в 2ГИС</a>
  · <span class="tiny">данные собраны {e(collected)}</span></div>
@@ -443,7 +508,7 @@ def build_rows(companies: list, cfg) -> list:
 
 # ---------- запись пакета ----------
 
-def write_outreach_pack(companies: list, cfg) -> Path:
+async def write_outreach_pack(companies: list, cfg) -> Path:
     """Собрать пакет рассылки. Возвращает путь к папке пакета."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     pack = Path(cfg.output_dir) / f"outreach_{cfg.city_slug}_{cfg.category}_{ts}"
@@ -453,8 +518,9 @@ def write_outreach_pack(companies: list, cfg) -> Path:
     for row in rows:
         # конкурент в файле разбора — только при включённом флаге (как и в панели)
         competitor = row["competitor"] if AUDIT_COMPETITOR else None
+        drafts = await build_quote_drafts(row["c"])
         (pack / row["audit_file"]).write_text(
-            render_audit_html(row["c"], cfg, competitor=competitor),
+            render_audit_html(row["c"], cfg, competitor=competitor, drafts=drafts),
             encoding="utf-8")
 
     (pack / "index.html").write_text(render_dashboard_html(rows, cfg), encoding="utf-8")
@@ -575,6 +641,88 @@ if __name__ == "__main__":
     html_many = render_audit_html(many, cfg)
     checks.append(("цитаты: в заголовке — сколько их и из какого окна",
                    "2 отзыва" in html_many and f"из последних {metrics.WINDOW}" in html_many))
+
+    # --- черновики ответов под цитатами (DRAFT_REPLIES) ---
+    draft1 = {"claim_type": "service", "reply": "Спасибо, разберём с администратором.",
+             "why": "Признаём проблему, не спорим."}
+    draft2 = {"claim_type": "treatment", "reply": "Сожалеем, напишите нам напрямую.",
+             "why": "Общая формула, без деталей визита."}
+    many3 = Company(name="Много", rating=4.0, reviews_count=100, loaded_reviews=50,
+                    unanswered_count=9, negative_unanswered=9,
+                    collected_at="2026-09-01T07:00:00+00:00",
+                    negative_quotes=[{"rating": 1, "date": "2026-08-30", "text": "раз"},
+                                     {"rating": 2, "date": "2026-08-20", "text": "два"},
+                                     {"rating": 1, "date": "2026-08-10", "text": "три"}])
+
+    html_no_drafts = render_audit_html(many3, cfg)
+    checks.append(("черновики: drafts не передан -> документ как раньше, ни следа фичи",
+                   "class=\"draft\"" not in html_no_drafts
+                   and "Как бы ответили" not in html_no_drafts
+                   and "разбираем в рамках пилота" not in html_no_drafts))
+    checks.append(("черновики: пустой список drafts=[] -> тот же результат, что и None",
+                   render_audit_html(many3, cfg, drafts=[]) == html_no_drafts))
+
+    html_drafts = render_audit_html(many3, cfg, drafts=[draft1, draft2])
+    checks.append(("черновики: под первой и второй цитатой ровно два блока",
+                   html_drafts.count("Как бы ответили мы:") == 2))
+    checks.append(("черновики: текст черновика на месте",
+                   "Спасибо, разберём с администратором." in html_drafts))
+    checks.append(("черновики: пояснение — курсивом",
+                   "<i>Признаём проблему, не спорим.</i>" in html_drafts))
+    checks.append(("черновики: под третьей цитатой черновика нет, но есть «остальные N»",
+                   "Остальные 7 отзывов без ответа разбираем в рамках пилота." in html_drafts))
+
+    # меньше 3 цитат вовсе -> «остальные» упоминать нечего, строки нет
+    html_2q = render_audit_html(lead, cfg, drafts=[draft1])  # у lead всего 1 цитата
+    checks.append(("черновики: меньше 3 цитат -> строки «остальные» нет",
+                   "разбираем в рамках пилота" not in html_2q))
+
+    # частичный сбой: черновик для второй цитаты не пришёл (None)
+    html_partial = render_audit_html(many3, cfg, drafts=[draft1, None])
+    checks.append(("черновики: частичный сбой — один блок черновика, не два",
+                   html_partial.count("Как бы ответили мы:") == 1))
+    checks.append(("черновики: частичный сбой всё равно показывает «остальные N»",
+                   "разбираем в рамках пилота" in html_partial))
+
+    # полный сбой генерации (все None) -> будто черновиков не заказывали вовсе
+    html_all_none = render_audit_html(many3, cfg, drafts=[None, None])
+    checks.append(("черновики: полный сбой -> ни блоков, ни строки «остальные»",
+                   "Как бы ответили" not in html_all_none
+                   and "разбираем в рамках пилота" not in html_all_none))
+
+    import asyncio
+
+    async def _fake_batch(company_name, category, quotes, api_key, model="", log=print):
+        return [draft1, draft2][:min(len(quotes), 2)]
+
+    _orig_batch = ai_reply.draft_audit_replies
+    _orig_flag = DRAFT_REPLIES
+    _saved_key = os.environ.get("OPENAI_API_KEY")
+    try:
+        ai_reply.draft_audit_replies = _fake_batch
+
+        globals()["DRAFT_REPLIES"] = False
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        checks.append(("build_quote_drafts: DRAFT_REPLIES=0 -> [] без похода в ai_reply",
+                       asyncio.run(build_quote_drafts(many3)) == []))
+
+        globals()["DRAFT_REPLIES"] = True
+        os.environ.pop("OPENAI_API_KEY", None)
+        checks.append(("build_quote_drafts: DRAFT_REPLIES=1, но нет ключа -> []",
+                       asyncio.run(build_quote_drafts(many3)) == []))
+
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        checks.append(("build_quote_drafts: флаг включён и ключ есть -> зовёт ai_reply",
+                       asyncio.run(build_quote_drafts(many3)) == [draft1, draft2]))
+        checks.append(("build_quote_drafts: нет цитат -> [] без похода в ai_reply",
+                       asyncio.run(build_quote_drafts(answered_only)) == []))
+    finally:
+        ai_reply.draft_audit_replies = _orig_batch
+        globals()["DRAFT_REPLIES"] = _orig_flag
+        if _saved_key is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = _saved_key
 
     # --- БАГ 2: одно число в шапке и в тексте ---
     head = re.search(r'<div class="v[^"]*">(\d+)</div>\s*<div class="l">без ответа',

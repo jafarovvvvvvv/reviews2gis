@@ -17,6 +17,7 @@ help.2gis: вежливо, без рекламы/конкурентов/спор
 import json
 import os
 import re
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -131,6 +132,26 @@ def parse_replies(content: str) -> list:
     return [content[:900]]
 
 
+async def _chat_completion(payload: dict, api_key: str, timeout: float = 90) -> str:
+    """POST на /chat/completions -> content первого варианта. Единственное место
+    в проекте, которое реально ходит в OpenAI — все функции этого модуля вызывают
+    только этот метод, свой HTTP-клиент никто не пишет."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(API_URL, json=payload,
+                                     headers={"Authorization": f"Bearer {api_key}"})
+            data = resp.json()
+    except Exception as e:
+        raise AiReplyError(f"OpenAI недоступен: {e}") from e
+    if resp.status_code != 200:
+        err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
+        raise AiReplyError(f"OpenAI: {err[:200]}")
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise AiReplyError(f"OpenAI: неожиданный формат ответа ({e})") from e
+
+
 async def generate_replies(company_name: str, review: dict, tone: str = "",
                            signature: str = "", category: str = "",
                            api_key: str = "", model: str = "") -> list:
@@ -145,21 +166,128 @@ async def generate_replies(company_name: str, review: dict, tone: str = "",
         # лимит с запасом: у reasoning-моделей сюда входят и токены размышлений
         "max_completion_tokens": 2000,
     }
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(API_URL, json=payload,
-                                     headers={"Authorization": f"Bearer {api_key}"})
-            data = resp.json()
-    except Exception as e:
-        raise AiReplyError(f"OpenAI недоступен: {e}") from e
-    if resp.status_code != 200:
-        err = (data.get("error") or {}).get("message") or f"HTTP {resp.status_code}"
-        raise AiReplyError(f"OpenAI: {err[:200]}")
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        raise AiReplyError(f"OpenAI: неожиданный формат ответа ({e})") from e
+    content = await _chat_completion(payload, api_key)
     return parse_replies(content)
+
+
+MAX_AUDIT_DRAFTS = 2  # разбор показывает готовые черновики только под первыми N цитатами
+
+_VALID_CLAIM_TYPES = {"service", "treatment"}
+
+AUDIT_DRAFT_PROMPT = """Ты помогаешь медицинской клинике в Казахстане подготовить черновик
+ПУБЛИЧНОГО ответа на негативный отзыв в 2ГИС для бесплатного разбора карточки —
+это демонстрация качества нашей работы владельцу клиники, он сам решает, публиковать
+ли этот текст.
+
+ШАГ 1 — классификация претензии (поле claim_type):
+- "service" — жалоба на сервис: очередь, запись, регистратура, ресепшн, цены, счета,
+  график работы, обстановка;
+- "treatment" — жалоба касается лечения, качества медицинской помощи, конкретного
+  врача, диагноза или хода приёма.
+Если сомневаешься — выбирай "treatment": это более осторожный вариант.
+
+ШАГ 2 — черновик ответа (поле reply). Правила действуют всегда:
+- 2–4 предложения, не больше;
+- от лица клиники, обращение на «вы», спокойный тон, без канцелярита и штампов;
+- признай проблему, не спорь с автором отзыва, не оправдывайся;
+- предложи продолжить разговор в личном канале (WhatsApp или по телефону), а не
+  в комментариях;
+- никогда не обещай компенсаций, скидок или возвратов;
+- не используй имя автора отзыва и не пересказывай детали визита, которые он описал.
+
+Если claim_type == "treatment" — ДОПОЛНИТЕЛЬНОЕ ограничение (врачебная тайна,
+это критично и важнее полезности ответа):
+- отвечай только общей формулой: сожалеем, просим написать или позвонить напрямую,
+  разберём ситуацию индивидуально;
+- НИКОГДА не подтверждай и не опровергай, что автор отзыва — пациент клиники;
+- НИКОГДА не упоминай диагноз, лечение, врача, симптомы или ход приёма — ни чтобы
+  подтвердить, ни чтобы опровергнуть;
+- не признавай вину и не описывай, что именно пошло не так в лечении.
+
+Ответ пиши на языке отзыва: {lang_name}.
+
+Верни строго JSON без пояснений:
+{{"claim_type": "service" или "treatment",
+  "reply": "черновик ответа на языке {lang_name}, 2-4 предложения",
+  "why": "одна короткая фраза по-русски — почему такой ответ работает"}}"""
+
+
+def build_draft_messages(company_name: str, category: str, quote: dict) -> list:
+    """Сообщения для классификации+черновика по одной цитате {rating,date,text}."""
+    text = (quote.get("text") or "").strip() or "(отзыв без текста, только оценка)"
+    lang = detect_lang(text)
+    lang_name = "казахский" if lang == "kk" else "русский"
+    rating = quote.get("rating")
+    rating_s = f"{rating}/5" if rating is not None else "без оценки"
+    user = (f"Клиника: «{company_name}»" + (f", профиль: {category}" if category else "")
+            + f".\nНегативный отзыв на 2ГИС (оценка {rating_s}):\n«{text}»")
+    return [
+        {"role": "system", "content": AUDIT_DRAFT_PROMPT.format(lang_name=lang_name)},
+        {"role": "user", "content": user},
+    ]
+
+
+def parse_draft(content: str) -> Optional[dict]:
+    """{claim_type, reply, why} из ответа модели, либо None — реплики не нашлось.
+
+    claim_type неизвестен/битый -> 'treatment': безопасный дефолт, если модель не
+    вернула валидную классификацию, публичный ответ не должен становиться менее
+    осторожным."""
+    content = (content or "").strip()
+    if not content:
+        return None
+    m = re.search(r"\{.*\}", content, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    reply = str(data.get("reply") or "").strip()
+    if not reply:
+        return None
+    claim_type = str(data.get("claim_type") or "").strip().lower()
+    if claim_type not in _VALID_CLAIM_TYPES:
+        claim_type = "treatment"
+    why = str(data.get("why") or "").strip()
+    return {"claim_type": claim_type, "reply": reply[:600], "why": why[:200]}
+
+
+async def draft_public_reply(company_name: str, category: str, quote: dict,
+                             api_key: str, model: str = "") -> Optional[dict]:
+    """Классификация + черновик ответа на одну цитату разбора.
+
+    None — ключа нет или модель не вернула пригодный JSON (вызывающий решает,
+    считать ли это ошибкой). Сетевые/HTTP-сбои бросают AiReplyError."""
+    if not api_key:
+        return None
+    messages = build_draft_messages(company_name, category, quote)
+    payload = {
+        "model": model or DEFAULT_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": 700,
+    }
+    content = await _chat_completion(payload, api_key, timeout=60)
+    return parse_draft(content)
+
+
+async def draft_audit_replies(company_name: str, category: str, quotes: list,
+                              api_key: str, model: str = "", log=print) -> list:
+    """До MAX_AUDIT_DRAFTS черновиков для первых цитат разбора.
+
+    По каждой цитате — свой try/except: одна неудача не должна тушить остальные.
+    Полный сбой (нет ключа, недоступен API) -> [], разбор рендерится без
+    черновиков, как раньше. Совпадает по духу с leadgen.push_to_crm."""
+    drafts = []
+    for q in quotes[:MAX_AUDIT_DRAFTS]:
+        try:
+            d = await draft_public_reply(company_name, category, q, api_key, model)
+        except AiReplyError as e:
+            log(f"  [warn] черновик ответа не получен ({company_name}): {e}")
+            d = None
+        drafts.append(d)
+    return drafts
 
 
 async def generate_for_company(conn, company_row, review: dict) -> list:
@@ -219,6 +347,74 @@ if __name__ == "__main__":
     checks.append(("parse: пусто", parse_replies("") == []))
     checks.append(("parse: битый JSON -> текст",
                    parse_replies('{"replies": [не json') == ['{"replies": [не json']))
+
+    # ---- разбор: черновики под цитатами негатива ----
+    dmsgs = build_draft_messages("Клиника Аруна", "стоматология",
+                                 {"rating": 1, "date": "2026-08-01", "text": "Хамят на ресепшн"})
+    dsys, duser = dmsgs[0]["content"], dmsgs[1]["content"]
+    checks.append(("draft-промпт: врачебная тайна упомянута", "врачебная тайна" in dsys))
+    checks.append(("draft-промпт: claim_type service/treatment",
+                   '"service"' in dsys and '"treatment"' in dsys))
+    checks.append(("draft-промпт: без компенсаций и без имени автора",
+                   "компенсац" in dsys and "имя автора" in dsys))
+    checks.append(("draft-промпт: неуверенность -> treatment (безопасный дефолт)",
+                   "выбирай \"treatment\"" in dsys))
+    checks.append(("draft-промпт: компания и текст цитаты в user",
+                   "Аруна" in duser and "Хамят" in duser))
+    checks.append(("draft-промпт: язык казахский определяется так же, как в build_messages",
+                   "казахский" in build_draft_messages(
+                       "X", "", {"text": "Дәрігер өте жақсы, рахмет үлкен!"})[0]["content"]))
+
+    checks.append(("parse_draft: чистый JSON",
+                   parse_draft('{"claim_type": "service", "reply": "Ответ", "why": "коротко"}')
+                   == {"claim_type": "service", "reply": "Ответ", "why": "коротко"}))
+    checks.append(("parse_draft: неизвестный claim_type -> безопасный дефолт treatment",
+                   parse_draft('{"claim_type": "хз", "reply": "Ответ"}')["claim_type"]
+                   == "treatment"))
+    checks.append(("parse_draft: claim_type отсутствует -> treatment",
+                   parse_draft('{"reply": "Ответ"}')["claim_type"] == "treatment"))
+    checks.append(("parse_draft: нет reply -> None",
+                   parse_draft('{"claim_type": "service"}') is None))
+    checks.append(("parse_draft: пусто -> None", parse_draft("") is None))
+    checks.append(("parse_draft: битый JSON -> None", parse_draft("не json вовсе") is None))
+    checks.append(("parse_draft: код-фенс",
+                   parse_draft('```json\n{"claim_type":"service","reply":"X"}\n```')
+                   == {"claim_type": "service", "reply": "X", "why": ""}))
+
+    import asyncio
+
+    async def _fake_draft_ok(company_name, category, quote, api_key, model=""):
+        return {"claim_type": "service", "reply": f"ответ на: {quote['text']}", "why": "коротко"}
+
+    async def _fake_draft_boom(company_name, category, quote, api_key, model=""):
+        raise AiReplyError("таймаут")
+
+    _orig_draft_public_reply = draft_public_reply
+    quotes3 = [{"rating": 1, "text": "раз"}, {"rating": 2, "text": "два"},
+              {"rating": 1, "text": "три"}]
+
+    globals()["draft_public_reply"] = _fake_draft_ok
+    drafts_ok = asyncio.run(draft_audit_replies("Аруна", "", quotes3, "sk-test"))
+    checks.append(("draft_audit_replies: не больше MAX_AUDIT_DRAFTS",
+                   len(drafts_ok) == MAX_AUDIT_DRAFTS))
+    checks.append(("draft_audit_replies: только первые цитаты",
+                   drafts_ok[0]["reply"] == "ответ на: раз"
+                   and drafts_ok[1]["reply"] == "ответ на: два"))
+
+    globals()["draft_public_reply"] = _fake_draft_boom
+    logs = []
+    drafts_fail = asyncio.run(draft_audit_replies("Аруна", "", quotes3, "sk-test",
+                                                   log=logs.append))
+    checks.append(("draft_audit_replies: сбой API -> None вместо падения",
+                   drafts_fail == [None, None]))
+    checks.append(("draft_audit_replies: сбой залогирован как [warn]",
+                   len(logs) == 2 and all("[warn]" in l for l in logs)))
+    globals()["draft_public_reply"] = _orig_draft_public_reply
+
+    checks.append(("draft_public_reply: без ключа -> None",
+                   asyncio.run(draft_public_reply("X", "", {"text": "т"}, "")) is None))
+    checks.append(("draft_audit_replies: пустой список цитат -> пустой список",
+                   asyncio.run(draft_audit_replies("X", "", [], "sk-test")) == []))
 
     ok = 0
     for label, passed in checks:

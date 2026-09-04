@@ -36,8 +36,8 @@ from config import city_to_slug
 from fetcher import BlockedError, FetchError, fetch_ways, fetcher_class
 from lead_scoring import (CSV_HEADERS, Company, PRIORITY_HIGH, PRIORITY_LOW,
                           PRIORITY_MEDIUM, sort_key)
-from outreach import (AUDIT_COMPETITOR as _AUDIT_COMPETITOR, build_rows,
-                      instagram_link, phone_digits, render_audit_html,
+from outreach import (AUDIT_COMPETITOR as _AUDIT_COMPETITOR, build_quote_drafts,
+                      build_rows, instagram_link, phone_digits, render_audit_html,
                       write_outreach_pack)
 
 
@@ -217,7 +217,8 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
     save_snapshots(companies, cfg)
     await push_to_crm(companies, cfg)
     return {"companies": companies, "rows": build_rows(companies, cfg), "way": way,
-            "csv": write_csv(companies, cfg), "pack": write_outreach_pack(companies, cfg)}
+            "csv": write_csv(companies, cfg),
+            "pack": await write_outreach_pack(companies, cfg)}
 
 
 def _crm_payload(c, cfg) -> dict:
@@ -439,8 +440,9 @@ async def build_audit(firm_id: str, cfg, mode: str = "auto",
     c, sid = await fresh_company(firm_id, cfg, mode, max_age_hours)
     show = SHOW_COMPETITOR if with_competitor is None else with_competitor
     competitor = pick_competitor(cfg, firm_id) if show else None
+    drafts = await build_quote_drafts(c)
     html_out = render_audit_html(c, cfg, competitor=competitor,
-                                 dynamics=dynamics(firm_id, sid))
+                                 dynamics=dynamics(firm_id, sid), drafts=drafts)
     return html_out, c, sid
 
 
