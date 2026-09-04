@@ -6,6 +6,8 @@ SQLite-хранилище мониторинга отзывов (использ�
   companies — отслеживаемые карточки 2GIS + статус фоновой задачи
   reviews   — все увиденные отзывы; «новые» определяются дифом против этой таблицы
   chats     — Telegram-чаты, привязанные к уведомлениям
+  pending_notifications — уведомления, ждущие проверки владельцем сервиса
+                          (см. monitor.moderation_mode)
 
 Соединение открывается на операцию (БД маленькая, накладные расходы — копейки),
 схема создаётся при первом подключении. Самопроверка без сети: python db.py
@@ -85,7 +87,9 @@ CREATE TABLE IF NOT EXISTS insights_reports(
   period       TEXT NOT NULL DEFAULT '',
   reviews_used INTEGER NOT NULL DEFAULT 0,
   data_json    TEXT NOT NULL,
-  html         TEXT NOT NULL);
+  html         TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'pain');  -- 'pain' (разбор болей, insights.py)
+                                               -- | 'monthly' (отчёт клиенту, monthly.py)
 
 CREATE TABLE IF NOT EXISTS rating_history(
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,6 +132,21 @@ CREATE TABLE IF NOT EXISTS auto_runs(
   kind       TEXT NOT NULL,        -- 'digest' (еженедельно) | 'report' (ежемесячно)
   last_ts    TEXT NOT NULL,
   PRIMARY KEY(company_id, kind));
+
+-- Уведомления, задержанные на проверку у владельца сервиса (см. monitor.py).
+-- Клиенту такое сообщение уходит только после подтверждения кнопкой в Telegram.
+CREATE TABLE IF NOT EXISTS pending_notifications(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id   INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  review_id    TEXT NOT NULL DEFAULT '',
+  rating       INTEGER,
+  text         TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | dropped
+  created_at   TEXT NOT NULL,
+  decided_at   TEXT NOT NULL DEFAULT '');
+
+CREATE INDEX IF NOT EXISTS idx_pending_status
+  ON pending_notifications(status, company_id);
 """
 
 
@@ -159,6 +178,12 @@ def _migrate(conn):
         # nonce — для отзыва ссылки кабинета; enabled — включён ли кабинет
         conn.execute("ALTER TABLE companies ADD COLUMN cabinet_nonce TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE companies ADD COLUMN cabinet_enabled INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
+    rep_cols = {r["name"] for r in conn.execute("PRAGMA table_info(insights_reports)")}
+    if rep_cols and "kind" not in rep_cols:
+        # до появления ежемесячного отчёта в таблице лежали только разборы болей
+        conn.execute("ALTER TABLE insights_reports ADD COLUMN "
+                     "kind TEXT NOT NULL DEFAULT 'pain'")
         conn.commit()
 
 
@@ -344,20 +369,32 @@ def replace_topics(conn, company_id: int, topics: list):
     conn.commit()
 
 
+# Виды отчётов в одной таблице: разбор болей (insights.py) и ежемесячный отчёт
+# клиенту (monthly.py). Динамика «к прошлому разу» всегда считается внутри
+# своего вида — иначе разбор сравнивался бы с отчётом и наоборот.
+KIND_PAIN, KIND_MONTHLY = "pain", "monthly"
+
+
 def save_report(conn, company_id: int, period: str, reviews_used: int,
-                data_json: str, html: str) -> int:
+                data_json: str, html: str, kind: str = KIND_PAIN) -> int:
     cur = conn.execute(
         "INSERT INTO insights_reports(company_id,created_at,period,reviews_used,"
-        "data_json,html) VALUES(?,?,?,?,?,?)",
-        (company_id, now_iso(), period, reviews_used, data_json, html))
+        "data_json,html,kind) VALUES(?,?,?,?,?,?,?)",
+        (company_id, now_iso(), period, reviews_used, data_json, html, kind))
     conn.commit()
     return cur.lastrowid
 
 
-def list_reports(conn, company_id: int):
+def list_reports(conn, company_id: int, kind: str = None):
+    """Отчёты компании, новые сверху. kind=None — все виды."""
+    if kind is None:
+        return conn.execute(
+            "SELECT id,created_at,period,reviews_used,kind FROM insights_reports "
+            "WHERE company_id=? ORDER BY id DESC", (company_id,)).fetchall()
     return conn.execute(
-        "SELECT id,created_at,period,reviews_used FROM insights_reports "
-        "WHERE company_id=? ORDER BY id DESC", (company_id,)).fetchall()
+        "SELECT id,created_at,period,reviews_used,kind FROM insights_reports "
+        "WHERE company_id=? AND kind=? ORDER BY id DESC",
+        (company_id, kind)).fetchall()
 
 
 def get_report(conn, report_id: int):
@@ -365,11 +402,12 @@ def get_report(conn, report_id: int):
                         (report_id,)).fetchone()
 
 
-def prev_report_data(conn, company_id: int, before_id: int):
-    """data_json предыдущего отчёта (для динамики месяц-к-месяцу) или None."""
+def prev_report_data(conn, company_id: int, before_id: int, kind: str = KIND_PAIN):
+    """data_json предыдущего отчёта того же вида (динамика) или None."""
     row = conn.execute(
         "SELECT data_json FROM insights_reports WHERE company_id=? AND id<? "
-        "ORDER BY id DESC LIMIT 1", (company_id, before_id)).fetchone()
+        "AND kind=? ORDER BY id DESC LIMIT 1",
+        (company_id, before_id, kind)).fetchone()
     return row["data_json"] if row else None
 
 
@@ -570,6 +608,77 @@ def notify_targets(conn, company_id=None):
     return list(targets.values())
 
 
+def client_targets(conn, company_id: int):
+    """Только чаты клиента: подписанные на компанию, без админских.
+
+    Нужно для модерации: подтверждённое уведомление уходит клиенту, а владелец
+    сервиса его уже видел — второй раз слать ему то же самое незачем.
+    """
+    subs = subscribed_chat_ids(conn, company_id)
+    return [c for c in list_chats(conn)
+            if c["chat_id"] in subs and not c["is_admin"]]
+
+
+def admin_targets(conn):
+    """Админские чаты — владелец сервиса (получатель модерации)."""
+    return [c for c in list_chats(conn) if c["is_admin"]]
+
+
+# ---------- очередь уведомлений на проверку (модерация) ----------
+
+PENDING, SENT, DROPPED = "pending", "sent", "dropped"
+
+
+def add_pending(conn, company_id: int, review_id: str, rating, text: str) -> int:
+    """Отложить уведомление до подтверждения владельцем сервиса. Вернуть id.
+
+    Текст кладём готовым: к моменту подтверждения AI-варианты уже сгенерированы,
+    и клиент получит ровно то, что владелец видел и одобрил.
+    """
+    cur = conn.execute(
+        "INSERT INTO pending_notifications(company_id,review_id,rating,text,"
+        "status,created_at) VALUES(?,?,?,?,?,?)",
+        (company_id, review_id or "", rating, text, PENDING, now_iso()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_pending(conn, pending_id: int):
+    return conn.execute("SELECT * FROM pending_notifications WHERE id=?",
+                        (pending_id,)).fetchone()
+
+
+def list_pending(conn, company_id=None):
+    """Неразобранная очередь, старые сверху (их отправлять первыми)."""
+    if company_id is None:
+        return conn.execute(
+            "SELECT * FROM pending_notifications WHERE status=? ORDER BY id",
+            (PENDING,)).fetchall()
+    return conn.execute(
+        "SELECT * FROM pending_notifications WHERE status=? AND company_id=? "
+        "ORDER BY id", (PENDING, company_id)).fetchall()
+
+
+def decide_pending(conn, pending_id: int, status: str) -> bool:
+    """Отметить решение (SENT/DROPPED). False — записи нет или её уже разобрали:
+    две одинаковые кнопки в разных админ-чатах не должны отправить клиенту
+    одно и то же дважды.
+    """
+    cur = conn.execute(
+        "UPDATE pending_notifications SET status=?, decided_at=? "
+        "WHERE id=? AND status=?", (status, now_iso(), pending_id, PENDING))
+    conn.commit()
+    return bool(cur.rowcount)
+
+
+def reopen_pending(conn, pending_id: int):
+    """Вернуть запись в очередь: отправка клиенту сорвалась, кнопка должна
+    сработать ещё раз, а не «уже отправлено»."""
+    conn.execute("UPDATE pending_notifications SET status=?, decided_at='' "
+                 "WHERE id=?", (PENDING, pending_id))
+    conn.commit()
+
+
 if __name__ == "__main__":
     # самопроверка на временной БД
     import sys
@@ -632,9 +741,34 @@ if __name__ == "__main__":
                        sorted(t["chat_id"] for t in notify_targets(conn, cid)) == ["42", "77"]))
         checks.append(("targets: служебное — только админ",
                        [t["chat_id"] for t in notify_targets(conn)] == ["42"]))
+        # модерация делит тех же получателей на две непересекающиеся группы
+        checks.append(("targets: клиентские — подписка без админов",
+                       [t["chat_id"] for t in client_targets(conn, cid)] == ["77"]))
+        checks.append(("targets: админские — только админ",
+                       [t["chat_id"] for t in admin_targets(conn)] == ["42"]))
         set_chat_admin(conn, 42, False)
         checks.append(("снятие админа", notify_targets(conn) == []))
         set_chat_admin(conn, 42, True)
+
+        # --- очередь уведомлений на проверку ---
+        pid = add_pending(conn, cid, "r2", 1, "текст алерта")
+        checks.append(("очередь: запись создана в статусе pending",
+                       get_pending(conn, pid)["status"] == PENDING
+                       and get_pending(conn, pid)["text"] == "текст алерта"))
+        checks.append(("очередь: попадает в список ожидающих",
+                       [r["id"] for r in list_pending(conn, cid)] == [pid]))
+        checks.append(("очередь: решение принимается один раз",
+                       decide_pending(conn, pid, SENT) is True
+                       and decide_pending(conn, pid, SENT) is False))
+        checks.append(("очередь: разобранное из списка уходит",
+                       list_pending(conn, cid) == []))
+        reopen_pending(conn, pid)
+        checks.append(("очередь: возврат после сбоя отправки",
+                       get_pending(conn, pid)["status"] == PENDING
+                       and get_pending(conn, pid)["decided_at"] == ""))
+        checks.append(("очередь: отклонение закрывает запись",
+                       decide_pending(conn, pid, DROPPED) is True
+                       and get_pending(conn, pid)["status"] == DROPPED))
 
         delete_chat(conn, 77)
         checks.append(("cascade подписок при удалении чата",
@@ -651,8 +785,17 @@ if __name__ == "__main__":
         checks.append(("topics: полная замена", n == 1))
         rid1 = save_report(conn, cid, "янв", 10, '{"a":1}', "<html>1")
         rid2 = save_report(conn, cid, "фев", 20, '{"a":2}', "<html>2")
+        rid_m = save_report(conn, cid, "март", 5, '{"m":1}', "<html>m",
+                            kind=KIND_MONTHLY)
+        checks.append(("reports: вид по умолчанию — разбор болей",
+                       get_report(conn, rid1)["kind"] == KIND_PAIN))
+        checks.append(("reports: фильтр по виду",
+                       [r["id"] for r in list_reports(conn, cid, KIND_MONTHLY)] == [rid_m]))
+        checks.append(("reports: динамика считается внутри своего вида",
+                       prev_report_data(conn, cid, rid_m, KIND_MONTHLY) is None
+                       and prev_report_data(conn, cid, rid_m, KIND_PAIN) == '{"a":2}'))
         checks.append(("reports: список новые первыми",
-                       [r["id"] for r in list_reports(conn, cid)] == [rid2, rid1]))
+                       [r["id"] for r in list_reports(conn, cid)] == [rid_m, rid2, rid1]))
         checks.append(("reports: get", get_report(conn, rid1)["html"] == "<html>1"))
         checks.append(("reports: prev для динамики",
                        prev_report_data(conn, cid, rid2) == '{"a":1}'

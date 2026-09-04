@@ -187,6 +187,24 @@ def fmt_unanswered_batch_header(company_name: str, company_url: str, count: int)
             f'<a href="{e(company_url)}">Карточка в 2ГИС</a>')
 
 
+def fmt_moderation_header(company_name: str, rating, client_chats: list) -> str:
+    """Шапка над задержанным уведомлением (уходит только владельцу сервиса).
+
+    Сразу говорит, кому уйдёт текст после подтверждения: если чат клиента не
+    подписан, жать «отправить» бессмысленно, и это лучше видеть до нажатия.
+    """
+    e = html.escape
+    kind = "негатив" if is_negative(rating) else "отзыв"
+    if client_chats:
+        who = ", ".join(e(c["title"] or c["chat_id"]) for c in client_chats)
+        tail = f"После подтверждения уйдёт клиенту ({who})."
+    else:
+        tail = ("Чат клиента не подписан на компанию — отправлять пока некому "
+                "(подпишите на странице компании).")
+    return (f"🕓 <b>На проверку</b> — {e(company_name)} · {kind}\n"
+            f"{tail}\n\n")
+
+
 def fmt_check_error(company_name: str, error: str) -> str:
     return (f"⚠️ Не удалось проверить отзывы «{html.escape(company_name)}»: "
             f"{html.escape(error)}")
@@ -252,6 +270,17 @@ if __name__ == "__main__":
     checks.append(("ai: статичный шаблон не дублируется", "Черновик ответа" not in ai))
     no_ai = fmt_review_alert("Y", "u", {"rating": 1, "text": "плохо"}, ai_replies=[])
     checks.append(("ai: пустой список -> старый шаблон", "Черновик ответа" in no_ai))
+
+    # --- шапка модерации: видно, кому уйдёт текст после подтверждения ---
+    mh = fmt_moderation_header("Клиника <X>", 1, [{"title": "Чат клиента",
+                                                   "chat_id": "77"}])
+    checks.append(("модерация: заголовок и вид отзыва",
+                   "На проверку" in mh and "негатив" in mh))
+    checks.append(("модерация: назван чат-получатель",
+                   "Чат клиента" in mh and "Клиника &lt;X&gt;" in mh))
+    mh_empty = fmt_moderation_header("Y", 5, [])
+    checks.append(("модерация: получателя нет -> сказано прямо",
+                   "не подписан" in mh_empty and "отзыв" in mh_empty))
 
     ur = fmt_unanswered_review("Y", "u", {"rating": 1, "date_created": "2026-06-01",
                                           "author": "Иван", "text": "плохо"})

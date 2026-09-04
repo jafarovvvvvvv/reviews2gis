@@ -41,6 +41,7 @@ import insights
 import leadgen
 import metrics
 import monitor
+import monthly
 import outreach
 import tg
 
@@ -153,6 +154,8 @@ app = FastAPI(lifespan=lifespan)
 
 # Имя продукта (bedel, каз. — авторитет, репутация, вес в обществе). Домен bedelreviews.kz
 BRAND = "Bedel"
+# Подписи видов отчётов (db.KIND_*) — одни и те же в панели и в кабинете клиента
+REPORT_KINDS = {db.KIND_MONTHLY: "отчёт за месяц", db.KIND_PAIN: "разбор болей"}
 TAGLINE = "вес вашей репутации"
 
 # Копирование в буфер. navigator.clipboard есть ТОЛЬКО в защищённом контексте
@@ -342,6 +345,8 @@ ol.help li{margin:6px 0}
 .runline .grow{flex:1 1 220px;min-width:180px}
 details.msg{max-width:460px}
 details.msg pre{margin:8px 0 0;font-size:.9em}
+details.msg .variant{margin:10px 0 0}
+details.msg .variant b{font-size:.85em;color:var(--muted,#777)}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media (max-width:640px){header{padding:12px 16px}header nav{margin-left:auto}
   .tagline{display:none}main{margin-top:14px}.addform{flex-direction:column}}
@@ -678,11 +683,14 @@ async def client_cabinet(token: str):
 
     report_link = ""
     if reports:
-        rid = reports[0]["id"]
-        report_link = (f'<div class="card"><h2>Аналитический отчёт</h2>'
-                       f'<p class="muted">Разбор болей клиентов и рекомендации '
-                       f'за {e(reports[0]["period"])}.</p>'
-                       f'<a class="btn" href="/c/{token}/report/{rid}" '
+        last = reports[0]
+        monthly_kind = last["kind"] == db.KIND_MONTHLY
+        title = "Отчёт за месяц" if monthly_kind else "Разбор болей"
+        note = ("Что изменилось за период и на что жаловались чаще всего"
+                if monthly_kind else "Разбор болей клиентов и рекомендации")
+        report_link = (f'<div class="card"><h2>{title}</h2>'
+                       f'<p class="muted">{note} — {e(last["period"])}.</p>'
+                       f'<a class="btn" href="/c/{token}/report/{last["id"]}" '
                        f'target="_blank" rel="noopener">Открыть отчёт →</a></div>')
 
     body = f"""
@@ -1076,14 +1084,21 @@ async def company_page(cid: int, request: Request):
  Ниже — дополнительные получатели именно этой компании (например, чат клиента).</p>
  {routing}
 </div>
-<div class="card"><h2>Аналитический отчёт болей</h2>
- <p class="muted">Глубокий сбор до 300 отзывов, карта болей с цитатами-уликами и
- конкретные рекомендации. Готовый отчёт уходит в Telegram файлом (печать в PDF —
- Ctrl+P). Со второго отчёта появляется динамика «было → стало».</p>
+<div class="card"><h2>Отчёты</h2>
+ <p class="muted"><b>Отчёт за месяц</b> — то, что обещано клиенту: сколько новых
+ отзывов и сколько негативных, на что жалуются чаще всего, динамика к прошлому
+ месяцу и что осталось без ответа. Строится по накопленным данным, без похода
+ в 2ГИС.<br>
+ <b>Разбор болей</b> — глубокий инструмент на заказ: сбор до 300 отзывов, карта
+ болей с цитатами-уликами и рекомендации. Оба печатаются в PDF (Ctrl+P) и
+ уходят в Telegram файлом.</p>
+ <form class="inline" method="post" action="/companies/{cid}/monthly">
+   <button class="primary">Отчёт за месяц</button></form>
  <form class="inline" method="post" action="/companies/{cid}/report">
-   <button class="primary">Сгенерировать отчёт</button></form>
- {('<table><tr><th>Когда</th><th>Период данных</th><th>Объём</th><th></th></tr>'
+   <button>Разбор болей</button></form>
+ {('<table><tr><th>Когда</th><th>Вид</th><th>Период данных</th><th>Объём</th><th></th></tr>'
    + ''.join(f'<tr><td class="mono">{fmt_dt(r["created_at"])}</td>'
+             f'<td>{e(REPORT_KINDS.get(r["kind"], r["kind"]))}</td>'
              f'<td>{e(r["period"])}</td><td>{r["reviews_used"]} отз.</td>'
              f'<td class="links"><a href="/report/{r["id"]}" target="_blank" rel="noopener">открыть</a> '
              f'<form class="inline" method="post" action="/report/{r["id"]}/send">'
@@ -1127,7 +1142,7 @@ async def _send_report(report_id: int) -> list:
 
 
 async def _report_task(cid: int):
-    """Фон: построить отчёт и разослать; об ошибке сказать админам в TG."""
+    """Фон: построить разбор болей и разослать; об ошибке сказать админам в TG."""
     try:
         rid = await insights.build_report(cid, brand=BRAND)
     except Exception as ex:
@@ -1140,6 +1155,22 @@ async def _report_task(cid: int):
         return
     for err in await _send_report(rid):
         print(f"[report] {err}", flush=True)
+
+
+async def _monthly_task(cid: int):
+    """Фон: собрать ежемесячный отчёт клиенту и разослать (см. monthly.py)."""
+    try:
+        rid = await monthly.build_report(cid, brand=BRAND)
+    except Exception as ex:
+        conn = db.connect()
+        try:
+            await monitor.notify_chats(
+                conn, f"⚠ Отчёт за месяц не построился: {html.escape(str(ex)[:300])}")
+        finally:
+            conn.close()
+        return
+    for err in await _send_report(rid):
+        print(f"[monthly] {err}", flush=True)
 
 
 async def _audit_task(domain: str, slug: str, firm_id: str):
@@ -1179,8 +1210,28 @@ async def companies_report(cid: int):
                         err="AI не настроен: добавьте ключ OpenAI в «Настройках»")
     spawn(_report_task(cid))
     return redirect(f"/company/{cid}",
-                    msg="Отчёт готовится (~2–4 мин): сбор до 300 отзывов и анализ. "
-                        "Придёт в Telegram и появится в списке отчётов.")
+                    msg="Разбор болей готовится (~2–4 мин): сбор до 300 отзывов и "
+                        "анализ. Придёт в Telegram и появится в списке отчётов.")
+
+
+@app.post("/companies/{cid}/monthly")
+async def companies_monthly(cid: int):
+    """Ежемесячный отчёт клиенту — по накопленным данным, без похода в 2ГИС."""
+    conn = db.connect()
+    try:
+        if db.get_company(conn, cid) is None:
+            return redirect("/", err="Компания не найдена")
+        api_key, _ = ai_reply.get_ai_settings(conn)
+    finally:
+        conn.close()
+    # без ключа отчёт всё равно строится, просто без разметки тем — предупредим
+    note = ("" if api_key else
+            " AI не настроен, поэтому тем жалоб в отчёте не будет — "
+            "добавьте ключ OpenAI в «Настройках».")
+    spawn(_monthly_task(cid))
+    return redirect(f"/company/{cid}",
+                    msg="Отчёт за месяц готовится. Придёт в Telegram и появится "
+                        "в списке отчётов." + note)
 
 
 @app.get("/report/{rid}", response_class=HTMLResponse)
@@ -1297,8 +1348,8 @@ async def leads_page(request: Request):
     sender_warn = ("" if sender else
                    '<div class="flash err" style="font-weight:400">В сообщениях будет '
                    'заглушка <b>[Имя]</b> — впишите своё имя в '
-                   '<a href="/settings">настройках</a>, чтобы открывашки были готовы '
-                   'к отправке.</div>')
+                   '<a href="/settings">настройках</a>, чтобы тексты касаний были '
+                   'готовы к отправке.</div>')
     busy_note = ('<p class="muted">Прогон уже идёт — новый запустится только после '
                  'него.</p>' if leadgen.any_busy() else "")
 
@@ -1413,6 +1464,13 @@ async def lead_run_page(rid: str, request: Request):
         scope_hint = (f' · {branches} '
                       f'{outreach.plural(branches, "филиал", "филиала", "филиалов")}'
                       if branches and branches > 1 else "")
+        # тексты первого касания — по одному на канал: пишешь тем, что открыл,
+        # а не правишь «универсальный» текст под каждый канал руками
+        variants = "".join(
+            f'<div class="variant"><b>{e(outreach.TOUCH_LABELS[ch])}</b>'
+            f'<pre id="m{i}_{ch}">{e(row["messages"][ch])}</pre>'
+            f'<button class="small" onclick="copyMsg(\'m{i}_{ch}\',this)">Копировать</button>'
+            f'</div>' for ch in outreach.TOUCH_CHANNELS)
         trs.append(f"""<tr>
  <td>{e(c.priority)}<div class="meta">{e(c.priority_reason)}</div></td>
  <td><b>{e(c.name)}</b><div class="meta">{e(c.phone)}</div></td>
@@ -1423,9 +1481,7 @@ async def lead_run_page(rid: str, request: Request):
   <div class="meta">негатива: {e(metrics.fmt_int(n["negative_unanswered"]))} ·
    {e(metrics.WINDOW_LABEL)}</div></td>
  <td class="links">{' '.join(links)}</td>
- <td><details class="msg"><summary>сообщение</summary>
-  <pre id="m{i}">{e(row["message"])}</pre>
-  <button class="small" onclick="copyMsg('m{i}',this)">Копировать</button></details></td>
+ <td><details class="msg"><summary>первое касание</summary>{variants}</details></td>
  <td>{action}</td>
 </tr>""")
 
@@ -1434,7 +1490,7 @@ async def lead_run_page(rid: str, request: Request):
                       for p, n in counts.items())
     table = (f'<table><tr><th>Приоритет и причина</th><th>Компания</th>'
              f'<th>Рейтинг 2ГИС</th><th>Без ответа</th>'
-             f'<th>Ссылки</th><th>Открывашка</th><th>Мониторинг</th></tr>'
+             f'<th>Ссылки</th><th>Первое касание</th><th>Мониторинг</th></tr>'
              f'{"".join(trs)}</table>' if trs else "")
     err_note = (f'<div class="flash err">{e(run.error)}</div>' if run.error else "")
     pack_links = (f'<div class="links" style="margin-top:12px">'
@@ -1628,6 +1684,8 @@ async def settings_page(request: Request):
         interval = db.get_setting(conn, "check_interval_min", "360")
         max_per_hour = db.get_setting(conn, "max_checks_per_hour", "40")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
+        moderation = monitor.moderation_mode(conn)
+        pending = len(db.list_pending(conn))
         fetch_mode = db.get_setting(conn, "fetch_mode", "auto")
         auto_digest = db.get_setting(conn, "auto_digest", "0") == "1"
         auto_report = db.get_setting(conn, "auto_report", "0") == "1"
@@ -1645,6 +1703,7 @@ async def settings_page(request: Request):
         if ai_key else "sk-…"
     token_hint = (f"сохранён: …{e(token[-6:])} — введите новый, чтобы заменить"
                   if token else "1234567890:AA…")
+    pending_note = (f". Сейчас ждут вашего решения: <b>{pending}</b>" if pending else "")
 
     chat_rows = "".join(f"""<tr><td>{e(ch['title'])}</td><td>{e(ch['chat_id'])}</td>
  <td>{'<span class="badge b-new">админ — получает всё</span>' if ch['is_admin']
@@ -1690,13 +1749,23 @@ async def settings_page(request: Request):
    на слабом канале. Меняйте, только если 2ГИС перестанет отдавать данные простым запросом.</span></p>
   <p><label><input type="checkbox" name="notify_all" {'checked' if notify_all else ''}>
    уведомлять обо <b>всех</b> новых отзывах (иначе — только о негативе, оценка ≤3)</label></p>
+  <p><b>Что уходит клиенту только после моего подтверждения</b><br>
+   <select name="moderation" style="width:340px">
+    <option value="all" {'selected' if moderation == 'all' else ''}>Всё сначала мне</option>
+    <option value="negative" {'selected' if moderation == 'negative' else ''}>Негатив (≤3) мне, позитив и нейтраль клиенту сразу</option>
+    <option value="off" {'selected' if moderation == 'off' else ''}>Всё клиенту сразу, без проверки</option>
+   </select>
+   <span class="muted">Задержанное уведомление приходит в админ-чат с кнопками
+   «Отправить клиенту» / «Не отправлять». Пока ответы пишутся руками, держите
+   «всё сначала мне»{pending_note}.</span></p>
   <p><label><input type="checkbox" name="auto_digest" {'checked' if auto_digest else ''}>
    слать клиентам <b>еженедельный дайджест</b> (рейтинг, новые отзывы, негатив)</label></p>
   <p><label><input type="checkbox" name="auto_report" {'checked' if auto_report else ''}>
-   строить <b>ежемесячный отчёт болей</b> автоматически и слать получателям</label></p>
+   раз в месяц строить <b>отчёт за месяц</b> и слать получателям (что изменилось,
+   на что жалуются чаще всего, что осталось без ответа)</label></p>
   <p><b>Подпись в письмах лидам</b><br>
-   <span class="muted">Имя подставляется в сообщение-открывашку, контакт — в
-   подпись аудита («Поиск лидов»). Пусто — в тексте останется [Имя].</span><br>
+   <span class="muted">Имя подставляется в текст первого касания, контакт — в
+   подпись разбора («Поиск лидов»). Пусто — в тексте останется [Имя].</span><br>
    <input type="text" name="sender_name" value="{e(sender_name)}"
           placeholder="Ваше имя" style="margin-bottom:6px">
    <input type="text" name="sender_contact" value="{e(sender_contact)}"
@@ -1745,6 +1814,9 @@ async def settings_save(request: Request):
     interval = str(form.get("interval", "360")).strip()
     max_per_hour = str(form.get("max_per_hour", "40")).strip()
     notify_all = "1" if form.get("notify_all") else "0"
+    moderation = str(form.get("moderation", monitor.MODERATION_DEFAULT)).strip()
+    if moderation not in monitor.MODERATION_MODES:
+        moderation = monitor.MODERATION_DEFAULT
     fetch_mode = str(form.get("fetch_mode", "auto")).strip()
     if fetch_mode not in monitor.FETCH_MODES:
         fetch_mode = "auto"
@@ -1772,6 +1844,7 @@ async def settings_save(request: Request):
         db.set_setting(conn, "check_interval_min", interval)
         db.set_setting(conn, "max_checks_per_hour", max_per_hour)
         db.set_setting(conn, "notify_all", notify_all)
+        db.set_setting(conn, "moderation", moderation)
         db.set_setting(conn, "fetch_mode", fetch_mode)
         db.set_setting(conn, "auto_digest", auto_digest)
         db.set_setting(conn, "auto_report", auto_report)

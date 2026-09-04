@@ -179,6 +179,107 @@ async def notify_owner_test(conn, text: str, reply_markup=None) -> list:
     return []
 
 
+# ---------- модерация: что уходит клиенту сразу, а что сначала мне ----------
+#
+# Ответы на старте пишутся руками, и клиент не должен получить сырой текст
+# раньше, чем его посмотрел владелец сервиса. Режимы (настройка moderation):
+#   all      — всё сначала мне (по умолчанию: ничего не улетает клиенту само);
+#   negative — негатив (оценка <= 3) на проверку, позитив и нейтраль (4–5)
+#              уходят клиенту сразу;
+#   off      — всё уходит клиенту сразу (прежнее поведение).
+MODERATION_MODES = ("all", "negative", "off")
+MODERATION_DEFAULT = "all"
+
+
+def moderation_mode(conn) -> str:
+    """Режим модерации из настроек; мусор в значении -> безопасный «всё ко мне»."""
+    mode = db.get_setting(conn, "moderation", MODERATION_DEFAULT)
+    return mode if mode in MODERATION_MODES else MODERATION_DEFAULT
+
+
+def needs_review(mode: str, rating) -> bool:
+    """Задержать ли это уведомление на проверку у владельца сервиса."""
+    if mode == "off":
+        return False
+    if mode == "negative":
+        # оценки нет — считаем случай спорным и показываем владельцу: ошибиться
+        # в эту сторону дешевле, чем отправить клиенту неудачный текст
+        return rating is None or tg.is_negative(rating)
+    return True  # «all» и любое непонятное значение — задерживаем
+
+
+async def notify_admins(conn, text: str, reply_markup=None) -> list:
+    """Сообщение только владельцу сервиса (админ-чаты), без чатов клиента."""
+    token = db.get_setting(conn, "bot_token")
+    if not token:
+        return ["Telegram не настроен (нет токена) — уведомление не отправлено"]
+    chats = db.admin_targets(conn)
+    if not chats:
+        return ["нет админ-чатов: напишите боту /start"]
+    errors = []
+    for chat in chats:
+        try:
+            await tg.send_message(token, chat["chat_id"], text, reply_markup=reply_markup)
+        except tg.TgError as e:
+            errors.append(f"чат {chat['chat_id']}: {e}")
+    return errors
+
+
+async def notify_clients(conn, text: str, company_id: int, reply_markup=None) -> list:
+    """Сообщение только чатам клиента (подписки на компанию, без админских)."""
+    token = db.get_setting(conn, "bot_token")
+    if not token:
+        return ["Telegram не настроен (нет токена) — уведомление не отправлено"]
+    chats = db.client_targets(conn, company_id)
+    if not chats:
+        return ["нет чатов клиента: подпишите чат на компанию на её странице"]
+    errors = []
+    for chat in chats:
+        try:
+            await tg.send_message(token, chat["chat_id"], text, reply_markup=reply_markup)
+        except tg.TgError as e:
+            errors.append(f"чат {chat['chat_id']}: {e}")
+    return errors
+
+
+async def hold_for_review(conn, company_id: int, company_name: str, rv: dict,
+                          text: str) -> list:
+    """Положить уведомление в очередь и показать его владельцу с кнопками.
+
+    Клиенту ничего не уходит, пока владелец не нажмёт «Отправить клиенту»
+    (обработка — bot.handle_callback, действия send/drop).
+    """
+    pid = db.add_pending(conn, company_id, rv.get("review_id", ""),
+                         rv.get("rating"), text)
+    kb = tg.inline_kb(
+        [tg.btn_cb("✅ Отправить клиенту", f"send:{pid}"),
+         tg.btn_cb("🚫 Не отправлять", f"drop:{pid}")],
+        [tg.btn_cb("✍ Ещё вариант ответа", f"reply:{company_id}")])
+    return await notify_admins(
+        conn, tg.fmt_moderation_header(company_name, rv.get("rating"),
+                                       db.client_targets(conn, company_id)) + text,
+        reply_markup=kb)
+
+
+async def publish_pending(conn, pending_id: int) -> tuple:
+    """Подтверждённое уведомление -> чатам клиента. (ok, текст результата)."""
+    row = db.get_pending(conn, pending_id)
+    if row is None:
+        return False, "Уведомление не найдено."
+    if row["status"] != db.PENDING:
+        return False, ("Уже отправлено клиенту." if row["status"] == db.SENT
+                       else "Это уведомление уже отклонено.")
+    # занимаем запись ДО отправки: два админ-чата не должны отправить дважды
+    if not db.decide_pending(conn, pending_id, db.SENT):
+        return False, "Кто-то уже разобрал это уведомление."
+    errors = await notify_clients(conn, row["text"], row["company_id"])
+    if errors:
+        # не ушло -> возвращаем в очередь, кнопка должна работать повторно
+        db.reopen_pending(conn, pending_id)
+        return False, "Не ушло: " + "; ".join(errors)
+    return True, "Отправлено клиенту."
+
+
 async def notify_document(conn, filename: str, content: bytes, caption: str,
                           company_id=None) -> list:
     """Разослать файл (отчёт) тем же получателям, что и notify_chats."""
@@ -242,14 +343,14 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
     Возвращает {"new": [...], "errors": [...]}.
     """
     conn = db.connect()
-    result = {"new": [], "errors": []}
+    result = {"new": [], "errors": [], "held": 0}
     try:
         row = db.get_company(conn, company_id)
         if row is None:
-            return {"new": [], "errors": ["компания удалена"]}
+            return {"new": [], "errors": ["компания удалена"], "held": 0}
         if row["firm_id"] == "demo":  # демо-компания не скрапится
             db.set_company_status(conn, company_id, db.ST_OK, "")
-            return {"new": [], "errors": []}
+            return {"new": [], "errors": [], "held": 0}
         # Не было ни одной успешной проверки -> это baseline, даже если проверку
         # запустили вручную: первичная загрузка могла упасть (нет браузера и т.п.),
         # и первый успешный прогон не должен счесть все старые отзывы «новыми»
@@ -309,6 +410,7 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
         # уведомления: старые первыми, чтобы лента в Telegram шла хронологично
         new.sort(key=lambda r: r.get("date_created") or "")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
+        mode = moderation_mode(conn)
         fresh_row = db.get_company(conn, company_id)  # с обновлённым именем/тоном
         for rv in new:
             if notify_all or tg.is_negative(rv.get("rating")):
@@ -320,12 +422,18 @@ async def check_company(company_id: int, baseline: bool = False) -> dict:
                 except ai_reply.AiReplyError as e:
                     print(f"[ai] {e}", flush=True)
                     result["errors"].append(str(e))
+                text = tg.fmt_review_alert(c.name, row["url"], rv, ai_replies=ai)
+                if needs_review(mode, rv.get("rating")):
+                    # клиенту не уходит ничего, пока владелец не подтвердит
+                    result["errors"] += await hold_for_review(
+                        conn, company_id, c.name, rv, text)
+                    result["held"] += 1
+                    continue
                 kb = tg.inline_kb(
                     [tg.btn_cb("✍ Ещё вариант ответа", f"reply:{company_id}")],
                     [tg.btn_url("Открыть в 2ГИС", row["url"])])
                 result["errors"] += await notify_chats(
-                    conn, tg.fmt_review_alert(c.name, row["url"], rv, ai_replies=ai),
-                    company_id=company_id, reply_markup=kb)
+                    conn, text, company_id=company_id, reply_markup=kb)
         result["new"] = new
         return result
     finally:
@@ -367,7 +475,13 @@ async def send_weekly_digest(company_id: int) -> list:
 
 async def run_auto_tasks():
     """Авто-дайджесты (раз в 7 дней) и авто-отчёты (раз в 30 дней) для компаний,
-    у которых это включено в настройках. Отчёт строим максимум один за тик."""
+    у которых это включено в настройках. Отчёт строим максимум один за тик.
+
+    Ежемесячный отчёт клиенту — monthly.py: это то, что мы обещаем в оффере
+    («раз в месяц: что изменилось и на что жалуются чаще всего»). Глубокий
+    разбор болей (insights.py) остался отдельным инструментом на заказ —
+    из панели и по команде /report.
+    """
     conn = db.connect()
     try:
         digest_on = db.get_setting(conn, "auto_digest", "0") == "1"
@@ -390,15 +504,15 @@ async def run_auto_tasks():
             due = db.auto_due(conn, c["id"], "report", 30)
             conn.close()
             if due:
-                import insights
+                import monthly
                 try:
-                    rid = await insights.build_report(c["id"])
+                    rid = await monthly.build_report(c["id"])
                     conn = db.connect()
                     rep = db.get_report(conn, rid)
                     fname = f"otchet_{c['id']}_{rep['created_at'][:10]}.html"
                     await notify_document(
                         conn, fname, rep["html"].encode("utf-8"),
-                        f"📊 Ежемесячный отчёт — {c['name']} · {rep['period']}",
+                        f"📊 Отчёт за месяц — {c['name']} · {rep['period']}",
                         company_id=c["id"])
                     db.mark_auto(conn, c["id"], "report")
                     conn.close()
@@ -539,6 +653,92 @@ if __name__ == "__main__":
         globals()["notify_chats"] = _real_notify
         db.bump_errors, db.clear_errors = _real_bump, _real_clear
         _alerted.clear()
+
+    # --- модерация: кто что получает ---
+    checks.append(("модерация: по умолчанию всё сначала владельцу",
+                   MODERATION_DEFAULT == "all"
+                   and needs_review("all", 5) and needs_review("all", 1)))
+    checks.append(("модерация: режим negative — негатив на проверку",
+                   needs_review("negative", 3) and needs_review("negative", 1)))
+    checks.append(("модерация: режим negative — 4 и 5 уходят клиенту сразу",
+                   not needs_review("negative", 4)
+                   and not needs_review("negative", 5)))
+    checks.append(("модерация: режим off — ничего не задерживаем",
+                   not needs_review("off", 1) and not needs_review("off", 5)))
+    checks.append(("модерация: без оценки — на проверку, а не мимо владельца",
+                   needs_review("negative", None)))
+
+    _settings = {}
+    _real_get = db.get_setting
+    try:
+        db.get_setting = lambda conn, key, default="": _settings.get(key, default)
+        checks.append(("модерация: пустая настройка -> режим по умолчанию",
+                       moderation_mode(None) == MODERATION_DEFAULT))
+        _settings["moderation"] = "negative"
+        checks.append(("модерация: настройка читается", moderation_mode(None) == "negative"))
+        _settings["moderation"] = "мусор"
+        checks.append(("модерация: мусор в настройке -> безопасный режим",
+                       moderation_mode(None) == MODERATION_DEFAULT))
+    finally:
+        db.get_setting = _real_get
+
+    # --- сквозная проверка модерации на временной БД ---
+    # Самое дорогое место, где можно ошибиться: клиент не должен получить текст,
+    # которого владелец не видел, и не должен получить его дважды.
+    import tempfile
+    from pathlib import Path
+
+    _real_path, _real_send = db.DB_PATH, tg.send_message
+    _tmp = tempfile.TemporaryDirectory()
+    sent = []
+
+    async def _fake_send(token, chat_id, text, reply_markup=None):
+        sent.append((str(chat_id), text, bool(reply_markup)))
+        return {}
+
+    try:
+        db.DB_PATH = Path(_tmp.name) / "t.db"
+        tg.send_message = _fake_send
+        conn = db.connect()
+        db.set_setting(conn, "bot_token", "T")
+        cid = db.add_company(conn, "111", "https://2gis.kz", "almaty", "u")
+        db.update_company_info(conn, cid, name="Клиника", status=db.ST_OK, error="")
+        db.add_chat(conn, "1", "Мой чат")        # первый чат становится админом
+        db.add_chat(conn, "2", "Чат клиента")
+        db.set_subscriptions(conn, cid, ["2"])
+
+        rv = {"review_id": "r1", "rating": 5, "text": "Спасибо!"}
+        asyncio.run(hold_for_review(conn, cid, "Клиника", rv, "ТЕЛО"))
+        checks.append(("модерация: задержанное ушло только владельцу, с кнопками",
+                       [c for c, _, _ in sent] == ["1"] and sent[0][2] is True
+                       and "На проверку" in sent[0][1] and "ТЕЛО" in sent[0][1]))
+        checks.append(("модерация: в шапке назван чат-получатель",
+                       "Чат клиента" in sent[0][1]))
+
+        pid = db.list_pending(conn, cid)[0]["id"]
+        sent.clear()
+        ok_pub, note = asyncio.run(publish_pending(conn, pid))
+        checks.append(("модерация: подтверждение уходит только клиенту",
+                       ok_pub and [c for c, _, _ in sent] == ["2"]
+                       and sent[0][1] == "ТЕЛО"))
+        sent.clear()
+        ok_again, note2 = asyncio.run(publish_pending(conn, pid))
+        checks.append(("модерация: второе нажатие не шлёт дубль",
+                       ok_again is False and sent == []
+                       and "Уже отправлено" in note2))
+
+        db.set_subscriptions(conn, cid, [])   # чат клиента отписали
+        pid2 = db.add_pending(conn, cid, "r2", 1, "ТЕЛО 2")
+        sent.clear()
+        ok_none, note3 = asyncio.run(publish_pending(conn, pid2))
+        checks.append(("модерация: некому слать -> честная ошибка, не «успех»",
+                       ok_none is False and "Не ушло" in note3))
+        checks.append(("модерация: сорвавшаяся отправка возвращается в очередь",
+                       db.get_pending(conn, pid2)["status"] == db.PENDING))
+        conn.close()
+    finally:
+        db.DB_PATH, tg.send_message = _real_path, _real_send
+        _tmp.cleanup()
 
     _check_times.clear()
     from datetime import datetime, timedelta, timezone

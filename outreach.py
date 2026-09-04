@@ -3,12 +3,19 @@
 
 Вход — список Company после прогона (leadgen.py). Выход — «пакет для рассылки»
 в папке output/outreach_<город>_<категория>_<дата>/:
-  index.html       — дашборд: лиды по приоритету, готовое персональное
-                     сообщение (кнопка «копировать»), ссылка wa.me с уже
+  index.html       — дашборд: лиды по приоритету, тексты первого касания под
+                     каждый канал (кнопка «копировать»), ссылка wa.me с уже
                      подставленным текстом, ссылка на аудит
   audit_<id>.html  — одностраничный аудит карточки: метрики, худшие отзывы,
-                     сравнение с конкурентом, «3 шага» (печать в PDF — Ctrl+P)
-  outreach.csv     — Название;Телефон;WhatsApp;Сообщение (для своего учёта)
+                     сравнение с конкурентом, два шага (печать в PDF — Ctrl+P)
+  outreach.csv     — Название;Приоритет;Телефон;WhatsApp + текст на каждый канал
+
+Что продаём (от этого зависят все тексты здесь): не инструмент, а снятую
+работу. «Слежу за карточкой в 2ГИС. Появился отзыв, особенно негативный —
+присылаю готовый ответ в WhatsApp в тот же день, вы вставляете. Раз в месяц
+отчёт: что изменилось и на что жалуются чаще всего.» Мониторинг как ценность
+не продаётся (у 2ГИС свои бесплатные уведомления), рост рейтинга по срокам
+не обещается — см. build_steps/rating_note.
 
 Конкурент для сравнения берётся из этого же прогона (та же категория и город):
 лучший рейтинг при >=30 отзывах. Дополнительных запросов к 2GIS нет.
@@ -36,9 +43,13 @@ AUDIT_COMPETITOR = (os.getenv("AUDIT_COMPETITOR") or "0").strip().lower() in (
     "1", "true", "yes")
 
 # Черновики ответов под цитатами негатива (см. ai_reply.draft_audit_replies).
-# Выключено по умолчанию: требует рабочего OPENAI_API_KEY и делает разбор
-# медленнее (до MAX_AUDIT_DRAFTS запросов к OpenAI на карточку).
-DRAFT_REPLIES = (os.getenv("DRAFT_REPLIES") or "0").strip().lower() in (
+# ВКЛЮЧЕНО по умолчанию: готовый ответ под конкретной цитатой — единственное
+# место, где директор видит нашу работу, а не обещание, и шаг «закрыть негатив»
+# опирается именно на них (build_steps). Цена: до MAX_AUDIT_DRAFTS запросов к
+# OpenAI на карточку — для пакета на 100+ лидов это заметно, выключайте
+# DRAFT_REPLIES=0 на больших прогонах. Без ключа OpenAI флаг ничего не меняет:
+# разбор просто строится без черновиков.
+DRAFT_REPLIES = (os.getenv("DRAFT_REPLIES") or "1").strip().lower() in (
     "1", "true", "yes")
 
 # Минимальный разрыв рейтинга, при котором упоминаем конкурента
@@ -109,8 +120,8 @@ def pain_bullets(c: Company, competitor: Optional[Company]) -> list:
                    f"{fmt_rating(competitor.rating)}; для людей, выбирающих по карте, "
                    f"это аргумент не в вашу пользу")
     elif c.rating is not None and RATING_BAND[0] <= c.rating <= RATING_BAND[1]:
-        out.append(f"рейтинг {fmt_rating(c.rating)} — до «зелёной зоны» 4,5+ не хватает "
-                   f"немного, а именно она даёт поток клиентов с карт")
+        out.append(f"рейтинг {fmt_rating(c.rating)} — ниже «зелёной зоны» 4,5+, по "
+                   f"которой люди отсеивают варианты прямо в выдаче на карте")
 
     # 2. отзывы без ответа. Число здесь — то же самое поле, что в шапке
     # (unanswered_count); негатив и свежесть называются своими словами, а не
@@ -142,27 +153,121 @@ def pain_bullets(c: Company, competitor: Optional[Company]) -> list:
     return out[:MAX_BULLETS]
 
 
-# ---------- сообщение-открывашка ----------
+# ---------- сообщения первого касания ----------
 
-def build_message(c: Company, competitor: Optional[Company], cfg) -> str:
+# Задача первого касания — НЕ вручить разбор, а выйти на директора: узнать имя
+# и прямой контакт. Разбор отправляем потом, уже конкретному человеку.
+# Поэтому текст короткий, начинается с наблюдения по их карточке и кончается
+# вопросом про директора.
+#
+# Правила этих текстов (нарушишь одно — сообщение читается как рассылка):
+#   • не начинать с «бесплатный разбор» и вообще с оффера;
+#   • живой язык, без канцелярита и маркетинговых оборотов;
+#   • 3–4 предложения, одним сообщением;
+#   • без длинных тире: в переписке они выдают копипасту (проверяется самотестом).
+TOUCH_CHANNELS = ("whatsapp", "instagram", "admin")
+TOUCH_LABELS = {
+    "whatsapp": "WhatsApp",
+    "instagram": "Instagram Direct",
+    "admin": "Если ответил администратор",
+}
+
+
+def city_prepositional(city: str) -> str:
+    """«Костанай» -> «в Костанае», «Алматы» -> «в Алматы».
+
+    В холодном сообщении «работаю в 2ГИС в Костанай» сразу выдаёт шаблон,
+    поэтому город склоняем. Правила покрывают города из config.CITY_SLUGS;
+    неузнанное окончание оставляем как есть — это хуже, чем правильный падеж,
+    но лучше, чем выдуманная форма.
+    """
+    city = (city or "").strip()
+    if not city:
+        return ""
+    low = city.lower()
+    if low.endswith(("ый", "ий")):        # Рудный -> в Рудном
+        return f"в {city[:-2]}ом"
+    if low.endswith("а"):                 # Астана -> в Астане
+        return f"в {city[:-1]}е"
+    if low.endswith("й"):                 # Костанай -> в Костанае
+        return f"в {city[:-1]}е"
+    if low.endswith(("ы", "е", "о", "у", "и", "э", "ю", "я")):
+        return f"в {city}"                # Алматы, Актобе, Атырау — не склоняем
+    if low[-1:].isalpha():                # согласная: Шымкент -> в Шымкенте
+        return f"в {city}е"
+    return f"в {city}"
+
+
+def touch_observation(c: Company) -> str:
+    """Одно короткое наблюдение по карточке — продолжение фразы «У «X» …».
+
+    Берём самый заметный факт: сначала негатив без ответа, потом весь долг по
+    ответам, потом молчащая карточка. Числа — те же поля, что в шапке разбора,
+    ничего «на глазок».
+    """
+    neg = c.negative_unanswered or 0
+    if neg:
+        return (f"{neg} {plural(neg, 'негативный отзыв', 'негативных отзыва', 'негативных отзывов')} "
+                f"без ответа")
+    unanswered = c.unanswered_count or 0
+    if unanswered:
+        return (f"{unanswered} {plural(unanswered, 'отзыв', 'отзыва', 'отзывов')} "
+                f"без ответа из последних {c.loaded_reviews or metrics.WINDOW}")
+    if c.has_fresh_reviews is False:
+        return "за последний месяц ни одного нового отзыва"
+    if c.reviews_count is not None and c.reviews_count < 30:
+        return f"отзывов всего {c.reviews_count}"
+    return "есть пара вещей, которые бросаются в глаза"
+
+
+def build_touch_message(c: Company, cfg, channel: str = "whatsapp") -> str:
+    """Текст первого касания под конкретный канал (TOUCH_CHANNELS)."""
     sender = cfg.sender_name or "[Имя]"
     name = c.name if c.name != NA else "вашей компании"
-    bullets = "\n".join(f"• {b[0].upper()}{b[1:]}." for b in pain_bullets(c, competitor))
+    obs = touch_observation(c)
+
+    if channel == "instagram":
+        # В Direct и так видно, кто пишет: представление не нужно, нужна
+        # причина, по которой пишут именно им.
+        return (
+            f"Здравствуйте! Смотрел карточку «{name}» в 2ГИС, зацепило вот что: "
+            f"{obs}. Это читает каждый, кто выбирает, куда пойти.\n"
+            f"\n"
+            f"У меня по этой части есть что показать, но обсуждать это есть смысл "
+            f"с директором, а не в общем аккаунте. Подскажете, как его зовут и "
+            f"куда ему написать напрямую?"
+        )
+
+    if channel == "admin":
+        # Администратор не передаст (или передаст так, что смысл потеряется),
+        # поэтому просим не «передайте», а прямой контакт.
+        return (
+            f"Спасибо! Я не по записи. Смотрю карточку «{name}» в 2ГИС: {obs}, "
+            f"и это видит каждый, кто выбирает, куда пойти.\n"
+            f"\n"
+            f"Передавать ничего не нужно, я сам всё объясню за пару минут. "
+            f"Дайте, пожалуйста, прямой номер или WhatsApp директора?"
+        )
+
+    where = city_prepositional(getattr(cfg, "city", ""))
     return (
-        f"Здравствуйте! Меня зовут {sender}. Помогаю бизнесу в {cfg.city} получать "
-        f"больше клиентов с карт — отзывы и рейтинг на 2ГИС.\n"
+        f"Здравствуйте! Меня зовут {sender}, я занимаюсь отзывами на 2ГИС"
+        f"{' ' + where if where else ''}. Открыл карточку «{name}»: {obs}.\n"
         f"\n"
-        f"Посмотрел карточку «{name}» на 2ГИС:\n"
-        f"{bullets}\n"
-        f"\n"
-        f"Скинуть полный разбор + 3 конкретных шага, что с этим делать? "
-        f"Бесплатно, без обязательств."
+        f"Это видит каждый, кто выбирает, куда пойти, и по этому поводу у меня "
+        f"есть что показать. Подскажите, как зовут директора и куда ему лучше "
+        f"написать?"
     )
+
+
+def build_touch_messages(c: Company, cfg) -> dict:
+    """Все варианты первого касания: {канал: текст} в порядке TOUCH_CHANNELS."""
+    return {ch: build_touch_message(c, cfg, ch) for ch in TOUCH_CHANNELS}
 
 
 # ---------- аудит (одна страница HTML, печатается в PDF) ----------
 
-_AUDIT_CSS = """
+AUDIT_CSS = """
 body{font-family:'Segoe UI',Arial,sans-serif;max-width:760px;margin:24px auto;
      padding:0 16px;color:#1a1a2e;line-height:1.5}
 h1{font-size:1.5em;margin-bottom:0}
@@ -178,13 +283,15 @@ blockquote{background:#fff6f6;border-left:4px solid #c0392b;margin:10px 0;
 blockquote .meta{color:#888;font-size:.85em}
 .vs{background:#f4f6fa;border-radius:10px;padding:14px;margin:16px 0}
 .steps li{margin:8px 0}
+.note{background:#f4f6fa;border-radius:10px;padding:12px 14px;margin:16px 0;
+      color:#444;font-size:.92em}
 .footer{margin-top:28px;padding-top:12px;border-top:1px solid #ddd;color:#666;font-size:.9em}
 .tiny{font-size:.82em;color:#888}
 .vs .up{color:#c0392b}.vs .down{color:#27ae60}
 @media print{body{margin:0}.noprint{display:none}}
 """
 
-# Стили черновиков ответов — отдельно от _AUDIT_CSS и подключаются отдельным
+# Стили черновиков ответов — отдельно от AUDIT_CSS и подключаются отдельным
 # <style>, только когда в разборе реально есть хоть один черновик. Иначе при
 # DRAFT_REPLIES=0 в документе появлялись бы мёртвые правила и он переставал
 # быть побайтово тем же, что и без этой фичи.
@@ -229,27 +336,56 @@ def render_dynamics_block(dyn) -> str:
             f'<ul class="pains">{"".join(rows)}</ul></div>')
 
 
+# Шагов ровно два, и это не сокращение ради краткости, а позиционирование.
+# Чего здесь больше не будет:
+#   • «включить мониторинг» — у 2ГИС есть свои бесплатные уведомления в Telegram
+#     и на почту для всех компаний, продавать «вы узнаете о новом отзыве» нечестно.
+#     Мониторинг в коде остался и работает, но клиенту он не продаётся;
+#   • «запустить поток отзывов» (QR/просьба после визита) — это меняет процессы
+#     внутри клиники и держится на дисциплине администраторов. Мы это пока не
+#     продаём, значит и не обещаем.
 STEP_ANSWER = (
-    "<b>Ответить на весь негатив.</b> Спокойный ответ владельца виден каждому будущему "
-    "клиенту и снимает до половины ущерба от плохого отзыва. Мы готовим черновики "
-    "ответов в вашем стиле — остаётся нажать «отправить».")
-STEP_FLOW = (
-    "<b>Запустить поток отзывов от довольных клиентов.</b> Ссылка/QR на карточку + "
-    "короткое сообщение клиенту после визита. Рейтинг растёт за 1–2 месяца, недовольных "
-    "сначала выслушиваем приватно — негатив не доходит до карты.")
-STEP_MONITOR = (
-    "<b>Включить мониторинг.</b> О новом негативе вы узнаёте в тот же день, а не через "
-    "месяц, когда его прочитали сотни людей.")
+    "<b>Закрыть накопленный негатив.</b> Ответ владельца снимает часть ущерба от "
+    "плохого отзыва и виден каждому, кто открывает карточку. Тексты пишем мы — "
+    "вам останется вставить их в кабинет 2ГИС.")
+STEP_ANSWER_DRAFTS = (
+    "<b>Закрыть накопленный негатив.</b> Ответ владельца снимает часть ущерба от "
+    "плохого отзыва и виден каждому, кто открывает карточку. Готовые ответы — выше, "
+    "под цитатами: их можно вставлять в кабинет 2ГИС как есть.")
+STEP_KEEP = (
+    "<b>Не копить дальше.</b> Каждый новый отзыв получает ответ: готовый текст "
+    "приходит вам в WhatsApp, вы его вставляете. Помнить и отслеживать ничего "
+    "не нужно.")
 
 
-def build_steps(c: Company) -> list:
-    """Шаги для разбора. Шаг «ответить на весь негатив» появляется, только если
-    негатив без ответа реально есть: иначе документ противоречит сам себе."""
+def build_steps(c: Company, has_drafts: bool = False) -> list:
+    """Шаги для разбора. Шаг «закрыть негатив» появляется, только если негатив
+    без ответа реально есть: иначе документ противоречит сам себе.
+
+    has_drafts — показаны ли в этом же документе готовые ответы под цитатами.
+    Обещать «ответы прямо в разборе» там, где их нет, нельзя.
+    """
     steps = []
     if getattr(c, "negative_quotes", None):
-        steps.append(STEP_ANSWER)
-    steps += [STEP_FLOW, STEP_MONITOR]
+        steps.append(STEP_ANSWER_DRAFTS if has_drafts else STEP_ANSWER)
+    steps.append(STEP_KEEP)
     return steps
+
+
+def rating_note(c: Company) -> str:
+    """Честная приписка про рейтинг под шагами.
+
+    Раньше разбор обещал «рейтинг растёт за 1–2 месяца». При сотнях накопленных
+    оценок это неправда: сдвиг на 0,3 требует сотен новых оценок. Обещание
+    заменено на то, что ответы действительно дают.
+    """
+    n = getattr(c, "ratings_count", None)
+    base = (f"при {metrics.fmt_int(n)} накопленных оценках" if n
+            else "при накопленной базе оценок")
+    return (f'<p class="note"><b>Про рейтинг честно.</b> Ответы на отзывы сами по себе '
+            f'оценку не поднимают: они стабилизируют репутацию и снимают часть ущерба '
+            f'от негатива. Сдвинуть сам рейтинг {base} может только приток новых '
+            f'оценок — это отдельная работа, и её мы вам сейчас не продаём.</p>')
 
 
 async def build_quote_drafts(c: Company) -> list:
@@ -353,10 +489,11 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None,
                       for b in pain_bullets(c, competitor))
 
     worst = render_quotes(c, drafts)
-    draft_style = f"<style>{_DRAFT_CSS}</style>" if 'class="draft"' in worst else ""
+    has_drafts = 'class="draft"' in worst
+    draft_style = f"<style>{_DRAFT_CSS}</style>" if has_drafts else ""
     steps_html = ("<h2>Что можно сделать уже на этой неделе</h2>\n<ol class=\"steps\">"
-                  + "".join(f"<li>{step}</li>" for step in build_steps(c))
-                  + "</ol>")
+                  + "".join(f"<li>{step}</li>" for step in build_steps(c, has_drafts))
+                  + "</ol>\n" + rating_note(c))
 
     vs = ""
     if competitor is not None and competitor.rating is not None:
@@ -378,7 +515,7 @@ def render_audit_html(c: Company, cfg, competitor=None, dynamics=None,
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <title>Разбор карточки 2ГИС — {e(name)}</title>
-<style>{_AUDIT_CSS}</style>{draft_style}</head><body>
+<style>{AUDIT_CSS}</style>{draft_style}</head><body>
 <h1>Разбор карточки 2ГИС — {e(name)}</h1>
 <div class="sub">{e(c.category)} · {e(cfg.city)} · <a href="{e(c.url)}">карточка в 2ГИС</a>
  · <span class="tiny">данные собраны {e(collected)}</span></div>
@@ -405,6 +542,8 @@ th{background:#f4f6fa;position:sticky;top:0}
 tr:hover{background:#fafbff}
 .links a{margin-right:10px;white-space:nowrap}
 details{max-width:520px}
+.variant{margin:10px 0}
+.variant b{font-size:.9em;color:#555}
 pre{white-space:pre-wrap;background:#f4f6fa;border-radius:8px;padding:10px;font-family:inherit;font-size:.92em}
 button{cursor:pointer;border:1px solid #ccd;border-radius:6px;background:#fff;padding:4px 10px}
 button:hover{background:#eef}
@@ -454,14 +593,21 @@ def render_dashboard_html(rows: list, cfg) -> str:
         ig = instagram_link(c.website)
         if ig:
             links.append(f'<a href="{e(ig)}">Instagram</a>')
+        # все каналы касания рядом: под рукой должен быть тот текст, в котором
+        # реально пишешь, а не один «универсальный»
+        variants = "".join(
+            f'<div class="variant"><b>{e(TOUCH_LABELS[ch])}</b> '
+            f'<button onclick="event.preventDefault();copyMsg(\'m{i}_{ch}\',this)">Копировать</button>'
+            f'<pre id="m{i}_{ch}">{e(row["messages"][ch])}</pre></div>'
+            for ch in TOUCH_CHANNELS)
         trs.append(f"""<tr>
  <td>{e(c.priority)}</td>
  <td><b>{e(c.name)}</b><br><span style="color:#888">{e(c.phone)}</span></td>
  <td>{e(fmt_rating(c.rating))} / {c.reviews_count if c.reviews_count is not None else e(NA)} отз.<br>
      без ответа: {c.unanswered_count if c.unanswered_count is not None else e(NA)}</td>
  <td class="links">{' '.join(links)}</td>
- <td><details><summary>Сообщение <button onclick="event.preventDefault();copyMsg('m{i}',this)">Копировать</button></summary>
-     <pre id="m{i}">{e(row["message"])}</pre></details></td>
+ <td><details><summary>Первое касание ({len(TOUCH_CHANNELS)} варианта)</summary>
+     {variants}</details></td>
 </tr>""")
 
     return f"""<!DOCTYPE html>
@@ -469,12 +615,13 @@ def render_dashboard_html(rows: list, cfg) -> str:
 <title>Рассылка: {e(cfg.category)} — {e(cfg.city)}</title>
 <style>{_DASH_CSS}</style></head><body>
 <h1>Пакет для рассылки — {e(cfg.category)}, {e(cfg.city)}</h1>
-<div class="sub">{len(rows)} лидов · собрано {today} · кнопка WhatsApp открывает чат
-с уже подставленным сообщением; «аудит» — страница для отправки после «да, скиньте»
+<div class="sub">{len(rows)} лидов · собрано {today} · цель первого касания — выйти на
+директора (имя и прямой контакт), а не вручить разбор; кнопка WhatsApp открывает чат
+с уже подставленным текстом, «аудит» — страница для отправки уже директору
 (Ctrl+P → сохранить как PDF)</div>
 {warn}
 <table>
-<tr><th>Приоритет</th><th>Компания</th><th>Рейтинг</th><th>Ссылки</th><th>Открывашка</th></tr>
+<tr><th>Приоритет</th><th>Компания</th><th>Рейтинг</th><th>Ссылки</th><th>Первое касание</th></tr>
 {''.join(trs)}
 </table>
 <script>{_DASH_JS}</script>
@@ -489,19 +636,23 @@ def audit_filename(c: Company, i: int = 0) -> str:
 
 
 def build_rows(companies: list, cfg) -> list:
-    """Лиды -> строки рассылки: сообщение, ссылка WhatsApp, файл аудита.
+    """Лиды -> строки рассылки: тексты касаний, ссылка WhatsApp, файл аудита.
 
     Чистая функция (без диска и сети): по ней строится и пакет в output/,
     и таблица результатов на странице «Поиск лидов» в панели — так обе
     поверхности показывают ровно один и тот же текст.
+
+    messages — все варианты касания ({канал: текст}); message — вариант для
+    WhatsApp, он же уходит в ссылку wa.me и в CSV.
     """
     companies = sorted(companies, key=sort_key)
     rows = []
     for i, c in enumerate(companies):
         competitor = pick_benchmark(companies, exclude=c)
-        message = build_message(c, competitor, cfg)
+        messages = build_touch_messages(c, cfg)
+        message = messages["whatsapp"]
         rows.append({"c": c, "competitor": competitor, "message": message,
-                     "wa": wa_link(c.phone, message),
+                     "messages": messages, "wa": wa_link(c.phone, message),
                      "audit_file": audit_filename(c, i)})
     return rows
 
@@ -527,10 +678,12 @@ async def write_outreach_pack(companies: list, cfg) -> Path:
 
     with open(pack / "outreach.csv", "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Название", "Приоритет", "Телефон", "WhatsApp", "Сообщение"])
+        w.writerow(["Название", "Приоритет", "Телефон", "WhatsApp"]
+                   + [TOUCH_LABELS[ch] for ch in TOUCH_CHANNELS])
         for row in rows:
             w.writerow([row["c"].name, row["c"].priority, row["c"].phone,
-                        row["wa"] or NA, row["message"]])
+                        row["wa"] or NA]
+                       + [row["messages"][ch] for ch in TOUCH_CHANNELS])
     return pack
 
 
@@ -571,26 +724,65 @@ if __name__ == "__main__":
 
     checks = []
 
-    msg = build_message(lead, top, cfg)
-    checks.append(("конкурент в сообщении", "Dent Lux" in msg and "4,8" in msg))
-    checks.append(("сообщение: число без ответа — то же поле, что в шапке",
-                   "14 отзывов остались без ответа" in msg))
-    checks.append(("сообщение: негатив назван своими словами",
-                   "3 из них негативные" in msg))
-    checks.append(("сообщение: свежие названы отдельно",
-                   "2 — за последний месяц" in msg))
+    msg = build_touch_message(lead, cfg)
+    touch = build_touch_messages(lead, cfg)
+
+    # --- первое касание: задача — выйти на директора, а не вручить разбор ---
+    checks.append(("касание: варианты под все каналы",
+                   set(touch) == set(TOUCH_CHANNELS) and all(touch.values())))
+    checks.append(("касание: WhatsApp — это whatsapp-вариант",
+                   touch["whatsapp"] == msg))
+    checks.append(("касание: наблюдение по их карточке, а не про нас",
+                   all("3 негативных отзыва без ответа" in t for t in touch.values())))
+    checks.append(("касание: заканчивается вопросом про директора",
+                   all(t.rstrip().endswith("?") for t in touch.values())))
+    checks.append(("касание: во всех вариантах спрашиваем про директора",
+                   all("директор" in t.lower() for t in touch.values())))
+    checks.append(("касание: не начинается с оффера «бесплатный разбор»",
+                   all("бесплатн" not in t.lower() for t in touch.values())
+                   and all("разбор" not in t.lower() for t in touch.values())))
+    checks.append(("касание: без длинных тире",
+                   all("—" not in t and "–" not in t for t in touch.values())))
+    checks.append(("касание: коротко — не больше 4 предложений",
+                   all(t.count(".") + t.count("?") + t.count("!") <= 5
+                       for t in touch.values())))
+    checks.append(("касание: администратора не просим передать, просим контакт",
+                   "Передавать ничего не нужно" in touch["admin"]
+                   and "прямой номер" in touch["admin"]))
+    checks.append(("касание: в Instagram не представляемся по второму разу",
+                   "Меня зовут" not in touch["instagram"]))
+    checks.append(("касание: мониторинг клиенту не продаётся",
+                   all("мониторинг" not in t.lower() and "узнаете" not in t.lower()
+                       and "узнаёте" not in t.lower() for t in touch.values())))
     checks.append(("имя отправителя", "Эмиль" in msg))
-    checks.append(("не больше 3 пунктов", msg.count("• ") <= MAX_BULLETS))
+    checks.append(("касание: город склоняется, а не «в Костанай»",
+                   city_prepositional("Костанай") == "в Костанае"
+                   and city_prepositional("Астана") == "в Астане"
+                   and city_prepositional("Шымкент") == "в Шымкенте"
+                   and city_prepositional("Рудный") == "в Рудном"))
+    checks.append(("касание: несклоняемые города не ломаем",
+                   city_prepositional("Алматы") == "в Алматы"
+                   and city_prepositional("Актобе") == "в Актобе"
+                   and city_prepositional("Атырау") == "в Атырау"))
+    checks.append(("касание: города нет -> фраза не разваливается",
+                   city_prepositional("") == ""
+                   and "на 2ГИС. Открыл карточку" in build_touch_message(
+                       lead, type("C", (), {"city": "", "sender_name": "Э"})())))
     checks.append(("склонение", plural(1, "а", "б", "в") == "а"
                    and plural(3, "а", "б", "в") == "б"
                    and plural(11, "а", "б", "в") == "в"
                    and plural(21, "а", "б", "в") == "а"))
     lead1 = Company(unanswered_count=1, negative_unanswered=1, loaded_reviews=50)
-    checks.append(("склонение n=1 в сообщении",
-                   "1 отзыв остался без ответа" in build_message(lead1, None, cfg)))
+    checks.append(("склонение n=1 в касании",
+                   "1 негативный отзыв без ответа" in build_touch_message(lead1, cfg)))
+    lead_no_neg = Company(unanswered_count=9, negative_unanswered=0, loaded_reviews=50)
+    checks.append(("наблюдение: нет негатива -> весь долг по ответам",
+                   touch_observation(lead_no_neg) == "9 отзывов без ответа из последних 50"))
+    checks.append(("наблюдение: нечего сказать -> без выдуманных чисел",
+                   touch_observation(Company()) == "есть пара вещей, которые бросаются в глаза"))
 
     cfg_noname = _Cfg(); cfg_noname.sender_name = ""
-    checks.append(("заглушка имени", "[Имя]" in build_message(lead, top, cfg_noname)))
+    checks.append(("заглушка имени", "[Имя]" in build_touch_message(lead, cfg_noname)))
 
     wa = wa_link(lead.phone, msg)
     checks.append(("wa.me из +7(727)…", wa is not None and "/77271234567?" in wa))
@@ -620,14 +812,13 @@ if __name__ == "__main__":
     html_ans = render_audit_html(answered_only, cfg)
     checks.append(("цитаты: нет негатива без ответа -> блока нет",
                    "негатив без ответа" not in html_ans.lower()))
-    checks.append(("шаги: без негатива без ответа шаг «ответить» убран",
-                   "Ответить на весь негатив" not in html_ans))
-    checks.append(("шаги: остальные шаги на месте",
-                   "Запустить поток отзывов" in html_ans
-                   and "Включить мониторинг" in html_ans))
+    checks.append(("шаги: без негатива без ответа шаг «закрыть негатив» убран",
+                   "Закрыть накопленный негатив" not in html_ans))
+    checks.append(("шаги: второй шаг на месте",
+                   "Не копить дальше" in html_ans))
 
-    checks.append(("цитаты: есть негатив без ответа -> шаг «ответить» присутствует",
-                   "Ответить на весь негатив" in audit))
+    checks.append(("цитаты: есть негатив без ответа -> шаг «закрыть негатив» есть",
+                   "Закрыть накопленный негатив" in audit))
     checks.append(("цитаты: метки «есть ответ владельца» в блоке нет",
                    "есть ответ владельца" not in audit))
     checks.append(("цитаты: каждая помечена «без ответа»",
@@ -735,10 +926,33 @@ if __name__ == "__main__":
                    "3 отзыва остались без ответа" not in audit))
 
     # шаги строятся отдельной функцией — её можно проверить в лоб
-    checks.append(("build_steps: без цитат — два шага",
-                   len(build_steps(answered_only)) == 2))
-    checks.append(("build_steps: с цитатами — три шага",
-                   len(build_steps(lead)) == 3))
+    checks.append(("build_steps: без цитат — один шаг",
+                   len(build_steps(answered_only)) == 1))
+    checks.append(("build_steps: с цитатами — два шага",
+                   len(build_steps(lead)) == 2))
+    checks.append(("build_steps: мониторинг и сбор отзывов из шагов убраны",
+                   all("мониторинг" not in s.lower() and "QR" not in s
+                       and "поток отзывов" not in s.lower()
+                       for s in build_steps(lead, True))))
+    checks.append(("build_steps: есть черновики -> шаг ссылается на них",
+                   "Готовые ответы — выше" in build_steps(lead, True)[0]))
+    checks.append(("build_steps: черновиков нет -> обещания «ответы в разборе» нет",
+                   "Готовые ответы — выше" not in build_steps(lead, False)[0]))
+
+    # --- честность про рейтинг: сроков роста не обещаем ---
+    checks.append(("рейтинг: обещания «растёт за 1–2 месяца» больше нет",
+                   "1–2 месяца" not in audit and "растёт" not in audit))
+    checks.append(("рейтинг: честная приписка с реальной базой оценок",
+                   "Про рейтинг честно" in audit
+                   and "при 310 накопленных оценках" in audit
+                   and "приток новых оценок" in audit))
+    checks.append(("рейтинг: базы оценок нет -> формулировка без числа",
+                   "при накопленной базе оценок" in render_audit_html(
+                       Company(name="Без базы", rating=4.0, reviews_count=10,
+                               collected_at="2026-09-01T07:00:00+00:00"), cfg)))
+    checks.append(("разбор: мониторинг клиенту не продаётся",
+                   "мониторинг" not in audit.lower()
+                   and "узнаёте" not in audit and "узнаете" not in audit))
     checks.append(("аудит: оценки и отзывы разделены",
                    "на основе 310 оценок" in audit and "текстовых отзывов" in audit))
     checks.append(("аудит: сказано, что данные по одному филиалу",
@@ -773,9 +987,13 @@ if __name__ == "__main__":
                    fmt_collected(None) == "дата неизвестна"))
 
     dash = render_dashboard_html(
-        [{"c": lead, "message": msg, "wa": wa, "audit_file": "audit_1.html"}], cfg)
+        [{"c": lead, "message": msg, "messages": touch, "wa": wa,
+          "audit_file": "audit_1.html"}], cfg)
     checks.append(("дашборд: ссылки", "audit_1.html" in dash and "wa.me" in dash))
     checks.append(("дашборд: instagram", "instagram.com/aruna_dent" in dash))
+    checks.append(("дашборд: все три варианта касания с кнопкой копирования",
+                   all(TOUCH_LABELS[ch] in dash and f"m0_{ch}" in dash
+                       for ch in TOUCH_CHANNELS)))
 
     hot = Company(firm_id="3", name="Смайл", rating=4.0, reviews_count=60,
                   has_fresh_reviews=True, owner_responds=False,
@@ -789,6 +1007,9 @@ if __name__ == "__main__":
     checks.append(("строки: сообщение и WhatsApp на месте",
                    "«Смайл»" in rows[0]["message"]
                    and "wa.me/77270001122" in (rows[0]["wa"] or "")))
+    checks.append(("строки: все варианты касания, message — вариант WhatsApp",
+                   set(rows[0]["messages"]) == set(TOUCH_CHANNELS)
+                   and rows[0]["messages"]["whatsapp"] == rows[0]["message"]))
     checks.append(("строки: без телефона WhatsApp пустой",
                    [r for r in rows if r["c"].name == "Dent Lux"][0]["wa"] is None))
 

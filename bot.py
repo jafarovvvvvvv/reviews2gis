@@ -12,10 +12,17 @@ Telegram-бот: длинный поллинг getUpdates + админ-кома�
   /add <ссылка>    — добавить компанию по ссылке 2GIS
   /del <N>         — удалить компанию №N из /list
   /check [N]       — проверить все компании (или одну №N)
+  /monthly <N>     — ежемесячный отчёт клиенту (monthly.py)
+  /report <N>      — глубокий разбор болей (insights.py)
   /status          — настройки и состояние
   /interval <мин>  — интервал автопроверки (минимум 30)
   /mode all|neg    — все отзывы или только негатив
+  /mod all|neg|off — что уходит клиенту только после моего подтверждения
   /test            — тестовое сообщение в этот чат
+
+Уведомление, задержанное на проверку (monitor.hold_for_review), приходит
+владельцу сервиса с кнопками «Отправить клиенту» / «Не отправлять» —
+callback-действия send:<id> и drop:<id>.
 
 Поллинг — единственный потребитель getUpdates (кнопки «Найти чаты» в панели
 больше нет — она конфликтовала бы по 409). Разбор команд — чистая функция
@@ -28,6 +35,7 @@ import ai_reply
 import db
 import insights
 import monitor
+import monthly
 import tg
 
 HELP_ADMIN = (
@@ -37,13 +45,23 @@ HELP_ADMIN = (
     "/del <N> — удалить компанию №N\n"
     "/check [N] — проверить все (или №N)\n"
     "/reply <N> — AI-ответ на последний отзыв компании №N\n"
-    "/report <N> — аналитический отчёт болей по компании №N\n"
+    "/monthly <N> — отчёт за месяц клиенту по компании №N\n"
+    "/report <N> — глубокий разбор болей по компании №N\n"
     "/digest <N> — еженедельный дайджест по компании №N сейчас\n"
     "/status — настройки и состояние\n"
     "/interval <мин> — интервал автопроверки\n"
     "/mode all|neg — все отзывы / только негатив\n"
+    "/mod all|neg|off — что показывать мне до отправки клиенту\n"
     "/test — тест в этот чат"
 )
+
+# Подписи режимов модерации (monitor.MODERATION_MODES) — одни и те же
+# в /status, /mod и в настройках панели.
+MOD_LABELS = {
+    "all": "всё сначала мне",
+    "negative": "негатив мне, позитив клиенту сразу",
+    "off": "всё клиенту сразу",
+}
 HELP_GUEST = ("Этот чат получает уведомления по компаниям, на которые его "
               "подписали в панели. Управление — из админ-чата или панели.")
 
@@ -132,16 +150,43 @@ async def _build_and_send_report(company_id: int, token: str, chat_id: str):
         await _reply(token, chat_id, f"⚠ Файл не отправился: {html.escape(str(e))}")
 
 
+async def _build_and_send_monthly(company_id: int, token: str, chat_id: str):
+    """Фон: ежемесячный отчёт клиенту (monthly.py) + отправка файлом в чат."""
+    try:
+        rid = await monthly.build_report(company_id)
+    except Exception as ex:
+        await _reply(token, chat_id,
+                     f"⚠ Отчёт за месяц не построился: {html.escape(str(ex)[:300])}")
+        return
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+        comp = db.get_company(conn, company_id)
+    finally:
+        conn.close()
+    try:
+        await tg.send_document(
+            token, chat_id, f"otchet_{company_id}_{rep['created_at'][:10]}.html",
+            rep["html"].encode("utf-8"),
+            f"📊 Отчёт за месяц — {comp['name']} · {rep['period']}")
+    except tg.TgError as e:
+        await _reply(token, chat_id, f"⚠ Файл не отправился: {html.escape(str(e))}")
+
+
 async def _check_and_report(ids: list, token: str, chat_id: str):
     """Последовательная проверка (Playwright один) + краткий отчёт."""
     total_new = 0
+    total_held = 0
     failed = 0
     for cid in ids:
         res = await monitor.check_company(cid)
         total_new += len(res["new"])
+        total_held += res.get("held", 0)
         if res["errors"]:
             failed += 1
     msg = f"Проверка завершена: компаний {len(ids)}, новых отзывов {total_new}"
+    if total_held:
+        msg += f", из них на проверке у вас {total_held}"
     if failed:
         msg += f", с ошибками {failed} (детали в панели)"
     await _reply(token, chat_id, msg + ".")
@@ -232,11 +277,15 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
                     else "только негатив (≤3)")
             chats = db.list_chats(conn)
             admins = sum(1 for c in chats if c["is_admin"])
+            held = len(db.list_pending(conn))
             await _reply(token, chat_id,
                          f"Компаний: {len(companies)}\n"
                          f"Чатов: {len(chats)} (админских {admins})\n"
                          f"Интервал автопроверки: {interval} мин\n"
-                         f"Режим уведомлений: {mode}")
+                         f"Режим уведомлений: {mode}\n"
+                         f"Проверка перед отправкой клиенту: "
+                         f"{MOD_LABELS[monitor.moderation_mode(conn)]}\n"
+                         f"Ждут вашего решения: {held}")
 
         elif cmd == "interval":
             try:
@@ -257,6 +306,22 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
             else:
                 await _reply(token, chat_id, "Так: /mode all — все, /mode neg — только негатив")
 
+        elif cmd == "mod":
+            key = args.lower().strip()
+            aliases = {"all": "all", "всё": "all", "все": "all",
+                       "neg": "negative", "negative": "negative", "негатив": "negative",
+                       "off": "off", "выкл": "off"}
+            if key in aliases:
+                db.set_setting(conn, "moderation", aliases[key])
+                await _reply(token, chat_id,
+                             f"Проверка перед отправкой клиенту: "
+                             f"{MOD_LABELS[aliases[key]]}.")
+            else:
+                await _reply(token, chat_id,
+                             "Так: /mod all — всё сначала мне, /mod neg — только "
+                             "негатив на проверку, /mod off — всё клиенту сразу.\n"
+                             f"Сейчас: {MOD_LABELS[monitor.moderation_mode(conn)]}.")
+
         elif cmd == "reply":
             c = _company_by_num(companies, args)
             if c is None:
@@ -275,9 +340,18 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
                                              "в «Настройках» панели.")
                 return
             await _reply(token, chat_id,
-                         f"Готовлю отчёт по «{e(c['name'])}»: сбор до 300 отзывов "
-                         f"и анализ, ~2–4 минуты…")
+                         f"Готовлю разбор болей по «{e(c['name'])}»: сбор до 300 "
+                         f"отзывов и анализ, ~2–4 минуты…")
             _spawn(_build_and_send_report(c["id"], token, chat_id))
+
+        elif cmd == "monthly":
+            c = _company_by_num(companies, args)
+            if c is None:
+                await _reply(token, chat_id, "Укажите номер из /list: /monthly 2")
+                return
+            await _reply(token, chat_id,
+                         f"Готовлю отчёт за месяц по «{e(c['name'])}»…")
+            _spawn(_build_and_send_monthly(c["id"], token, chat_id))
 
         elif cmd == "digest":
             c = _company_by_num(companies, args)
@@ -341,6 +415,21 @@ async def _send_reply_variants(company_id: int, token: str, chat_id: str):
     await _reply(token, chat_id, "\n".join(parts))
 
 
+async def _decide_pending(pending_id: int, send: bool, token: str, chat_id: str):
+    """Кнопка под задержанным уведомлением: отпустить клиенту или закрыть."""
+    conn = db.connect()
+    try:
+        if send:
+            _, note = await monitor.publish_pending(conn, pending_id)
+        elif db.decide_pending(conn, pending_id, db.DROPPED):
+            note = "Уведомление закрыто, клиенту ничего не ушло."
+        else:
+            note = "Это уведомление уже разобрано."
+    finally:
+        conn.close()
+    await _reply(token, chat_id, note)
+
+
 async def handle_callback(cb: dict, token: str):
     """Нажатие inline-кнопки. Действия — только из админ-чатов."""
     data = cb.get("data") or ""
@@ -363,6 +452,12 @@ async def handle_callback(cb: dict, token: str):
     elif action == "check" and arg.isdigit():
         await tg.answer_callback(token, cb_id, "Запускаю проверку…")
         _spawn(_check_and_report([int(arg)], token, chat_id))
+    elif action in ("send", "drop") and arg.isdigit():
+        # решение по задержанному уведомлению (monitor.hold_for_review):
+        # «send» отпускает текст клиенту, «drop» закрывает без отправки
+        await tg.answer_callback(token, cb_id,
+                                 "Отправляю…" if action == "send" else "Не отправляю")
+        _spawn(_decide_pending(int(arg), action == "send", token, chat_id))
     else:
         await tg.answer_callback(token, cb_id)
 

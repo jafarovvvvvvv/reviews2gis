@@ -28,7 +28,7 @@ import leadgen
 from config import load_config
 from fetcher import BlockedError
 from lead_scoring import Company
-from outreach import build_message
+from outreach import TOUCH_LABELS, build_touch_messages
 
 
 def log(msg=""):
@@ -58,8 +58,9 @@ async def run_single(cfg):
     c, way = await leadgen.fetch_one(cfg, cfg.firm, cfg.mode)
     log(f"(способ: {way})")
     print_company(c)
-    log("\n--- сообщение-открывашка ---")
-    log(build_message(c, None, cfg))
+    for channel, text in build_touch_messages(c, cfg).items():
+        log(f"\n--- первое касание: {TOUCH_LABELS[channel]} ---")
+        log(text)
 
 
 async def run_full(cfg):
