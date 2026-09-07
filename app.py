@@ -281,10 +281,19 @@ button.danger{color:var(--red);border-color:#EBC4B9}
 button.danger:hover{border-color:var(--red);background:var(--card)}
 button.small{padding:4px 13px;font-size:.84em}
 :focus-visible{outline:2.5px solid var(--blue);outline-offset:2px;border-radius:8px}
-input[type=text],input[type=number]{padding:9px 12px;border:1.5px solid var(--line);
+input[type=text],input[type=number],select{padding:9px 12px;border:1.5px solid var(--line);
       border-radius:10px;font-size:1em;width:100%;font-family:inherit;background:#fff;
       color:var(--ink)}
-input[type=text]:focus,input[type=number]:focus{border-color:var(--green);outline:none}
+input[type=text]:focus,input[type=number]:focus,select:focus{border-color:var(--green);outline:none}
+select{cursor:pointer;width:auto}
+.reportform{display:flex;flex-wrap:wrap;gap:14px 22px;align-items:flex-end;margin-top:12px}
+.reportform .f{display:flex;flex-direction:column;gap:5px}
+.reportform label{font-family:'JetBrains Mono',Consolas,monospace;font-size:.68em;
+      letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.reportform select{min-width:220px}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}
+form.reportbar{display:flex;gap:8px;align-items:center}
+form.reportbar select{min-width:210px}
 table{border-collapse:collapse;width:100%}
 th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}
 th{font-family:'JetBrains Mono',Consolas,monospace;font-size:.7em;letter-spacing:.12em;
@@ -815,14 +824,16 @@ async def dashboard(request: Request):
             '<div class="card"><p class="muted">Пока нет ни одной карточки. Вставьте '
             'выше ссылку на компанию в 2ГИС — и её отзывы будут под присмотром.</p></div>')
     # массовая отправка: то же, что кнопка на странице компании, но по всем
-    # рабочим карточкам сразу — и с тем же выбором получателей
-    check_all = (f"""<div style="margin-top:14px">
+    # рабочим карточкам сразу — и с тем же выбором получателей. Select и кнопка
+    # каждой формы — в одном flex-контейнере, чтобы при переносе строки они не
+    # расходились по разным рядам (раньше select «Отчётов» цеплялся к соседней
+    # форме, а его собственная кнопка падала на следующую строку).
+    check_all = (f"""<div class="toolbar">
   <form class="inline" method="post" action="/check-all">
     <button>Проверить все сейчас</button></form>
-  <form class="inline" method="post" action="/reports/weekly-all"
-        style="margin-left:8px"
+  <form class="reportbar" method="post" action="/reports/weekly-all"
         onsubmit="return confirm('Собрать и разослать отчёты за неделю по всем карточкам?')">
-    <select name="to" style="width:210px;margin-right:6px">
+    <select name="to">
      <option value="me">только мне</option>
      <option value="all">мне и чатам компаний</option>
     </select>
@@ -1101,14 +1112,22 @@ async def company_page(cid: int, request: Request):
  <b>Разбор болей</b> — глубокий инструмент на заказ: сбор до 300 отзывов, карта
  болей с цитатами-уликами и рекомендации. Оба печатаются в PDF (Ctrl+P) и
  уходят в Telegram файлом.</p>
- <form class="inline" method="post" action="/companies/{cid}/weekly">
-   <select name="to" style="width:210px;margin-right:6px">
+ <form class="reportform" method="post" action="/companies/{cid}/weekly">
+  <div class="f"><label for="weekly-to-{cid}">Получатели</label>
+   <select id="weekly-to-{cid}" name="to">
     <option value="me">только мне</option>
     <option value="all">мне и чатам компании</option>
-   </select>
-   <button class="primary">Отчёт за неделю</button></form>
- <form class="inline" method="post" action="/companies/{cid}/report">
-   <button>Разбор болей</button></form>
+   </select></div>
+  <button class="primary">Отчёт за неделю</button>
+ </form>
+ <form class="reportform" method="post" action="/companies/{cid}/report">
+  <div class="f"><label for="pain-to-{cid}">Получатели</label>
+   <select id="pain-to-{cid}" name="to">
+    <option value="me">только мне</option>
+    <option value="all" selected>мне и чатам компании</option>
+   </select></div>
+  <button>Разбор болей</button>
+ </form>
  {('<table><tr><th>Когда</th><th>Вид</th><th>Период данных</th><th>Объём</th><th></th></tr>'
    + ''.join(f'<tr><td class="mono">{fmt_dt(r["created_at"])}</td>'
              f'<td>{e(REPORT_KINDS.get(r["kind"], r["kind"]))}</td>'
@@ -1135,8 +1154,13 @@ async def company_page(cid: int, request: Request):
     return page(c["name"], body, request, refresh=busy)
 
 
-async def _send_report(report_id: int) -> list:
-    """Отправить сохранённый отчёт получателям компании. Список ошибок."""
+async def _send_report(report_id: int, to: str = "all") -> list:
+    """Отправить сохранённый отчёт получателям компании. Список ошибок.
+
+    to="me" — только админ-чаты (см. monitor.notify_document); по умолчанию
+    "all" — прежнее поведение для повторной отправки уже готового отчёта
+    (кнопка «в Telegram» в истории отчётов).
+    """
     conn = db.connect()
     try:
         rep = db.get_report(conn, report_id)
@@ -1149,12 +1173,13 @@ async def _send_report(report_id: int) -> list:
                    f"в анализе {rep['reviews_used']} отзывов")
         return await monitor.notify_document(conn, fname,
                                              rep["html"].encode("utf-8"),
-                                             caption, company_id=rep["company_id"])
+                                             caption, company_id=rep["company_id"],
+                                             to=to)
     finally:
         conn.close()
 
 
-async def _report_task(cid: int):
+async def _report_task(cid: int, to: str = "all"):
     """Фон: построить разбор болей и разослать; об ошибке сказать админам в TG."""
     try:
         rid = await insights.build_report(cid, brand=BRAND)
@@ -1166,7 +1191,7 @@ async def _report_task(cid: int):
         finally:
             conn.close()
         return
-    for err in await _send_report(rid):
+    for err in await _send_report(rid, to=to):
         print(f"[report] {err}", flush=True)
 
 
@@ -1242,7 +1267,9 @@ async def _audit_task(domain: str, slug: str, firm_id: str):
 
 
 @app.post("/companies/{cid}/report")
-async def companies_report(cid: int):
+async def companies_report(cid: int, request: Request):
+    form = await request.form()
+    to = _report_to(form)
     conn = db.connect()
     try:
         if db.get_company(conn, cid) is None:
@@ -1253,10 +1280,11 @@ async def companies_report(cid: int):
     if not api_key:
         return redirect(f"/company/{cid}",
                         err="AI не настроен: добавьте ключ OpenAI в «Настройках»")
-    spawn(_report_task(cid))
+    spawn(_report_task(cid, to))
     return redirect(f"/company/{cid}",
-                    msg="Разбор болей готовится (~2–4 мин): сбор до 300 отзывов и "
-                        "анализ. Придёт в Telegram и появится в списке отчётов.")
+                    msg=f"Разбор болей готовится (~2–4 мин): сбор до 300 отзывов и "
+                        f"анализ, получатели — {monitor.REPORT_TO_LABELS[to]}. "
+                        f"Придёт в Telegram и появится в списке отчётов.")
 
 
 def _report_to(form) -> str:
