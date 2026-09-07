@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS insights_reports(
   data_json    TEXT NOT NULL,
   html         TEXT NOT NULL,
   kind         TEXT NOT NULL DEFAULT 'pain');  -- 'pain' (разбор болей, insights.py)
-                                               -- | 'monthly' (отчёт клиенту, monthly.py)
+                                               -- | 'weekly' (отчёт клиенту, weekly_report.py)
 
 CREATE TABLE IF NOT EXISTS rating_history(
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +129,8 @@ CREATE INDEX IF NOT EXISTS idx_snap_firm ON lead_snapshots(firm_id, collected_at
 
 CREATE TABLE IF NOT EXISTS auto_runs(
   company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-  kind       TEXT NOT NULL,        -- 'digest' (еженедельно) | 'report' (ежемесячно)
+  kind       TEXT NOT NULL,        -- 'digest' (дайджест) | 'report' (отчёт клиенту,
+                                   -- по понедельникам — см. weekly_due)
   last_ts    TEXT NOT NULL,
   PRIMARY KEY(company_id, kind));
 
@@ -181,9 +182,14 @@ def _migrate(conn):
         conn.commit()
     rep_cols = {r["name"] for r in conn.execute("PRAGMA table_info(insights_reports)")}
     if rep_cols and "kind" not in rep_cols:
-        # до появления ежемесячного отчёта в таблице лежали только разборы болей
+        # до появления отчёта клиенту в таблице лежали только разборы болей
         conn.execute("ALTER TABLE insights_reports ADD COLUMN "
                      "kind TEXT NOT NULL DEFAULT 'pain'")
+        conn.commit()
+    if rep_cols:
+        # отчёт клиенту был ежемесячным до 2026-09-07; старые записи остаются
+        # тем же видом, чтобы динамика «к прошлому разу» не разорвалась
+        conn.execute("UPDATE insights_reports SET kind='weekly' WHERE kind='monthly'")
         conn.commit()
 
 
@@ -369,10 +375,10 @@ def replace_topics(conn, company_id: int, topics: list):
     conn.commit()
 
 
-# Виды отчётов в одной таблице: разбор болей (insights.py) и ежемесячный отчёт
-# клиенту (monthly.py). Динамика «к прошлому разу» всегда считается внутри
+# Виды отчётов в одной таблице: разбор болей (insights.py) и еженедельный отчёт
+# клиенту (weekly_report.py). Динамика «к прошлому разу» всегда считается внутри
 # своего вида — иначе разбор сравнивался бы с отчётом и наоборот.
-KIND_PAIN, KIND_MONTHLY = "pain", "monthly"
+KIND_PAIN, KIND_WEEKLY = "pain", "weekly"
 
 
 def save_report(conn, company_id: int, period: str, reviews_used: int,
@@ -450,6 +456,57 @@ def rating_days_ago(conn, company_id: int, days: int):
 
 
 # ---------- авто-расписания (дайджест/отчёт) ----------
+
+# Еженедельный отчёт уходит не «раз в 7 дней от последнего запуска» (так время
+# отправки уползало бы вперёд с каждой неделей), а в конкретный день недели и
+# час по времени проекта (Астана, UTC+5). По умолчанию — понедельник, 9 утра.
+WEEKLY_WEEKDAY = 0   # 0 = понедельник (datetime.weekday())
+WEEKLY_HOUR = 9      # локальный час, с которого отчёт считается «подошедшим»
+
+
+def last_slot(now_local, weekday: int, hour: int):
+    """Ближайший прошедший момент «<день недели> <час>:00» включительно.
+
+    Чистая функция от локального времени — по ней и решается, ушёл ли отчёт
+    за ЭТУ неделю или ещё нет.
+    """
+    from datetime import timedelta
+    slot = now_local.replace(hour=hour, minute=0, second=0, microsecond=0)
+    # сколько дней назад был нужный день недели (0 — сегодня)
+    back = (now_local.weekday() - weekday) % 7
+    slot -= timedelta(days=back)
+    if slot > now_local:      # сегодня нужный день, но час ещё не наступил
+        slot -= timedelta(days=7)
+    return slot
+
+
+def weekly_due(conn, company_id: int, kind: str, weekday: int = WEEKLY_WEEKDAY,
+               hour: int = WEEKLY_HOUR, now_local=None) -> bool:
+    """Пора ли слать недельную задачу: слот этой недели наступил, а мы не слали.
+
+    Ни разу не слали -> отсчитываем от момента добавления компании. Иначе
+    компания, заведённая в четверг, получила бы «отчёт за неделю» тем же
+    вечером, за неделю, которой мы не видели.
+    """
+    import metrics
+    now_local = now_local or metrics.now_local()
+    slot = last_slot(now_local, weekday, hour)
+    row = conn.execute("SELECT last_ts FROM auto_runs WHERE company_id=? AND kind=?",
+                       (company_id, kind)).fetchone()
+    if row is None:
+        comp = conn.execute("SELECT added_at FROM companies WHERE id=?",
+                            (company_id,)).fetchone()
+        if comp is None:
+            return False
+        stamp = comp["added_at"]
+    else:
+        stamp = row["last_ts"]
+    try:
+        since = metrics.to_local(datetime.fromisoformat(stamp))
+    except (ValueError, TypeError):
+        return True
+    return since < slot
+
 
 def auto_due(conn, company_id: int, kind: str, period_days: int) -> bool:
     """Пора ли запускать авто-задачу: не было ни разу или прошло >= period_days."""
@@ -786,13 +843,13 @@ if __name__ == "__main__":
         rid1 = save_report(conn, cid, "янв", 10, '{"a":1}', "<html>1")
         rid2 = save_report(conn, cid, "фев", 20, '{"a":2}', "<html>2")
         rid_m = save_report(conn, cid, "март", 5, '{"m":1}', "<html>m",
-                            kind=KIND_MONTHLY)
+                            kind=KIND_WEEKLY)
         checks.append(("reports: вид по умолчанию — разбор болей",
                        get_report(conn, rid1)["kind"] == KIND_PAIN))
         checks.append(("reports: фильтр по виду",
-                       [r["id"] for r in list_reports(conn, cid, KIND_MONTHLY)] == [rid_m]))
+                       [r["id"] for r in list_reports(conn, cid, KIND_WEEKLY)] == [rid_m]))
         checks.append(("reports: динамика считается внутри своего вида",
-                       prev_report_data(conn, cid, rid_m, KIND_MONTHLY) is None
+                       prev_report_data(conn, cid, rid_m, KIND_WEEKLY) is None
                        and prev_report_data(conn, cid, rid_m, KIND_PAIN) == '{"a":2}'))
         checks.append(("reports: список новые первыми",
                        [r["id"] for r in list_reports(conn, cid)] == [rid_m, rid2, rid1]))
@@ -817,6 +874,48 @@ if __name__ == "__main__":
         mark_auto(conn, cid, "digest")
         checks.append(("auto: только что -> не due", auto_due(conn, cid, "digest", 7) is False))
         checks.append(("auto: другой kind независим", auto_due(conn, cid, "report", 30) is True))
+
+        # --- недельное расписание: понедельник, 9 утра ---
+        from datetime import timedelta as _td
+        import metrics as _m
+
+        def _loc(*args):
+            """Момент в часовом поясе проекта (UTC+5) — как metrics.now_local()."""
+            return datetime(*args, tzinfo=_m.LOCAL_TZ)
+
+        MON = _loc(2026, 9, 7, 10, 0)      # понедельник, 10:00 — слот прошёл
+        checks.append(("слот: понедельник после 9 -> слот сегодняшний",
+                       last_slot(MON, 0, 9) == _loc(2026, 9, 7, 9, 0)))
+        checks.append(("слот: понедельник до 9 -> слот прошлой недели",
+                       last_slot(_loc(2026, 9, 7, 8, 59), 0, 9)
+                       == _loc(2026, 8, 31, 9, 0)))
+        checks.append(("слот: среда -> слот этого понедельника",
+                       last_slot(_loc(2026, 9, 9, 3, 0), 0, 9)
+                       == _loc(2026, 9, 7, 9, 0)))
+        checks.append(("слот: воскресенье -> слот прошедшего понедельника",
+                       last_slot(_loc(2026, 9, 13, 23, 0), 0, 9)
+                       == _loc(2026, 9, 7, 9, 0)))
+
+        wid = add_company(conn, "weekly-1", "https://2gis.kz", "almaty", "u")
+        conn.execute("UPDATE companies SET added_at=? WHERE id=?",
+                     ("2026-09-01T00:00:00+00:00", wid))
+        conn.commit()
+        checks.append(("недельное: компания добавлена до слота -> пора",
+                       weekly_due(conn, wid, "report", now_local=MON) is True))
+        conn.execute("UPDATE companies SET added_at=? WHERE id=?",
+                     ("2026-09-07T10:00:00+05:00", wid))
+        conn.commit()
+        checks.append(("недельное: только что добавили -> ждём следующего слота",
+                       weekly_due(conn, wid, "report", now_local=MON) is False))
+        mark_auto(conn, wid, "report")
+        checks.append(("недельное: отправили на этой неделе -> второй раз не шлём",
+                       weekly_due(conn, wid, "report", now_local=MON) is False))
+        checks.append(("недельное: следующий понедельник -> снова пора",
+                       weekly_due(conn, wid, "report",
+                                  now_local=MON + _td(days=7)) is True))
+        checks.append(("недельное: в середине недели не шлём",
+                       weekly_due(conn, wid, "report",
+                                  now_local=MON + _td(days=3)) is False))
 
         delete_company(conn, cid)
         checks.append(("cascade reviews", recent_reviews(conn, cid) == []))

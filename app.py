@@ -41,7 +41,6 @@ import insights
 import leadgen
 import metrics
 import monitor
-import monthly
 import outreach
 import tg
 
@@ -155,7 +154,7 @@ app = FastAPI(lifespan=lifespan)
 # Имя продукта (bedel, каз. — авторитет, репутация, вес в обществе). Домен bedelreviews.kz
 BRAND = "Bedel"
 # Подписи видов отчётов (db.KIND_*) — одни и те же в панели и в кабинете клиента
-REPORT_KINDS = {db.KIND_MONTHLY: "отчёт за месяц", db.KIND_PAIN: "разбор болей"}
+REPORT_KINDS = {db.KIND_WEEKLY: "отчёт за неделю", db.KIND_PAIN: "разбор болей"}
 TAGLINE = "вес вашей репутации"
 
 # Копирование в буфер. navigator.clipboard есть ТОЛЬКО в защищённом контексте
@@ -684,10 +683,10 @@ async def client_cabinet(token: str):
     report_link = ""
     if reports:
         last = reports[0]
-        monthly_kind = last["kind"] == db.KIND_MONTHLY
-        title = "Отчёт за месяц" if monthly_kind else "Разбор болей"
+        weekly_kind = last["kind"] == db.KIND_WEEKLY
+        title = "Отчёт за неделю" if weekly_kind else "Разбор болей"
         note = ("Что изменилось за период и на что жаловались чаще всего"
-                if monthly_kind else "Разбор болей клиентов и рекомендации")
+                if weekly_kind else "Разбор болей клиентов и рекомендации")
         report_link = (f'<div class="card"><h2>{title}</h2>'
                        f'<p class="muted">{note} — {e(last["period"])}.</p>'
                        f'<a class="btn" href="/c/{token}/report/{last["id"]}" '
@@ -815,9 +814,19 @@ async def dashboard(request: Request):
     grid = (f'<div class="grid">{"".join(cards)}</div>' if cards else
             '<div class="card"><p class="muted">Пока нет ни одной карточки. Вставьте '
             'выше ссылку на компанию в 2ГИС — и её отзывы будут под присмотром.</p></div>')
+    # массовая отправка: то же, что кнопка на странице компании, но по всем
+    # рабочим карточкам сразу — и с тем же выбором получателей
     check_all = (f"""<div style="margin-top:14px">
   <form class="inline" method="post" action="/check-all">
-    <button>Проверить все сейчас</button></form></div>""" if cards else "")
+    <button>Проверить все сейчас</button></form>
+  <form class="inline" method="post" action="/reports/weekly-all"
+        style="margin-left:8px"
+        onsubmit="return confirm('Собрать и разослать отчёты за неделю по всем карточкам?')">
+    <select name="to" style="width:210px;margin-right:6px">
+     <option value="me">только мне</option>
+     <option value="all">мне и чатам компаний</option>
+    </select>
+    <button>Отчёты за неделю — всем</button></form></div>""" if cards else "")
     body = f"""
 <h1>Карточки под наблюдением</h1>
 <div class="sysbar">{tg_line} {ai_chip}
@@ -1085,15 +1094,19 @@ async def company_page(cid: int, request: Request):
  {routing}
 </div>
 <div class="card"><h2>Отчёты</h2>
- <p class="muted"><b>Отчёт за месяц</b> — то, что обещано клиенту: сколько новых
- отзывов и сколько негативных, на что жалуются чаще всего, динамика к прошлому
- месяцу и что осталось без ответа. Строится по накопленным данным, без похода
- в 2ГИС.<br>
+ <p class="muted"><b>Отчёт за неделю</b> — то, что обещано клиенту: сколько новых
+ отзывов и сколько негативных, на что жалуются чаще всего, динамика к прошлой
+ неделе и что осталось без ответа. Строится по накопленным данным, без похода
+ в 2ГИС; по расписанию уходит сам в понедельник утром.<br>
  <b>Разбор болей</b> — глубокий инструмент на заказ: сбор до 300 отзывов, карта
  болей с цитатами-уликами и рекомендации. Оба печатаются в PDF (Ctrl+P) и
  уходят в Telegram файлом.</p>
- <form class="inline" method="post" action="/companies/{cid}/monthly">
-   <button class="primary">Отчёт за месяц</button></form>
+ <form class="inline" method="post" action="/companies/{cid}/weekly">
+   <select name="to" style="width:210px;margin-right:6px">
+    <option value="me">только мне</option>
+    <option value="all">мне и чатам компании</option>
+   </select>
+   <button class="primary">Отчёт за неделю</button></form>
  <form class="inline" method="post" action="/companies/{cid}/report">
    <button>Разбор болей</button></form>
  {('<table><tr><th>Когда</th><th>Вид</th><th>Период данных</th><th>Объём</th><th></th></tr>'
@@ -1157,20 +1170,52 @@ async def _report_task(cid: int):
         print(f"[report] {err}", flush=True)
 
 
-async def _monthly_task(cid: int):
-    """Фон: собрать ежемесячный отчёт клиенту и разослать (см. monthly.py)."""
+async def _weekly_task(cid: int, to: str):
+    """Фон: отчёт за неделю по одной компании (см. weekly_report.py).
+
+    Рассылка — общий путь monitor.build_and_send_report, чтобы «только мне»
+    из панели и из бота означало один и тот же список получателей.
+    """
     try:
-        rid = await monthly.build_report(cid, brand=BRAND)
+        _, errors = await monitor.build_and_send_report(cid, to=to, brand=BRAND)
     except Exception as ex:
         conn = db.connect()
         try:
             await monitor.notify_chats(
-                conn, f"⚠ Отчёт за месяц не построился: {html.escape(str(ex)[:300])}")
+                conn, f"⚠ Отчёт за неделю не построился: {html.escape(str(ex)[:300])}")
         finally:
             conn.close()
         return
-    for err in await _send_report(rid):
-        print(f"[monthly] {err}", flush=True)
+    for err in errors:
+        print(f"[weekly] {err}", flush=True)
+
+
+async def _weekly_bulk_task(ids: list, to: str):
+    """Фон: отчёты за неделю пачкой. Последовательно — каждый отчёт это запросы
+    к OpenAI, параллелить их значит ловить лимиты и путать порядок в чате.
+    Одна упавшая компания не отменяет остальные; итог приходит одним письмом.
+    """
+    ok, failed = 0, []
+    for cid in ids:
+        try:
+            await monitor.build_and_send_report(cid, to=to, brand=BRAND)
+            ok += 1
+        except Exception as ex:
+            conn = db.connect()
+            try:
+                comp = db.get_company(conn, cid)
+            finally:
+                conn.close()
+            failed.append(f"{comp['name'] if comp else cid}: {str(ex)[:120]}")
+    note = (f"📊 Отчёты за неделю разосланы ({monitor.REPORT_TO_LABELS[to]}): "
+            f"готово {ok} из {len(ids)}.")
+    if failed:
+        note += "\n⚠ Не вышло: " + html.escape("; ".join(failed)[:500])
+    conn = db.connect()
+    try:
+        await monitor.notify_admins(conn, note)
+    finally:
+        conn.close()
 
 
 async def _audit_task(domain: str, slug: str, firm_id: str):
@@ -1214,9 +1259,25 @@ async def companies_report(cid: int):
                         "анализ. Придёт в Telegram и появится в списке отчётов.")
 
 
-@app.post("/companies/{cid}/monthly")
-async def companies_monthly(cid: int):
-    """Ежемесячный отчёт клиенту — по накопленным данным, без похода в 2ГИС."""
+def _report_to(form) -> str:
+    """Кому слать отчёт из формы. Что угодно неожиданное -> «только мне»:
+    ошибиться в эту сторону дешевле, чем отправить клиенту непроверенное."""
+    to = str(form.get("to", monitor.REPORT_TO_DEFAULT)).strip()
+    return to if to in monitor.REPORT_TO else monitor.REPORT_TO_DEFAULT
+
+
+def _no_ai_note(api_key) -> str:
+    """Без ключа отчёт строится, но без тем жалоб — предупреждаем честно."""
+    return ("" if api_key else
+            " AI не настроен, поэтому тем жалоб в отчёте не будет — "
+            "добавьте ключ OpenAI в «Настройках».")
+
+
+@app.post("/companies/{cid}/weekly")
+async def companies_weekly(cid: int, request: Request):
+    """Отчёт за неделю по одной компании — по накопленным данным, без 2ГИС."""
+    form = await request.form()
+    to = _report_to(form)
     conn = db.connect()
     try:
         if db.get_company(conn, cid) is None:
@@ -1224,14 +1285,33 @@ async def companies_monthly(cid: int):
         api_key, _ = ai_reply.get_ai_settings(conn)
     finally:
         conn.close()
-    # без ключа отчёт всё равно строится, просто без разметки тем — предупредим
-    note = ("" if api_key else
-            " AI не настроен, поэтому тем жалоб в отчёте не будет — "
-            "добавьте ключ OpenAI в «Настройках».")
-    spawn(_monthly_task(cid))
+    spawn(_weekly_task(cid, to))
     return redirect(f"/company/{cid}",
-                    msg="Отчёт за месяц готовится. Придёт в Telegram и появится "
-                        "в списке отчётов." + note)
+                    msg=f"Отчёт за неделю готовится, получатели — "
+                        f"{monitor.REPORT_TO_LABELS[to]}. Придёт в Telegram и "
+                        f"появится в списке отчётов." + _no_ai_note(api_key))
+
+
+@app.post("/reports/weekly-all")
+async def reports_weekly_all(request: Request):
+    """Отчёты за неделю сразу по всем рабочим компаниям (кнопка на дашборде)."""
+    form = await request.form()
+    to = _report_to(form)
+    conn = db.connect()
+    try:
+        # демо и компании в ошибке пропускаем: отчёт по ним будет пустым или врущим
+        ids = [c["id"] for c in db.list_companies(conn)
+               if c["firm_id"] != "demo" and c["status"] == db.ST_OK]
+        api_key, _ = ai_reply.get_ai_settings(conn)
+    finally:
+        conn.close()
+    if not ids:
+        return redirect("/", err="Нет компаний, по которым можно собрать отчёт")
+    spawn(_weekly_bulk_task(ids, to))
+    return redirect("/", msg=f"Готовлю отчёты за неделю по {len(ids)} "
+                             f"{outreach.plural(len(ids), 'компании', 'компаниям', 'компаниям')}, "
+                             f"получатели — {monitor.REPORT_TO_LABELS[to]}. "
+                             f"Итог придёт в Telegram." + _no_ai_note(api_key))
 
 
 @app.get("/report/{rid}", response_class=HTMLResponse)
@@ -1685,6 +1765,7 @@ async def settings_page(request: Request):
         max_per_hour = db.get_setting(conn, "max_checks_per_hour", "40")
         notify_all = db.get_setting(conn, "notify_all", "1") == "1"
         moderation = monitor.moderation_mode(conn)
+        report_to = monitor.report_to_mode(conn)
         pending = len(db.list_pending(conn))
         fetch_mode = db.get_setting(conn, "fetch_mode", "auto")
         auto_digest = db.get_setting(conn, "auto_digest", "0") == "1"
@@ -1761,8 +1842,15 @@ async def settings_page(request: Request):
   <p><label><input type="checkbox" name="auto_digest" {'checked' if auto_digest else ''}>
    слать клиентам <b>еженедельный дайджест</b> (рейтинг, новые отзывы, негатив)</label></p>
   <p><label><input type="checkbox" name="auto_report" {'checked' if auto_report else ''}>
-   раз в месяц строить <b>отчёт за месяц</b> и слать получателям (что изменилось,
-   на что жалуются чаще всего, что осталось без ответа)</label></p>
+   каждый <b>понедельник утром</b> строить <b>отчёт за неделю</b> и рассылать
+   (что изменилось, на что жалуются чаще всего, что осталось без ответа)</label></p>
+  <p><b>Кому уходит отчёт по расписанию</b><br>
+   <select name="report_to" style="width:260px">
+    <option value="me" {'selected' if report_to == 'me' else ''}>Только мне</option>
+    <option value="all" {'selected' if report_to == 'all' else ''}>Мне и чатам компании</option>
+   </select>
+   <span class="muted">относится только к авто-рассылке: у кнопок «Отчёт за неделю»
+   получатель выбирается на месте.</span></p>
   <p><b>Подпись в письмах лидам</b><br>
    <span class="muted">Имя подставляется в текст первого касания, контакт — в
    подпись разбора («Поиск лидов»). Пусто — в тексте останется [Имя].</span><br>
@@ -1822,6 +1910,9 @@ async def settings_save(request: Request):
         fetch_mode = "auto"
     auto_digest = "1" if form.get("auto_digest") else "0"
     auto_report = "1" if form.get("auto_report") else "0"
+    report_to = str(form.get("report_to", monitor.REPORT_TO_DEFAULT)).strip()
+    if report_to not in monitor.REPORT_TO:
+        report_to = monitor.REPORT_TO_DEFAULT
     try:
         interval = str(max(30, int(interval)))
     except ValueError:
@@ -1848,6 +1939,7 @@ async def settings_save(request: Request):
         db.set_setting(conn, "fetch_mode", fetch_mode)
         db.set_setting(conn, "auto_digest", auto_digest)
         db.set_setting(conn, "auto_report", auto_report)
+        db.set_setting(conn, "report_to", report_to)
         # пустое поле здесь — осознанная очистка подписи, поэтому пишем как есть
         db.set_setting(conn, "sender_name", sender_name)
         db.set_setting(conn, "sender_contact", sender_contact)

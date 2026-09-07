@@ -280,11 +280,27 @@ async def publish_pending(conn, pending_id: int) -> tuple:
     return True, "Отправлено клиенту."
 
 
+# Кому уходит отчёт. Решение принимается на каждой отправке (кнопка в панели,
+# команда бота) и для авто-рассылки берётся из настройки report_to.
+#   me  — только мне (админ-чаты): посмотреть перед тем, как показывать клиенту;
+#   all — мне и чатам, привязанным к компании.
+REPORT_TO = ("me", "all")
+REPORT_TO_DEFAULT = "me"
+REPORT_TO_LABELS = {"me": "только мне", "all": "мне и чатам компании"}
+
+
+def report_to_mode(conn) -> str:
+    """Кому уходит АВТО-отчёт по расписанию; мусор -> безопасное «только мне»."""
+    mode = db.get_setting(conn, "report_to", REPORT_TO_DEFAULT)
+    return mode if mode in REPORT_TO else REPORT_TO_DEFAULT
+
+
 async def notify_document(conn, filename: str, content: bytes, caption: str,
-                          company_id=None) -> list:
-    """Разослать файл (отчёт) тем же получателям, что и notify_chats."""
+                          company_id=None, to: str = "all") -> list:
+    """Разослать файл (отчёт). to='me' — только админ-чаты, 'all' — как notify_chats."""
     token = db.get_setting(conn, "bot_token")
-    chats = db.notify_targets(conn, company_id)
+    chats = (db.admin_targets(conn) if to == "me"
+             else db.notify_targets(conn, company_id))
     errors = []
     if not token:
         return ["Telegram не настроен (нет токена) — файл не отправлен"]
@@ -473,19 +489,47 @@ async def send_weekly_digest(company_id: int) -> list:
         conn.close()
 
 
+async def build_and_send_report(company_id: int, to: str = REPORT_TO_DEFAULT,
+                                brand: str = "") -> tuple:
+    """Собрать отчёт за неделю и разослать. Возвращает (id отчёта, ошибки).
+
+    Единственный путь отправки отчёта: им пользуются кнопка в панели, команда
+    бота и расписание — чтобы «отправить себе» везде значило одно и то же.
+    Исключение сборки не глотаем: вызывающий решает, как о нём сказать.
+    """
+    import weekly_report
+    rid = await weekly_report.build_report(company_id, brand=brand)
+    conn = db.connect()
+    try:
+        rep = db.get_report(conn, rid)
+        comp = db.get_company(conn, company_id)
+        name = comp["name"] if comp else "компания"
+        fname = f"otchet_{company_id}_{rep['created_at'][:10]}.html"
+        errors = await notify_document(
+            conn, fname, rep["html"].encode("utf-8"),
+            f"📊 Отчёт за неделю — {name} · {rep['period']}",
+            company_id=company_id, to=to)
+    finally:
+        conn.close()
+    return rid, errors
+
+
 async def run_auto_tasks():
-    """Авто-дайджесты (раз в 7 дней) и авто-отчёты (раз в 30 дней) для компаний,
+    """Авто-дайджесты (раз в 7 дней) и еженедельные отчёты для компаний,
     у которых это включено в настройках. Отчёт строим максимум один за тик.
 
-    Ежемесячный отчёт клиенту — monthly.py: это то, что мы обещаем в оффере
-    («раз в месяц: что изменилось и на что жалуются чаще всего»). Глубокий
-    разбор болей (insights.py) остался отдельным инструментом на заказ —
-    из панели и по команде /report.
+    Отчёт клиенту — weekly_report.py, это вторая часть оффера («что изменилось
+    и на что жалуются чаще всего»). Уходит НЕ «раз в N дней от последнего
+    запуска», а в понедельник утром (db.weekly_due): иначе время отправки
+    уползало бы вперёд с каждой неделей. Кому уходит — настройка report_to,
+    по умолчанию только мне. Глубокий разбор болей (insights.py) остался
+    отдельным инструментом на заказ — из панели и по команде /report.
     """
     conn = db.connect()
     try:
         digest_on = db.get_setting(conn, "auto_digest", "0") == "1"
         report_on = db.get_setting(conn, "auto_report", "0") == "1"
+        report_to = report_to_mode(conn)
         companies = [c for c in db.list_companies(conn)
                      if c["firm_id"] != "demo" and c["status"] == db.ST_OK]
     finally:
@@ -501,25 +545,20 @@ async def run_auto_tasks():
     if report_on:
         for c in companies:  # дорого (LLM) — не больше одного отчёта за тик
             conn = db.connect()
-            due = db.auto_due(conn, c["id"], "report", 30)
+            due = db.weekly_due(conn, c["id"], "report")
             conn.close()
-            if due:
-                import monthly
-                try:
-                    rid = await monthly.build_report(c["id"])
-                    conn = db.connect()
-                    rep = db.get_report(conn, rid)
-                    fname = f"otchet_{c['id']}_{rep['created_at'][:10]}.html"
-                    await notify_document(
-                        conn, fname, rep["html"].encode("utf-8"),
-                        f"📊 Отчёт за месяц — {c['name']} · {rep['period']}",
-                        company_id=c["id"])
-                    db.mark_auto(conn, c["id"], "report")
-                    conn.close()
-                except Exception as e:
-                    print(f"[auto-report] {c['name']}: {e}", flush=True)
-                    conn = db.connect(); db.mark_auto(conn, c["id"], "report"); conn.close()
-                break
+            if not due:
+                continue
+            try:
+                _, errors = await build_and_send_report(c["id"], to=report_to)
+                for err in errors:
+                    print(f"[auto-report] {c['name']}: {err}", flush=True)
+            except Exception as e:
+                print(f"[auto-report] {c['name']}: {e}", flush=True)
+            # отметку ставим в любом случае: иначе упавшая компания будет
+            # пытаться строить отчёт каждую минуту до конца понедельника
+            conn = db.connect(); db.mark_auto(conn, c["id"], "report"); conn.close()
+            break
 
 
 async def scheduler_loop(interval_poll_sec: int = 60):
@@ -726,6 +765,44 @@ if __name__ == "__main__":
         checks.append(("модерация: второе нажатие не шлёт дубль",
                        ok_again is False and sent == []
                        and "Уже отправлено" in note2))
+
+        # --- получатели отчёта: «только мне» не должно задевать чат клиента ---
+        docs = []
+
+        async def _fake_doc(token, chat_id, filename, content, caption=""):
+            docs.append(str(chat_id))
+            return {}
+
+        _real_doc = tg.send_document
+        try:
+            tg.send_document = _fake_doc
+            asyncio.run(notify_document(conn, "f.html", b"x", "c",
+                                        company_id=cid, to="me"))
+            checks.append(("отчёт «только мне»: ушло в админ-чат и никуда больше",
+                           docs == ["1"]))
+            docs.clear()
+            asyncio.run(notify_document(conn, "f.html", b"x", "c",
+                                        company_id=cid, to="all"))
+            checks.append(("отчёт «мне и чатам компании»: оба получателя",
+                           sorted(docs) == ["1", "2"]))
+        finally:
+            tg.send_document = _real_doc
+
+        _settings2 = {}
+        _real_get2 = db.get_setting
+        try:
+            db.get_setting = lambda conn, key, default="": _settings2.get(key, default)
+            checks.append(("авто-отчёт: по умолчанию только мне",
+                           report_to_mode(None) == "me"
+                           and REPORT_TO_DEFAULT == "me"))
+            _settings2["report_to"] = "мусор"
+            checks.append(("авто-отчёт: мусор в настройке -> только мне",
+                           report_to_mode(None) == "me"))
+            _settings2["report_to"] = "all"
+            checks.append(("авто-отчёт: настройка читается",
+                           report_to_mode(None) == "all"))
+        finally:
+            db.get_setting = _real_get2
 
         db.set_subscriptions(conn, cid, [])   # чат клиента отписали
         pid2 = db.add_pending(conn, cid, "r2", 1, "ТЕЛО 2")

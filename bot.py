@@ -12,7 +12,8 @@ Telegram-бот: длинный поллинг getUpdates + админ-кома�
   /add <ссылка>    — добавить компанию по ссылке 2GIS
   /del <N>         — удалить компанию №N из /list
   /check [N]       — проверить все компании (или одну №N)
-  /monthly <N>     — ежемесячный отчёт клиенту (monthly.py)
+  /weekly <N> [all] — отчёт за неделю (weekly_report.py); без аргумента —
+                     только в админ-чаты, all — ещё и чатам компании
   /report <N>      — глубокий разбор болей (insights.py)
   /status          — настройки и состояние
   /interval <мин>  — интервал автопроверки (минимум 30)
@@ -35,7 +36,6 @@ import ai_reply
 import db
 import insights
 import monitor
-import monthly
 import tg
 
 HELP_ADMIN = (
@@ -45,7 +45,7 @@ HELP_ADMIN = (
     "/del <N> — удалить компанию №N\n"
     "/check [N] — проверить все (или №N)\n"
     "/reply <N> — AI-ответ на последний отзыв компании №N\n"
-    "/monthly <N> — отчёт за месяц клиенту по компании №N\n"
+    "/weekly <N> [all] — отчёт за неделю по компании №N (all — и чатам компании)\n"
     "/report <N> — глубокий разбор болей по компании №N\n"
     "/digest <N> — еженедельный дайджест по компании №N сейчас\n"
     "/status — настройки и состояние\n"
@@ -150,27 +150,22 @@ async def _build_and_send_report(company_id: int, token: str, chat_id: str):
         await _reply(token, chat_id, f"⚠ Файл не отправился: {html.escape(str(e))}")
 
 
-async def _build_and_send_monthly(company_id: int, token: str, chat_id: str):
-    """Фон: ежемесячный отчёт клиенту (monthly.py) + отправка файлом в чат."""
+async def _build_and_send_weekly(company_id: int, to: str, token: str, chat_id: str):
+    """Фон: отчёт за неделю через общий путь monitor.build_and_send_report.
+
+    Своей рассылки здесь нет намеренно: «только мне» из бота и «только мне» из
+    панели должны означать один и тот же список получателей.
+    """
     try:
-        rid = await monthly.build_report(company_id)
+        _, errors = await monitor.build_and_send_report(company_id, to=to)
     except Exception as ex:
         await _reply(token, chat_id,
-                     f"⚠ Отчёт за месяц не построился: {html.escape(str(ex)[:300])}")
+                     f"⚠ Отчёт за неделю не построился: {html.escape(str(ex)[:300])}")
         return
-    conn = db.connect()
-    try:
-        rep = db.get_report(conn, rid)
-        comp = db.get_company(conn, company_id)
-    finally:
-        conn.close()
-    try:
-        await tg.send_document(
-            token, chat_id, f"otchet_{company_id}_{rep['created_at'][:10]}.html",
-            rep["html"].encode("utf-8"),
-            f"📊 Отчёт за месяц — {comp['name']} · {rep['period']}")
-    except tg.TgError as e:
-        await _reply(token, chat_id, f"⚠ Файл не отправился: {html.escape(str(e))}")
+    note = f"📊 Отчёт за неделю готов и отправлен ({monitor.REPORT_TO_LABELS[to]})."
+    if errors:
+        note += "\n⚠ " + html.escape("; ".join(errors)[:300])
+    await _reply(token, chat_id, note)
 
 
 async def _check_and_report(ids: list, token: str, chat_id: str):
@@ -344,14 +339,22 @@ async def handle_command(cmd: str, args: str, chat: dict, token: str):
                          f"отзывов и анализ, ~2–4 минуты…")
             _spawn(_build_and_send_report(c["id"], token, chat_id))
 
-        elif cmd == "monthly":
-            c = _company_by_num(companies, args)
+        elif cmd == "weekly":
+            # «/weekly 2» — только мне, «/weekly 2 all» — ещё и чатам компании.
+            # Умолчание намеренно осторожное: отчёт клиенту уходит, только если
+            # об этом попросили явно.
+            num, _, rest = args.partition(" ")
+            to = "all" if rest.strip().lower() in ("all", "все", "клиенту") else "me"
+            c = _company_by_num(companies, num)
             if c is None:
-                await _reply(token, chat_id, "Укажите номер из /list: /monthly 2")
+                await _reply(token, chat_id,
+                             "Укажите номер из /list: /weekly 2 (только мне) "
+                             "или /weekly 2 all (и чатам компании)")
                 return
             await _reply(token, chat_id,
-                         f"Готовлю отчёт за месяц по «{e(c['name'])}»…")
-            _spawn(_build_and_send_monthly(c["id"], token, chat_id))
+                         f"Готовлю отчёт за неделю по «{e(c['name'])}» "
+                         f"({monitor.REPORT_TO_LABELS[to]})…")
+            _spawn(_build_and_send_weekly(c["id"], to, token, chat_id))
 
         elif cmd == "digest":
             c = _company_by_num(companies, args)
