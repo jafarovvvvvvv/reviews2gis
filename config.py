@@ -8,6 +8,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Название сервиса — одно на проект: им подписаны панель, кабинет клиента и
+# отчёты. Раньше константа жила только в app.py, и отчёт, собранный по
+# расписанию (monitor.py), уходил без подписи, а собранный кнопкой — с ней.
+BRAND = os.getenv("BRAND") or "Bedel"
+
 # Города Казахстана -> slug в URL 2GIS (2gis.kz/<slug>/...)
 CITY_SLUGS = {
     "алматы": "almaty", "астана": "astana", "нур-султан": "astana", "нурсултан": "astana",

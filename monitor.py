@@ -490,15 +490,18 @@ async def send_weekly_digest(company_id: int) -> list:
 
 
 async def build_and_send_report(company_id: int, to: str = REPORT_TO_DEFAULT,
-                                brand: str = "") -> tuple:
+                                brand: str = None) -> tuple:
     """Собрать отчёт за неделю и разослать. Возвращает (id отчёта, ошибки).
 
     Единственный путь отправки отчёта: им пользуются кнопка в панели, команда
     бота и расписание — чтобы «отправить себе» везде значило одно и то же.
     Исключение сборки не глотаем: вызывающий решает, как о нём сказать.
     """
+    import config
     import weekly_report
-    rid = await weekly_report.build_report(company_id, brand=brand)
+    # подпись одна и та же, кем бы отчёт ни был запущен: кнопкой или расписанием
+    rid = await weekly_report.build_report(
+        company_id, brand=config.BRAND if brand is None else brand)
     conn = db.connect()
     try:
         rep = db.get_report(conn, rid)

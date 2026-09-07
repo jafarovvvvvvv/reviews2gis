@@ -152,7 +152,7 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 # Имя продукта (bedel, каз. — авторитет, репутация, вес в обществе). Домен bedelreviews.kz
-BRAND = "Bedel"
+BRAND = config.BRAND  # одно определение на проект (см. config.py)
 # Подписи видов отчётов (db.KIND_*) — одни и те же в панели и в кабинете клиента
 REPORT_KINDS = {db.KIND_WEEKLY: "отчёт за неделю", db.KIND_PAIN: "разбор болей"}
 TAGLINE = "вес вашей репутации"
