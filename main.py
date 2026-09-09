@@ -27,7 +27,7 @@ for _s in (sys.stdout, sys.stderr):
 import leadgen
 from config import load_config
 from fetcher import BlockedError
-from lead_scoring import Company
+from lead_scoring import Company, set_active_rules
 from outreach import TOUCH_LABELS, build_touch_messages
 
 
@@ -94,6 +94,9 @@ async def run_full(cfg):
 
 def main():
     cfg = load_config()
+    # флаги --lead-* (или .env LEAD_*) действуют весь прогон; без них — дефолт
+    # из lead_scoring.ScoringRules (см. её docstring)
+    set_active_rules(cfg.lead_rules)
     if getattr(cfg, "firm", None):
         asyncio.run(run_single(cfg))
     else:

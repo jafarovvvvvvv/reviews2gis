@@ -10,7 +10,7 @@
   branch_scope   — по чему собраны данные: филиал или вся сеть
   org_*          — те же числа по всей сети, если у компании несколько филиалов
 
-Базовое правило приоритета:
+Базовое правило приоритета (пороги — см. ScoringRules ниже, все настраиваемые):
   🔥 Высокий = отзывов >=30 И свежие И (рейтинг 3.5-4.4 ИЛИ есть без ответа)
   🟡 Средний = поток есть (>=30, свежие), без триггеров выше
   ⚪ Низкий  = отзывов <30 ИЛИ нет свежих отзывов
@@ -20,7 +20,7 @@
 отвечает на бо́льшую часть отзывов; базовое правило дало ему Высокий только
 из-за 9 отзывов без ответа, хотя продавать там нечего):
 
-  Если rating >= DOWNGRADE_RATING_MIN И response_rate >= DOWNGRADE_RESPONSE_RATE_MIN
+  Если rating >= downgrade_rating_min И response_rate >= downgrade_response_rate_min
   -> Высокий понижается до Среднего, даже если unanswered_count большой.
 
 Смысл: высокий рейтинг + владелец реально отвечает на отзывы = боли нет,
@@ -32,7 +32,19 @@
 приоритета»); причина всегда начинается с метки приоритета, поэтому её можно
 читать в отрыве от остальной строки: «Высокий: рейтинг 4,2 в проблемной зоне,
 39 без ответа», «Средний: рейтинг 5,0, владелец отвечает на 63% — боли нет».
+
+НАСТРОЙКА ПОРОГОВ (ScoringRules): все четыре числа ниже — это ДЕФОЛТ, он
+всегда виден в коде (см. класс ScoringRules). Их можно переопределить вручную
+на весь прогон, не трогая код:
+  • флагом CLI (main.py: --lead-min-reviews, --lead-rating-band,
+    --lead-downgrade-rating-min, --lead-downgrade-response-rate-min);
+  • или переменной окружения (LEAD_MIN_REVIEWS, LEAD_RATING_BAND_LOW/HIGH,
+    LEAD_DOWNGRADE_RATING_MIN, LEAD_DOWNGRADE_RESPONSE_RATE_MIN — их же
+    читает .env).
+Флаг главнее переменной окружения, переменная — главнее дефолта. Ничего не
+задано -> действует дефолт из ScoringRules(). См. rules_from_env/set_active_rules.
 """
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -51,12 +63,69 @@ _PLAIN_LABEL = {PRIORITY_HIGH: "Высокий", PRIORITY_MEDIUM: "Средни�
 # Для сортировки: чем меньше число — тем выше в таблице
 _PRIORITY_RANK = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
 
-MIN_REVIEWS = 30             # «поток есть» — столько отзывов и больше
-PROBLEM_BAND = (3.5, 4.4)    # рейтинг в этой полосе — сам по себе тревожный сигнал
 
-# Понижающее правило: высокий рейтинг + владелец реально отвечает -> боли нет
-DOWNGRADE_RATING_MIN = 4.8
-DOWNGRADE_RESPONSE_RATE_MIN = 0.2
+@dataclass(frozen=True)
+class ScoringRules:
+    """Пороги правила приоритета. Значения ниже — ДЕФОЛТ (см. docstring
+    модуля); каждое поле можно переопределить вручную флагом CLI или
+    переменной окружения — см. rules_from_env/set_active_rules."""
+    min_reviews: int = 30                # «поток есть» — столько отзывов и больше
+    problem_band: tuple = (3.5, 4.4)     # рейтинг в этой полосе — сам по себе тревожный сигнал
+    downgrade_rating_min: float = 4.5        # высокий рейтинг от этого значения...
+    downgrade_response_rate_min: float = 0.2  # ...и владелец отвечает от этой доли -> боли нет
+
+
+DEFAULT_RULES = ScoringRules()
+
+# Активные на процесс пороги — то, что реально использует Company.compute_priority,
+# если ей явно не передали rules. main.py переключает их один раз при старте
+# (CLI-флаги), панель/скрипты — через .env (см. rules_from_env). Пока никто не
+# менял — это ровно DEFAULT_RULES.
+_active_rules: ScoringRules = DEFAULT_RULES
+
+
+def set_active_rules(rules: Optional[ScoringRules]) -> None:
+    """Переопределить пороги приоритета на весь процесс. rules=None -> дефолт."""
+    global _active_rules
+    _active_rules = rules or DEFAULT_RULES
+
+
+def active_rules() -> ScoringRules:
+    return _active_rules
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def rules_from_env(base: ScoringRules = DEFAULT_RULES) -> ScoringRules:
+    """base с точечным переопределением из переменных окружения — не задано,
+    значит остаётся base (по умолчанию — DEFAULT_RULES, то есть дефолт из ТЗ)."""
+    return ScoringRules(
+        min_reviews=_env_int("LEAD_MIN_REVIEWS", base.min_reviews),
+        problem_band=(_env_float("LEAD_RATING_BAND_LOW", base.problem_band[0]),
+                      _env_float("LEAD_RATING_BAND_HIGH", base.problem_band[1])),
+        downgrade_rating_min=_env_float("LEAD_DOWNGRADE_RATING_MIN",
+                                        base.downgrade_rating_min),
+        downgrade_response_rate_min=_env_float("LEAD_DOWNGRADE_RESPONSE_RATE_MIN",
+                                               base.downgrade_response_rate_min),
+    )
 
 
 @dataclass
@@ -100,14 +169,18 @@ class Company:
     priority: str = field(default=PRIORITY_LOW)
     priority_reason: str = ""
 
-    def compute_priority(self) -> str:
-        """Назначить приоритет и причину. Возвращает приоритет."""
+    def compute_priority(self, rules: Optional[ScoringRules] = None) -> str:
+        """Назначить приоритет и причину. Возвращает приоритет.
+
+        rules=None -> берутся активные на процесс пороги (active_rules()) —
+        дефолт, если их никто не переопределил флагом/конфигом."""
         self.priority, self.priority_reason = decide_priority(
             reviews_count=self.reviews_count,
             has_fresh=self.has_fresh_reviews,
             rating=self.rating,
             unanswered_count=self.unanswered_count,
-            response_rate=self.response_rate)
+            response_rate=self.response_rate,
+            rules=rules or active_rules())
         return self.priority
 
     # ---- сериализация для CSV ----
@@ -161,18 +234,23 @@ CSV_HEADERS = [
 ]
 
 
-def _downgrade_applies(rating, response_rate) -> bool:
+def _downgrade_applies(rating, response_rate, rules: ScoringRules) -> bool:
     """Высокий рейтинг + владелец реально отвечает -> боли нет, лид не тот.
 
     response_rate=None (данных нет) НЕ считается «отвечает» — понижение просто
     не применяется, а не падает и не понижает вслепую."""
-    return (rating is not None and rating >= DOWNGRADE_RATING_MIN
-            and response_rate is not None and response_rate >= DOWNGRADE_RESPONSE_RATE_MIN)
+    return (rating is not None and rating >= rules.downgrade_rating_min
+            and response_rate is not None and response_rate >= rules.downgrade_response_rate_min)
 
 
-def decide_priority(reviews_count, has_fresh, rating,
-                    unanswered_count, response_rate) -> tuple:
+def decide_priority(reviews_count, has_fresh, rating, unanswered_count, response_rate,
+                    rules: ScoringRules = DEFAULT_RULES) -> tuple:
     """Правило приоритета -> (приоритет, причина). Чистая функция.
+
+    rules — пороги (см. ScoringRules); по умолчанию DEFAULT_RULES, то есть
+    дефолт из ТЗ. Передайте свой ScoringRules, чтобы посчитать приоритет с
+    ручными порогами, не трогая процесс-wide active_rules() (её использует
+    Company.compute_priority).
 
     Причина всегда начинается с метки приоритета («Высокий: …», «Средний: …»)
     и объясняет, какое условие сработало — включая понижающее правило, если
@@ -181,9 +259,9 @@ def decide_priority(reviews_count, has_fresh, rating,
     """
     if reviews_count is None:
         return PRIORITY_LOW, f"{_PLAIN_LABEL[PRIORITY_LOW]}: нет данных о количестве отзывов"
-    if reviews_count < MIN_REVIEWS:
+    if reviews_count < rules.min_reviews:
         return (PRIORITY_LOW, f"{_PLAIN_LABEL[PRIORITY_LOW]}: отзывов меньше "
-                              f"{MIN_REVIEWS} ({reviews_count})")
+                              f"{rules.min_reviews} ({reviews_count})")
     if not has_fresh:
         return PRIORITY_LOW, f"{_PLAIN_LABEL[PRIORITY_LOW]}: нет отзывов за последний месяц"
 
@@ -191,7 +269,8 @@ def decide_priority(reviews_count, has_fresh, rating,
     # полосе ИЛИ есть отзывы без ответа — каждое условие даёт свой фрагмент
     # причины, фрагменты всегда открываются текущим рейтингом для контекста.
     fragments = [f"рейтинг {metrics.fmt_rating(rating)}"]
-    in_problem_band = rating is not None and PROBLEM_BAND[0] <= rating <= PROBLEM_BAND[1]
+    band_low, band_high = rules.problem_band
+    in_problem_band = rating is not None and band_low <= rating <= band_high
     if in_problem_band:
         fragments[0] += " в проблемной зоне"
     if unanswered_count:
@@ -201,7 +280,7 @@ def decide_priority(reviews_count, has_fresh, rating,
             fragments.append(f"{unanswered_count} без ответа")
 
     if in_problem_band or unanswered_count:
-        if _downgrade_applies(rating, response_rate):
+        if _downgrade_applies(rating, response_rate, rules):
             pct = metrics.fmt_pct(response_rate)
             return (PRIORITY_MEDIUM,
                     f"{_PLAIN_LABEL[PRIORITY_MEDIUM]}: рейтинг {metrics.fmt_rating(rating)}, "
@@ -239,9 +318,10 @@ if __name__ == "__main__":
         # 3. rating 4.9, unanswered 50, response_rate 0.00 -> Высокий
         (50, True, 4.9, 50, 0.00, PRIORITY_HIGH,
          "Высокий: рейтинг 4,9, но владелец не отвечает вообще"),
-        # 4. rating 4.8, unanswered 20, response_rate 0.20 -> Средний (граница включительно)
-        (50, True, 4.8, 20, 0.20, PRIORITY_MEDIUM,
-         "Средний: рейтинг 4,8, владелец отвечает на 20% — боли нет"),
+        # 4. rating 4.5 (дефолтная граница понижения), unanswered 20, response_rate
+        #    0.20 (дефолтная граница) -> Средний (обе границы включительно)
+        (50, True, 4.5, 20, 0.20, PRIORITY_MEDIUM,
+         "Средний: рейтинг 4,5, владелец отвечает на 20% — боли нет"),
         # 5. rating 4.8, unanswered 20, response_rate 0.19 -> Высокий (чуть ниже границы)
         (50, True, 4.8, 20, 0.19, PRIORITY_HIGH, "Высокий: рейтинг 4,8, 20 без ответа"),
         # 6. reviews_count 12 -> Низкий независимо от остальных полей
@@ -266,15 +346,79 @@ if __name__ == "__main__":
         checks.append((f"приоритет rc={rc} fresh={fresh} r={rating} unans={unans} "
                        f"rr={rr} -> {got} ({reason})", ok))
 
-    # понижение — граница строго снаружи по рейтингу (4.79 < 4.8 -> не понижается)
-    got, reason = decide_priority(50, True, 4.79, 20, 0.90)
-    checks.append(("понижение: рейтинг чуть ниже 4,8 -> не применяется",
+    # понижение — граница строго снаружи по рейтингу (4.49 < дефолтных 4.5 -> не понижается)
+    got, reason = decide_priority(50, True, 4.49, 20, 0.90)
+    checks.append(("понижение: рейтинг чуть ниже 4,5 -> не применяется",
                    got == PRIORITY_HIGH))
 
     # response_rate=None не роняет и не понижает даже при высоком рейтинге
     got, reason = decide_priority(50, True, 5.0, 30, None)
     checks.append(("понижение: response_rate=None -> правило не падает, "
                    "не понижает", got == PRIORITY_HIGH))
+
+    # ============ ScoringRules: дефолт vs ручное переопределение ============
+
+    # без rules — decide_priority сама берёт DEFAULT_RULES (min_reviews=30,
+    # downgrade_rating_min=4.5, downgrade_response_rate_min=0.2)
+    checks.append(("ScoringRules: дефолт применяется без передачи rules",
+                   decide_priority(29, True, 5.0, 0, 0.9)[0] == PRIORITY_LOW
+                   and "меньше 30" in decide_priority(29, True, 5.0, 0, 0.9)[1]))
+
+    # ручной ScoringRules перекрывает дефолт точечно (min_reviews=10 — раньше
+    # эти 29 отзывов были «Низкий», с ручным порогом поток уже есть)
+    loose = ScoringRules(min_reviews=10)
+    got, reason = decide_priority(29, True, 5.0, 0, 0.9, rules=loose)
+    checks.append(("ScoringRules: ручной min_reviews перекрывает дефолт",
+                   got != PRIORITY_LOW and "поток есть" in reason))
+
+    # ручной downgrade_rating_min=4.9 — рейтинг 4.7 больше дефолтных 4.5, но
+    # меньше ручных 4.9 -> с ручным порогом понижение НЕ применяется
+    strict = ScoringRules(downgrade_rating_min=4.9)
+    got_default, _ = decide_priority(50, True, 4.7, 20, 0.9)
+    got_strict, _ = decide_priority(50, True, 4.7, 20, 0.9, rules=strict)
+    checks.append(("ScoringRules: дефолт понижает на рейтинге 4,7",
+                   got_default == PRIORITY_MEDIUM))
+    checks.append(("ScoringRules: ручной downgrade_rating_min=4.9 не понижает на 4,7",
+                   got_strict == PRIORITY_HIGH))
+
+    # Company.compute_priority: без rules — активные на процесс (по умолчанию
+    # DEFAULT_RULES); явный rules перекрывает их для конкретного вызова
+    default_co = Company(reviews_count=29, has_fresh_reviews=True, rating=5.0)
+    checks.append(("Company.compute_priority: без rules — дефолт (29 < 30 -> Низкий)",
+                   default_co.compute_priority() == PRIORITY_LOW))
+    override_co = Company(reviews_count=29, has_fresh_reviews=True, rating=5.0)
+    checks.append(("Company.compute_priority: явный rules перекрывает дефолт",
+                   override_co.compute_priority(rules=loose) != PRIORITY_LOW))
+
+    # set_active_rules — процесс-wide переопределение (так main.py прокидывает
+    # CLI-флаг): compute_priority() без явного rules берёт активные пороги;
+    # set_active_rules(None) обязан вернуть дефолт, а не оставить прошлый флаг
+    try:
+        set_active_rules(loose)
+        active_co = Company(reviews_count=29, has_fresh_reviews=True, rating=5.0)
+        checks.append(("active_rules: set_active_rules меняет поведение по умолчанию",
+                       active_co.compute_priority() != PRIORITY_LOW))
+    finally:
+        set_active_rules(None)
+    reset_co = Company(reviews_count=29, has_fresh_reviews=True, rating=5.0)
+    checks.append(("active_rules: set_active_rules(None) возвращает дефолт",
+                   reset_co.compute_priority() == PRIORITY_LOW
+                   and active_rules() == DEFAULT_RULES))
+
+    # rules_from_env: без переменных окружения — тот же дефолт
+    checks.append(("rules_from_env: без .env — совпадает с DEFAULT_RULES",
+                   rules_from_env() == DEFAULT_RULES))
+
+    # rules_from_env: переменная окружения точечно переопределяет одно поле,
+    # остальные остаются дефолтными
+    os.environ["LEAD_MIN_REVIEWS"] = "5"
+    try:
+        env_rules = rules_from_env()
+        checks.append(("rules_from_env: LEAD_MIN_REVIEWS переопределяет min_reviews",
+                       env_rules.min_reviews == 5
+                       and env_rules.downgrade_rating_min == DEFAULT_RULES.downgrade_rating_min))
+    finally:
+        del os.environ["LEAD_MIN_REVIEWS"]
 
     # Company.compute_priority делегирует в decide_priority
     c = Company(reviews_count=50, has_fresh_reviews=True, rating=4.0)

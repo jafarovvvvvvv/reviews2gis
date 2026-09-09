@@ -35,7 +35,7 @@ import metrics
 from config import city_to_slug
 from fetcher import BlockedError, FetchError, fetch_ways, fetcher_class
 from lead_scoring import (CSV_HEADERS, Company, PRIORITY_HIGH, PRIORITY_LOW,
-                          PRIORITY_MEDIUM, sort_key)
+                          PRIORITY_MEDIUM, rules_from_env, set_active_rules, sort_key)
 from outreach import (AUDIT_COMPETITOR as _AUDIT_COMPETITOR, build_quote_drafts,
                       build_rows, instagram_link, phone_digits, render_audit_html,
                       write_outreach_pack)
@@ -65,6 +65,13 @@ SHOW_COMPETITOR = outreach_competitor_flag()
 # лиды остаются только в CSV/пакете рассылки, как раньше.
 CRM_PUSH_URL = os.getenv("CRM_PUSH_URL") or ""
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY") or ""
+
+# Пороги приоритета лида (lead_scoring.ScoringRules) — источник конфига для
+# процессов без CLI-флагов (веб-панель): .env (LEAD_*), а если и его нет —
+# дефолт из ТЗ (см. docstring lead_scoring.py). CLI (main.py) сам вызывает
+# set_active_rules с учётом --lead-*, что полностью перекрывает это значение
+# для CLI-прогона — порядок здесь неважен.
+set_active_rules(rules_from_env())
 
 # статусы прогона
 ST_RUNNING = "running"

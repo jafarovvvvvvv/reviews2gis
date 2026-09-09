@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from lead_scoring import ScoringRules, rules_from_env
+
 load_dotenv()
 
 # Название сервиса — одно на проект: им подписаны панель, кабинет клиента и
@@ -56,6 +58,7 @@ class Config:
     sender_name: str = ""     # имя в сообщении-открывашке (SENDER_NAME)
     sender_contact: str = ""  # телефон/Instagram для подписи аудита (SENDER_CONTACT)
     mode: str = "auto"        # способ чтения: auto | http | browser (см. fetcher.FETCH_MODES)
+    lead_rules: ScoringRules = None  # пороги приоритета лида (см. lead_scoring.ScoringRules)
 
     @property
     def domain(self) -> str:
@@ -83,7 +86,37 @@ def load_config() -> Config:
     p.add_argument("--mode", default=os.getenv("FETCH_MODE") or "auto",
                    choices=("auto", "http", "browser"),
                    help="Способ чтения: auto (HTTP, браузер в резерве), http, browser")
+
+    # Пороги приоритета лида (lead_scoring.ScoringRules) — если флаг не задан,
+    # используется .env (LEAD_*), а если и его нет — дефолт из ТЗ (см.
+    # docstring lead_scoring.py). Флаг главнее .env.
+    _defaults = rules_from_env()
+    p.add_argument("--lead-min-reviews", type=int, default=None,
+                   help=f"Порог «поток есть», отзывов (дефолт {_defaults.min_reviews})")
+    p.add_argument("--lead-rating-band", type=float, nargs=2, default=None,
+                   metavar=("LOW", "HIGH"),
+                   help="Проблемная полоса рейтинга -> Высокий (дефолт "
+                        f"{_defaults.problem_band[0]} {_defaults.problem_band[1]})")
+    p.add_argument("--lead-downgrade-rating-min", type=float, default=None,
+                   help="Рейтинг, от которого Высокий может понижаться до Среднего "
+                        f"(дефолт {_defaults.downgrade_rating_min})")
+    p.add_argument("--lead-downgrade-response-rate-min", type=float, default=None,
+                   help="response_rate, от которого применяется понижение "
+                        f"(дефолт {_defaults.downgrade_response_rate_min})")
     args = p.parse_args()
+
+    lead_rules = ScoringRules(
+        min_reviews=(args.lead_min_reviews if args.lead_min_reviews is not None
+                    else _defaults.min_reviews),
+        problem_band=(tuple(args.lead_rating_band) if args.lead_rating_band is not None
+                     else _defaults.problem_band),
+        downgrade_rating_min=(args.lead_downgrade_rating_min
+                              if args.lead_downgrade_rating_min is not None
+                              else _defaults.downgrade_rating_min),
+        downgrade_response_rate_min=(args.lead_downgrade_response_rate_min
+                                     if args.lead_downgrade_response_rate_min is not None
+                                     else _defaults.downgrade_response_rate_min),
+    )
 
     env_headless = os.getenv("HEADLESS", "true").lower() not in ("false", "0", "no")
     headless = env_headless and not args.no_headless
@@ -98,6 +131,7 @@ def load_config() -> Config:
         sender_name=args.sender_name.strip(),
         sender_contact=args.sender_contact.strip(),
         mode=args.mode,
+        lead_rules=lead_rules,
     )
     # пробросим firm отдельно (не часть основного конфига)
     cfg.firm = args.firm  # type: ignore[attr-defined]
