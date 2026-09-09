@@ -148,6 +148,14 @@ CREATE TABLE IF NOT EXISTS pending_notifications(
 
 CREATE INDEX IF NOT EXISTS idx_pending_status
   ON pending_notifications(status, company_id);
+
+-- Архив лидов: карточка признана «не тот профиль» (например, тяжело продать —
+-- рейтинг и так высокий, боли нет) и больше не должна попадать в новые
+-- прогоны/CSV/CRM. lead_snapshots при этом НЕ трогаем — история остаётся.
+CREATE TABLE IF NOT EXISTS lead_archive(
+  firm_id     TEXT PRIMARY KEY,
+  archived_at TEXT NOT NULL,
+  reason      TEXT NOT NULL DEFAULT '');
 """
 
 
@@ -598,6 +606,41 @@ def latest_snapshots_in(conn, city_slug: str, category: str):
         "ORDER BY s.firm_id", (city_slug, category)).fetchall()
 
 
+def archive_lead(conn, firm_id: str, reason: str = "") -> bool:
+    """Отправить лида в архив (не трогая lead_snapshots). True, если добавлен —
+    повторный вызов на уже заархивированном обновит причину и вернёт False."""
+    was_new = conn.execute(
+        "SELECT 1 FROM lead_archive WHERE firm_id=?", (firm_id,)).fetchone() is None
+    conn.execute(
+        "INSERT INTO lead_archive(firm_id, archived_at, reason) VALUES(?,?,?) "
+        "ON CONFLICT(firm_id) DO UPDATE SET reason=excluded.reason",
+        (firm_id, now_iso(), reason))
+    conn.commit()
+    return was_new
+
+
+def unarchive_lead(conn, firm_id: str) -> bool:
+    cur = conn.execute("DELETE FROM lead_archive WHERE firm_id=?", (firm_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def archived_firm_ids(conn) -> set:
+    return {r["firm_id"] for r in conn.execute("SELECT firm_id FROM lead_archive")}
+
+
+def list_archived(conn) -> list:
+    """Архив с последним известным снимком (имя/рейтинг для отображения)."""
+    return conn.execute(
+        "SELECT a.firm_id, a.archived_at, a.reason, s.name, s.rating, s.url, "
+        "       s.category, s.city_slug "
+        "FROM lead_archive a "
+        "LEFT JOIN (SELECT firm_id, MAX(id) AS mid FROM lead_snapshots GROUP BY firm_id) t "
+        "  ON t.firm_id = a.firm_id "
+        "LEFT JOIN lead_snapshots s ON s.id = t.mid "
+        "ORDER BY a.archived_at DESC").fetchall()
+
+
 def add_chat(conn, chat_id: str, title: str, is_admin=None) -> bool:
     """Зарегистрировать чат. Возвращает True, если чат новый.
 
@@ -967,6 +1010,26 @@ if __name__ == "__main__":
                        {r["firm_id"] for r in pool} == {"777", "888"}))
         checks.append(("снимки: берётся свежий снимок компании",
                        [r["rating"] for r in pool if r["firm_id"] == "777"] == [4.9]))
+
+        # --- архив лидов ---
+        checks.append(("архив: изначально пуст",
+                       archived_firm_ids(conn) == set()))
+        added = archive_lead(conn, "777", "тяжело продать: рейтинг 4.9, отвечают на всё")
+        checks.append(("архив: добавление вернуло True", added is True))
+        checks.append(("архив: firm_id виден в множестве",
+                       archived_firm_ids(conn) == {"777"}))
+        again = archive_lead(conn, "777", "новая причина")
+        checks.append(("архив: повторная архивация не дублирует, вернула False",
+                       again is False and archived_firm_ids(conn) == {"777"}))
+        arch_list = list_archived(conn)
+        checks.append(("архив: список с именем/рейтингом из последнего снимка",
+                       len(arch_list) == 1 and arch_list[0]["firm_id"] == "777"
+                       and arch_list[0]["name"] == "Тест-клиника"
+                       and arch_list[0]["reason"] == "новая причина"))
+        checks.append(("архив: снятие с архива", unarchive_lead(conn, "777") is True
+                       and archived_firm_ids(conn) == set()))
+        checks.append(("архив: lead_snapshots не тронут при архивации/разархивации",
+                       last_lead_snapshot(conn, "777") is not None))
         conn.close()
 
         # миграция старой схемы chats (без is_admin)

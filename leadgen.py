@@ -210,6 +210,13 @@ async def run_leads(cfg: LeadCfg, mode: str = "auto", report=None) -> dict:
     Возвращает {companies, rows, way, csv, pack} (пути — Path).
     """
     companies, way = await collect_leads(cfg, mode, report)
+    conn = db.connect()
+    try:
+        archived = db.archived_firm_ids(conn)
+    finally:
+        conn.close()
+    if archived:
+        companies = [c for c in companies if c.firm_id not in archived]
     companies.sort(key=sort_key)
     report = report or (lambda *a, **kw: None)
     report("готовлю пакет для рассылки…", len(companies), len(companies))
@@ -687,6 +694,23 @@ if __name__ == "__main__":
                        (pack_dir / "index.html").is_file()
                        and (pack_dir / "audit_111111.html").is_file()))
         checks.append(("прогон: CSV на диске", (Path(tmp) / run2.csv_name).is_file()))
+
+        # --- заархивированный лид не попадает в новый прогон ---
+        conn = db.connect()
+        db.archive_lead(conn, "222222", "тест: тяжело продать")
+        conn.close()
+        try:
+            globals()["_one_way"] = _fake_one_way
+            run3 = new_run(LeadCfg(city="Алматы", category="стоматология",
+                                   count=3, output_dir=tmp, sender_name="Эмиль"))
+            asyncio.run(run_task(run3))
+            checks.append(("прогон: архивный лид отфильтрован",
+                           {r["c"].firm_id for r in run3.rows} == {"111111", "333333"}))
+        finally:
+            globals()["_one_way"] = real_one_way
+            conn = db.connect()
+            db.unarchive_lead(conn, "222222")
+            conn.close()
 
         packs = list_packs(tmp)
         checks.append(("пакеты: найден на диске",
