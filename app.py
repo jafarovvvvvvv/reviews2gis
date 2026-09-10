@@ -38,6 +38,7 @@ import config
 import db
 import fetcher
 import insights
+import lead_scoring
 import leadgen
 import metrics
 import monitor
@@ -1405,6 +1406,45 @@ def _lead_cfg(conn, city: str, category: str, count) -> leadgen.LeadCfg:
                         or os.getenv("SENDER_CONTACT") or ""))
 
 
+# Пороги приоритета лида, которые можно задать вручную прямо в панели (см.
+# lead_scoring.ScoringRules) — храним ПУСТЫЕ строки как «не задано», а не
+# посчитанный дефолт, иначе поле в форме навсегда останется заполненным и
+# пользователь не поймёт, что можно просто стереть значение и вернуть дефолт.
+_LEAD_RULE_FIELDS = ("lead_min_reviews", "lead_band_low", "lead_band_high",
+                    "lead_downgrade_rating", "lead_downgrade_rate")
+
+
+def _lead_rules_defaults(conn) -> dict:
+    """Последние введённые пороги (пустая строка = используется дефолт)."""
+    return {k: db.get_setting(conn, k) or "" for k in _LEAD_RULE_FIELDS}
+
+
+def _parse_lead_rules(form) -> lead_scoring.ScoringRules:
+    """Форма -> ScoringRules. Пустое или нечисловое поле -> эффективный дефолт
+    (rules_from_env: .env, если задан, иначе ScoringRules() из ТЗ) — иначе
+    пустая панельная форма тихо забивала бы .env-настройку сервера своим
+    хардкодом. Нечисловое значение тоже не должно ронять панель."""
+    d = lead_scoring.rules_from_env()
+
+    def _num(name, default, cast=float):
+        raw = str(form.get(name, "") or "").strip().replace(",", ".")
+        if not raw:
+            return default
+        try:
+            return cast(raw)
+        except ValueError:
+            return default
+
+    return lead_scoring.ScoringRules(
+        min_reviews=_num("lead_min_reviews", d.min_reviews, cast=int),
+        problem_band=(_num("lead_band_low", d.problem_band[0]),
+                     _num("lead_band_high", d.problem_band[1])),
+        downgrade_rating_min=_num("lead_downgrade_rating", d.downgrade_rating_min),
+        downgrade_response_rate_min=_num("lead_downgrade_rate",
+                                         d.downgrade_response_rate_min),
+    )
+
+
 def _run_status(run) -> str:
     """Статус прогона: чип + при работе — полоса прогресса."""
     chip = {leadgen.ST_RUNNING: '<span class="chip busy">идёт…</span>',
@@ -1428,8 +1468,11 @@ async def leads_page(request: Request):
         city, category, count = _lead_defaults(conn)
         sender = db.get_setting(conn, "sender_name") or os.getenv("SENDER_NAME") or ""
         mode = db.get_setting(conn, "fetch_mode", "auto")
+        rules = _lead_rules_defaults(conn)
     finally:
         conn.close()
+    dr = lead_scoring.rules_from_env()  # эффективный дефолт: .env, если задан, иначе ТЗ
+    rules_custom = any(rules.values())
 
     runs = leadgen.list_runs()
     run_cards = "".join(f"""<div class="runline" style="margin-bottom:12px">
@@ -1477,6 +1520,28 @@ async def leads_page(request: Request):
   <div class="f narrow"><label for="lead-count">Сколько</label>
    <input id="lead-count" type="number" name="count" min="1"
           max="{leadgen.MAX_COUNT}" value="{e(count)}"></div>
+  <details class="rules" style="flex-basis:100%"{' open' if rules_custom else ''}>
+   <summary>Фильтры приоритета {'<span class="chip new">свои</span>' if rules_custom else '<span class="muted">(дефолт)</span>'}</summary>
+   <p class="muted" style="margin:8px 0">Пусто — используется дефолт (в скобках).
+   Значения применяются к этому и следующим прогонам, пока не измените ещё раз.</p>
+   <div class="leadform">
+    <div class="f narrow"><label for="lr-min">Мин. отзывов</label>
+     <input id="lr-min" type="number" min="1" name="lead_min_reviews"
+            placeholder="{dr.min_reviews}" value="{e(rules['lead_min_reviews'])}"></div>
+    <div class="f narrow"><label for="lr-blow">Рейтинг «проблемный» от</label>
+     <input id="lr-blow" type="number" step="0.1" min="1" max="5" name="lead_band_low"
+            placeholder="{dr.problem_band[0]}" value="{e(rules['lead_band_low'])}"></div>
+    <div class="f narrow"><label for="lr-bhigh">Рейтинг «проблемный» до</label>
+     <input id="lr-bhigh" type="number" step="0.1" min="1" max="5" name="lead_band_high"
+            placeholder="{dr.problem_band[1]}" value="{e(rules['lead_band_high'])}"></div>
+    <div class="f narrow"><label for="lr-drate">Понижение: рейтинг от</label>
+     <input id="lr-drate" type="number" step="0.1" min="1" max="5" name="lead_downgrade_rating"
+            placeholder="{dr.downgrade_rating_min}" value="{e(rules['lead_downgrade_rating'])}"></div>
+    <div class="f narrow"><label for="lr-drr">Понижение: ответов от, доля</label>
+     <input id="lr-drr" type="number" step="0.05" min="0" max="1" name="lead_downgrade_rate"
+            placeholder="{dr.downgrade_response_rate_min}" value="{e(rules['lead_downgrade_rate'])}"></div>
+   </div>
+  </details>
   <div><button class="primary">Найти лидов</button></div>
  </form>
  <p class="muted" style="margin-bottom:0">Прогон идёт в фоне (~1,5 сек на компанию):
@@ -1498,15 +1563,24 @@ async def leads_run(request: Request):
     if leadgen.any_busy():
         return redirect("/leads", err="Прогон уже идёт — дождитесь окончания: "
                                       "параллельные запросы к 2ГИС повышают риск блокировки")
+    rules = _parse_lead_rules(form)
     conn = db.connect()
     try:
         db.set_setting(conn, "lead_city", city)
         db.set_setting(conn, "lead_category", category)
         db.set_setting(conn, "lead_count", str(count))
+        # пустое поле формы храним пустой строкой — иначе при следующем
+        # открытии страницы поле показало бы посчитанный дефолт как «своё»
+        for field in _LEAD_RULE_FIELDS:
+            db.set_setting(conn, field, str(form.get(field, "") or "").strip())
         mode = db.get_setting(conn, "fetch_mode", "auto")
         cfg = _lead_cfg(conn, city, category, count)
     finally:
         conn.close()
+    # пороги приоритета — на весь процесс (см. lead_scoring.set_active_rules);
+    # прогоны панели уже сериализованы (any_busy() выше), поэтому глобальное
+    # состояние безопасно — параллельного прогона с другими порогами не будет
+    lead_scoring.set_active_rules(rules)
     run = leadgen.new_run(cfg)
     # SCRAPE_LOCK общий с мониторингом: пока идёт прогон, плановые проверки ждут
     spawn(leadgen.run_task(run, mode, lock=monitor.SCRAPE_LOCK))
