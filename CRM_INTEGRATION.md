@@ -130,4 +130,4 @@ Payload — по одному объекту на компанию:
   `Reviews2GisParserAdapter`), `routers/leads.py` (эндпоинт `/leads/push`) и
   `ARCHITECTURE.md` там же.
 - Деплой на сервер (оба проекта рядом, `host.docker.internal` между
-  контейнерами) — [[deploy-home-server]] (скилл), сервер 100.85.183.12.
+  контейнерами) — [[deploy-home-server]] (скилл), сервер home-server.
